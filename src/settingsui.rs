@@ -27,6 +27,10 @@ use crate::clock;
 use crate::config as cfg;
 use crate::settings::{self, DockAnchor, LyricPos, ModuleMode, PillAnchor, WeatherSource};
 
+/// 最近一次 `show()` 时光标的位置（屏幕物理像素）。右键 Dock 图标打开设置时，
+/// 窗口弹在光标附近而不是主屏正中；None（热键打开）= 居中。
+static CURSOR_ORIGIN: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
 const TITLE: &str = "Orbit 设置";
 /// 窗口总宽（固定尺寸，内容超出走组内滚动）
 const WIN_W: f32 = 940.0;
@@ -83,6 +87,15 @@ pub fn hide() {
 }
 
 pub fn show() {
+    // 记下当前光标位置：窗口弹在鼠标附近（右键 Dock 图标时的自然位置）
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    let cursor = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) }
+        .ok()
+        .map(|_| (pt.x, pt.y));
+    crate::tlog!("[settings] show() cursor={cursor:?}");
+    if let Ok(mut slot) = CURSOR_ORIGIN.lock() {
+        *slot = cursor;
+    }
     // 懒启动：eframe 渲染完第一帧后总会强制 set_visible(true)（epi_integration
     // 的 post_rendering，无视 with_visible(false)），启动时就建窗会让设置页
     // 开机弹出。所以等用户第一次打开设置才起线程；show 命令先进 QUEUE，
@@ -327,7 +340,7 @@ impl eframe::App for SettingsApp {
         for cmd in cmds {
             match cmd {
                 Cmd::Show => {
-                    self.center(ctx);
+                    self.place(ctx);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     OPEN.store(true, Ordering::Relaxed);
@@ -441,6 +454,30 @@ impl SettingsApp {
             .max(mon.top as f32 + 6.0))
             / k;
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+    }
+
+    /// 弹出定位：有光标记录（右键 Dock 打开）就弹在光标右下角、夹回屏幕内，
+    /// 靠边时往回挪避免出屏；没有（热键打开）回落到主屏居中。
+    fn place(&self, ctx: &egui::Context) {
+        let origin = CURSOR_ORIGIN.lock().ok().and_then(|s| *s);
+        crate::tlog!("[settings] place() origin={origin:?}");
+        let Some((cx, cy)) = origin else {
+            self.center(ctx);
+            return;
+        };
+        if let Ok(mut slot) = CURSOR_ORIGIN.lock() {
+            *slot = None;
+        }
+        let mon = crate::window::primary_monitor().rcMonitor;
+        let k = ppp(ctx);
+        let (ww, wh) = (WIN_W * k, WIN_H * k);
+        let off = (14.0 * k) as i32;
+        let x = (cx + off).clamp(mon.left + 4, (mon.right - ww as i32 - 4).max(mon.left + 4));
+        let y = (cy + off).clamp(mon.top + 4, (mon.bottom - wh as i32 - 4).max(mon.top + 4));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            x as f32 / k,
+            y as f32 / k,
+        )));
     }
 
     fn load_edits(&mut self) {

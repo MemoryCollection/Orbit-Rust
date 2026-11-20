@@ -190,9 +190,10 @@ pub const WEATHER_TEXT_SCALE: f32 = 1.25;
 pub const SHOW_DOCK: bool = true;
 /// Dock 高度
 pub const DOCK_H: f32 = 56.0;
-/// Dock 图标边长
-pub const DOCK_ICON: f32 = 44.0;
-/// 图标槽位（悬停底 = 图标 + 2px）
+/// Dock 图标边长（任务与托盘共用；比槽位小一圈，图标"占面"更透气，
+/// Dock 总尺寸由槽位决定、保持不变）
+pub const DOCK_ICON: f32 = 36.0;
+/// 图标槽位（间距节奏，决定 Dock 总长度）
 pub const DOCK_SLOT: f32 = 46.0;
 /// 相邻图标间距
 pub const DOCK_GAP: f32 = 6.0;
@@ -201,8 +202,10 @@ pub const DOCK_PAD_X: f32 = 12.0;
 /// 圆角半径：等于一半高度 → 完全胶囊形（高度变小时按 `min(dock_radius, 高/2)` 收）
 ///
 /// 实际值随主题变（`cfg::cur().dock_radius`），这里只保留名字方便检索。
-/// 悬停时图标放大量（逻辑点）：配合圆底让图标"浮"起来
-pub const DOCK_HOVER_GROW: f32 = 2.0;
+/// 波浪放大：光标划过时图标按与光标的距离高斯放大，最大 +45%
+pub const DOCK_WAVE_AMP: f32 = 0.45;
+/// 波浪放大的衰减半径（逻辑点）：约 1.3 个槽位，波浪覆盖相邻 2~3 个图标
+pub const DOCK_WAVE_SIGMA: f32 = 62.0;
 /// 距屏幕底部距离
 pub const DOCK_BOTTOM_MARGIN: i32 = 8;
 /// 运行中窗口重扫间隔（毫秒）

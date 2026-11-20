@@ -198,6 +198,8 @@ pub struct Dock {
     winlist_size: (i32, i32),
     /// 鼠标离开弹窗的那一刻（超过 `WINLIST_GRACE_MS` 就收起）
     winlist_left: Option<Instant>,
+    /// 光标在 Dock 窗口内的位置（逻辑点），驱动图标的波浪放大；离开 Dock 置 None
+    mouse: Option<(f32, f32)>,
 }
 
 pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -287,9 +289,15 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             WM_MOUSEMOVE => {
                 let x = (l.0 & 0xFFFF) as u16 as i16 as i32;
                 let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-                let desk = dock.desktop_at(x as f32, y as f32);
-                let idx = if desk { None } else { dock.index_at(x as f32, y as f32) };
-                let tidx = if desk { None } else { dock.tray_index_at(x as f32, y as f32) };
+                // 记录光标位置（逻辑点）：波浪放大跟着光标走
+                let (fx, fy) = (x as f32, y as f32);
+                let k = dock.scale.max(0.5);
+                let new_mouse = Some((fx / k, fy / k));
+                let mouse_moved = new_mouse != dock.mouse;
+                dock.mouse = new_mouse;
+                let desk = dock.desktop_at(fx, fy);
+                let idx = if desk { None } else { dock.index_at(fx, fy) };
+                let tidx = if desk { None } else { dock.tray_index_at(fx, fy) };
                 if idx != dock.hovered || tidx != dock.hovered_tray || desk != dock.hovered_desktop {
                     dock.hovered = idx;
                     dock.hovered_tray = tidx;
@@ -298,6 +306,9 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     // 悬停即显示提示条（托盘名字来自 UIA，任务图标用程序名）
                     dock.update_tip();
                     dock.forward_hover();
+                } else if mouse_moved {
+                    // 悬停目标没变但光标在动：波浪放大要跟随光标，逐帧重绘
+                    dock.render();
                 }
                 // 指针还停在同一个托盘图标上：像真托盘那样隔一会儿补一条 WM_MOUSEMOVE，
                 // 应用（微信）靠它维持 hover 跟踪，只发一次 enter 不够
@@ -329,6 +340,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             WM_MOUSELEAVE => {
                 dock.mouse_tracked = false;
+                dock.mouse = None;
                 dock.hide_tip();
                 // 注意不能写成 `a.take().is_some() || b.take().is_some()`：
                 // 短路后第二个 take 不会执行，托盘悬停状态会卡住
@@ -506,6 +518,7 @@ impl Dock {
             winlist_rects: Vec::new(),
             winlist_size: (0, 0),
             winlist_left: None,
+            mouse: None,
         }
     }
 
@@ -892,9 +905,10 @@ impl Dock {
             })
             .collect();
         let out = self.view.paint(
-            w, h, self.scale, &icons, self.hovered, self.active, &tray_icons,
-            self.hovered_tray, self.active_tray,
+            w, h, self.scale, &icons, self.active, &tray_icons,
+            self.active_tray,
             show_tray, show_desktop, self.hovered_desktop, vertical,
+            self.mouse,
         );
         self.rects = out.rects.clone();
         self.tray_rects = out.tray_rects.clone();

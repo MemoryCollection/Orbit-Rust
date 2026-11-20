@@ -36,6 +36,19 @@ fn icon_k() -> f32 {
     crate::settings::icon_scale().clamp(0.5, 2.0)
 }
 
+/// 波浪放大倍数：光标停在主轴 `c` 处时，主轴坐标 `axis` 上的图标放大多少。
+/// 高斯衰减（macOS Dock 同款手感）：光标正上方 ≈ 1+AMP，相邻格平滑过渡到 1。
+/// `cursor_axis = None`（光标不在 Dock 上）时恒为 1。
+fn wave_mag(cursor_axis: Option<f32>, axis: f32) -> f32 {
+    match cursor_axis {
+        None => 1.0,
+        Some(c) => {
+            let d = (c - axis) / cfg::DOCK_WAVE_SIGMA;
+            1.0 + cfg::DOCK_WAVE_AMP * (-d * d).exp()
+        }
+    }
+}
+
 /// 前台指示条：图标下沿一条短横条（任务栏那套视觉语言）。竖排时整条转向，
 /// 贴在"远离屏幕中心"的那一侧。任务图标和托盘图标共用，前台是谁就给谁画。
 fn active_bar(p: &egui::Painter, rect: egui::Rect, slot: f32, cross: f32, vertical: bool) {
@@ -129,13 +142,17 @@ impl DockView {
     }
 
     /// 画一帧 Dock。w/h 是物理像素尺寸，scale 是 pixels_per_point。
+    ///
+    /// `cursor`：光标在 Dock 窗口内的位置（逻辑点），用于波浪放大；
+    /// None = 光标不在 Dock 上，全部图标按基准大小画。
     pub fn paint(
         &mut self,
         w: i32, h: i32, scale: f32,
-        icons: &[&[u8]], hovered: Option<usize>, active: Option<usize>,
-        tray_icons: &[&[u8]], hovered_tray: Option<usize>, active_tray: Option<usize>,
+        icons: &[&[u8]], active: Option<usize>,
+        tray_icons: &[&[u8]], active_tray: Option<usize>,
         show_tray: bool, show_desktop: bool, hovered_desktop: bool,
         vertical: bool,
+        cursor: Option<(f32, f32)>,
     ) -> DockPainted {
         // Dock 图标大小设置：整套尺寸（含底板高度、槽位、间距）等比缩放，
         // 文字/图标按新的目标像素重新光栅化，不是位图拉伸
@@ -150,6 +167,17 @@ impl DockView {
         let isz = cfg::DOCK_ICON;
         let cross = if vertical { fw } else { fh };
         let long = if vertical { fh } else { fw };
+
+        // ---- 波浪放大 ----
+        // 光标沿主轴的坐标；图标按与光标的距离高斯放大（覆盖相邻 2~3 格）
+        let cursor_axis = cursor.map(|(x, y)| if vertical { y } else { x });
+        // 放大时图标朝屏幕内侧"浮出"的方向：底部 Dock 向上、左锚向右、右锚向左
+        let (gx, gy) = match crate::settings::dock_anchor() {
+            crate::settings::DockAnchor::Bottom => (0.0, -1.0),
+            crate::settings::DockAnchor::Top => (0.0, 1.0),
+            crate::settings::DockAnchor::Left => (1.0, 0.0),
+            crate::settings::DockAnchor::Right => (-1.0, 0.0),
+        };
 
         let mut rects_pt: Vec<[f32; 4]> = Vec::new();
         let mut tray_rects_pt: Vec<[f32; 4]> = Vec::new();
@@ -190,27 +218,23 @@ impl DockView {
                     let (rx, ry) = if vertical { (rc, pos) } else { (pos, rc) };
                     let rect = egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(slot, slot));
                     rects_pt.push([rx, ry, slot, slot]);
-                    if Some(i) == hovered {
-                        // 圆形悬停药丸：比图标再大一圈（3px），否则会被图标整个盖住，
-                        // 只剩一圈弧线看不出是"底"
-                        let c = rect.center();
-                        let rr = slot * 0.5 + 3.0;
-                        p.circle_filled(c, rr, argb(cfg::cur().dock_hover));
-                        p.circle_stroke(
-                            c,
-                            rr - 0.5,
-                            egui::Stroke::new(1.0, argb(cfg::cur().dock_hover_edge)),
-                        );
-                    }
+                    // 波浪放大：中心沿主轴按槽位算，放大倍数随光标距离衰减；
+                    // 放大出的部分朝屏幕内侧浮出（内缘锚定：偏移 = 增量的一半）
+                    let axis = pos + slot * 0.5;
+                    let side = isz * wave_mag(cursor_axis, axis);
+                    let lift = (side - isz) * 0.5;
+                    let icon_c = egui::pos2(
+                        (rx + slot * 0.5) + gx * lift,
+                        (ry + slot * 0.5) + gy * lift,
+                    );
                     // 浅色主题下彩色图标直接压在浅底上会发脏，先垫一层圆角白底
                     if !buf.is_empty() && cfg::cur().icon_backing != 0 {
-                        let br = egui::Rect::from_center_size(
-                            rect.center(),
-                            egui::vec2(isz + 2.0, isz + 2.0),
-                        );
                         p.rect_filled(
-                            br,
-                            egui::CornerRadius::same((isz * 0.22) as u8),
+                            egui::Rect::from_center_size(
+                                icon_c,
+                                egui::vec2(side + 2.0, side + 2.0),
+                            ),
+                            egui::CornerRadius::same((side * 0.22) as u8),
                             argb(cfg::cur().icon_backing),
                         );
                     }
@@ -220,16 +244,9 @@ impl DockView {
                         let n_px = side_px * side_px;
                         if n_px * 4 <= buf.len() {
                             let tex = soft.soft_image(&buf[..n_px * 4], side_px, side_px);
-                            // 悬停时图标跟着放大一点，"浮"在圆底上
-                            let side = isz
-                                + if Some(i) == hovered { cfg::DOCK_HOVER_GROW } else { 0.0 };
-                            let ir = egui::Rect::from_min_size(
-                                egui::pos2(rx + (slot - side) / 2.0, ry + (slot - side) / 2.0),
-                                egui::vec2(side, side),
-                            );
                             p.image(
                                 tex.id(),
-                                ir,
+                                egui::Rect::from_center_size(icon_c, egui::vec2(side, side)),
                                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                                 egui::Color32::WHITE,
                             );
@@ -282,25 +299,21 @@ impl DockView {
                         let rc = (cross - tslot) / 2.0;
                         let (rx, ry) = if vertical { (rc, pos) } else { (pos, rc) };
                         tray_rects_pt.push([rx, ry, tslot, tslot]);
-                        if Some(i) == hovered_tray {
-                            // 与任务图标同一套悬停药丸（半径同样 +3），槽位一样大才对得齐
-                            let center = egui::pos2(rx + tslot / 2.0, ry + tslot / 2.0);
-                            let rr = tslot * 0.5 + 3.0;
-                            p.circle_filled(center, rr, argb(cfg::cur().dock_hover));
-                            p.circle_stroke(
-                                center,
-                                rr - 0.5,
-                                egui::Stroke::new(1.0, argb(cfg::cur().dock_hover_edge)),
-                            );
-                        }
+                        // 托盘图标与任务图标同一套波浪放大（大小已统一）
+                        let t_axis = pos + tslot * 0.5;
+                        let t_side = tisz * wave_mag(cursor_axis, t_axis);
+                        let t_lift = (t_side - tisz) * 0.5;
+                        let t_center = egui::pos2(
+                            (rx + tslot * 0.5) + gx * t_lift,
+                            (ry + tslot * 0.5) + gy * t_lift,
+                        );
                         if !buf.is_empty() && cfg::cur().icon_backing != 0 {
-                            let bc = egui::pos2(rx + tslot / 2.0, ry + tslot / 2.0);
                             p.rect_filled(
                                 egui::Rect::from_center_size(
-                                    bc,
-                                    egui::vec2(tisz + 2.0, tisz + 2.0),
+                                    t_center,
+                                    egui::vec2(t_side + 2.0, t_side + 2.0),
                                 ),
-                                egui::CornerRadius::same((tisz * 0.22) as u8),
+                                egui::CornerRadius::same((t_side * 0.22) as u8),
                                 argb(cfg::cur().icon_backing),
                             );
                         }
@@ -310,13 +323,12 @@ impl DockView {
                             let n_px = side_px * side_px;
                             if n_px * 4 <= buf.len() {
                                 let tex = soft.soft_image(&buf[..n_px * 4], side_px, side_px);
-                                let ir = egui::Rect::from_min_size(
-                                    egui::pos2(rx + (tslot - tisz) / 2.0, ry + (tslot - tisz) / 2.0),
-                                    egui::vec2(tisz, tisz),
-                                );
                                 p.image(
                                     tex.id(),
-                                    ir,
+                                    egui::Rect::from_center_size(
+                                        t_center,
+                                        egui::vec2(t_side, t_side),
+                                    ),
                                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                                     egui::Color32::WHITE,
                                 );
