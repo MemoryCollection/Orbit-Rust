@@ -16,20 +16,14 @@ pub struct PanelPainted {
     pub hits: Vec<([f32; 4], u32)>,
 }
 
-// ---- 文本度量工具（egui 字体，逻辑点空间）----
+// ---- 文本度量工具（走 SoftBackend 的独立度量通道，pass 之前也能用）----
 
 fn tw(soft: &SoftBackend, text: &str, size: f32) -> f32 {
-    let fid = egui::FontId::proportional(size);
-    soft.ctx().fonts_mut(|f| {
-        f.layout_no_wrap(text.to_string(), fid, egui::Color32::WHITE).size().x
-    })
+    soft.text_width(text, egui::FontId::proportional(size))
 }
 
 fn th(soft: &SoftBackend, text: &str, size: f32) -> f32 {
-    let fid = egui::FontId::proportional(size);
-    soft.ctx().fonts_mut(|f| {
-        f.layout_no_wrap(text.to_string(), fid, egui::Color32::WHITE).size().y
-    })
+    soft.text_height(text, egui::FontId::proportional(size))
 }
 
 fn ellipsize(soft: &SoftBackend, text: &str, max_w: f32, size: f32) -> String {

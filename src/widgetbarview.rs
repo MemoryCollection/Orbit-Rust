@@ -57,23 +57,15 @@ pub fn paint(
     let txt_font = egui::FontId::proportional(cfg::WIDGET_TEXT_SIZE);
     let icon_font = egui::FontId::proportional(cfg::WIDGET_ICON_CELL * 0.85);
 
-    // 预量每个 widget 的文本宽（画和量用同一套 Galley）
-    let item_text: Vec<Option<std::sync::Arc<egui::Galley>>> = widgets
+    // 预量每个 widget 的文本宽（走 SoftBackend 的独立度量通道：pass 之前也能量）
+    let item_text_w: Vec<f32> = widgets
         .iter()
-        .map(|it| {
-            if it.text.is_empty() {
-                None
-            } else {
-                Some(soft.ctx().fonts_mut(|f| {
-                    f.layout_no_wrap(it.text.clone(), txt_font.clone(), egui::Color32::WHITE)
-                }))
-            }
-        })
+        .map(|it| soft.text_width(&it.text, txt_font.clone()))
         .collect();
     let item_w: Vec<f32> = widgets
         .iter()
-        .zip(&item_text)
-        .map(|(it, t)| {
+        .zip(&item_text_w)
+        .map(|(it, tw)| {
             let mut iw = 0.0;
             if !it.icon.is_empty() {
                 iw += cfg::WIDGET_ICON_CELL;
@@ -81,9 +73,7 @@ pub fn paint(
                     iw += cfg::WIDGET_ICON_GAP;
                 }
             }
-            if let Some(g) = t {
-                iw += g.size().x;
-            }
+            iw += *tw;
             iw
         })
         .collect();

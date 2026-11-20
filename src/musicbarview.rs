@@ -19,12 +19,9 @@ pub fn fixed_w() -> f32 {
     cfg::MUSIC_COVER_PAD + cfg::MUSIC_COVER + cfg::MUSIC_COVER_GAP + cfg::LYRIC_PAD_X
 }
 
-/// 歌词文本的逻辑宽度（egui 字体度量）。
+/// 歌词文本的逻辑宽度（走 SoftBackend 的独立度量通道：pass 之前也能量）。
 pub fn text_w(soft: &SoftBackend, text: &str, font: f32) -> f32 {
-    let fid = egui::FontId::proportional(font);
-    soft.ctx().fonts_mut(|f| {
-        f.layout_no_wrap(text.to_string(), fid, egui::Color32::WHITE).size().x
-    })
+    soft.text_width(text, egui::FontId::proportional(font))
 }
 
 /// 按最大逻辑宽度截断并加省略号（egui 字体度量）。

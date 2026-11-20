@@ -260,24 +260,18 @@ impl DockView {
         let font = egui::FontId::proportional(cfg::TIP_TEXT_SIZE);
         let max_w = cfg::TIP_MAX_W;
 
-        // 用 egui 字体度量截断
+        // 用 SoftBackend 的独立度量通道截断（pass 之前也能量）
         let mut s = label.to_string();
-        let mut tw = self.soft.ctx().fonts_mut(|f| {
-            f.layout_no_wrap(s.clone(), font.clone(), egui::Color32::WHITE).size().x
-        });
+        let mut tw = self.soft.text_width(&s, font.clone());
         if tw > max_w {
             let mut chars: Vec<char> = label.chars().collect();
             while tw > max_w && chars.len() > 1 {
                 chars.pop();
                 s = format!("{}…", chars.iter().collect::<String>());
-                tw = self.soft.ctx().fonts_mut(|f| {
-                    f.layout_no_wrap(s.clone(), font.clone(), egui::Color32::WHITE).size().x
-                });
+                tw = self.soft.text_width(&s, font.clone());
             }
         }
-        let th = self.soft.ctx().fonts_mut(|f| {
-            f.layout_no_wrap(s.clone(), font.clone(), egui::Color32::WHITE).size().y
-        });
+        let th = self.soft.text_height(&s, font.clone());
 
         let pad_x = cfg::TIP_PAD_X;
         let pad_y = cfg::TIP_PAD_Y;

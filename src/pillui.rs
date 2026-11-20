@@ -121,31 +121,20 @@ impl PillUi {
         let scale = v.scale.max(0.5);
         self.soft.set_scale(scale);
 
-        // ---- 布局预量宽（egui 自己的字体度量，画和量用同一套 Galley） ----
+        // ---- 布局预量宽（走 SoftBackend 的独立度量通道：pass 之前也能量） ----
         let time_font = egui::FontId::proportional(cfg::TIME_SIZE);
         let txt_font = egui::FontId::proportional(cfg::WIDGET_TEXT_SIZE);
         let icon_font = egui::FontId::proportional(cfg::WIDGET_ICON_CELL * 0.85);
-        let clock_gal = self.soft.ctx().fonts_mut(|f| {
-            f.layout_no_wrap(v.clock.to_string(), time_font.clone(), egui::Color32::WHITE)
-        });
-        let cw = clock_gal.size().x;
-        let item_text: Vec<Option<std::sync::Arc<egui::Galley>>> = v
+        let cw = self.soft.text_width(v.clock, time_font.clone());
+        let item_text_w: Vec<f32> = v
             .items
             .iter()
-            .map(|it| {
-                if it.text.is_empty() {
-                    None
-                } else {
-                    Some(self.soft.ctx().fonts_mut(|f| {
-                        f.layout_no_wrap(it.text.clone(), txt_font.clone(), egui::Color32::WHITE)
-                    }))
-                }
-            })
+            .map(|it| self.soft.text_width(&it.text, txt_font.clone()))
             .collect();
         let item_w: Vec<f32> = v
             .items
             .iter()
-            .zip(&item_text)
+            .zip(&item_text_w)
             .map(|(it, t)| {
                 let mut w = 0.0;
                 if !it.icon.is_empty() {
@@ -154,9 +143,7 @@ impl PillUi {
                         w += cfg::WIDGET_ICON_GAP;
                     }
                 }
-                if let Some(g) = t {
-                    w += g.size().x;
-                }
+                w += *t;
                 w
             })
             .collect();
@@ -347,11 +334,11 @@ impl PillUi {
             }
         };
         mix(&mut hash, v.clock.as_bytes());
-        for (it, t) in v.items.iter().zip(&item_text) {
+        for (it, tw) in v.items.iter().zip(&item_text_w) {
             mix(&mut hash, it.icon.as_bytes());
             mix(&mut hash, &it.icon_argb.to_le_bytes());
             mix(&mut hash, it.text.as_bytes());
-            mix(&mut hash, &t.as_ref().map_or(0, |g| g.size().x.to_bits()).to_le_bytes());
+            mix(&mut hash, &tw.to_bits().to_le_bytes());
         }
         for f in v.flash {
             mix(&mut hash, f.rgba);

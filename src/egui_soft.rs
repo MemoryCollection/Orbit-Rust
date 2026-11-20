@@ -9,9 +9,11 @@
 //! - 字体纹理与图标纹理都在预乘域，直接分量相乘即可正确合成；
 //! - egui 顶层面板会画不透明的 panel_fill 底，必须在样式里置成 TRANSPARENT。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use eframe::egui;
+use eframe::egui::epaint;
 use eframe::egui::epaint::Primitive;
 
 use crate::config as cfg;
@@ -37,6 +39,62 @@ pub fn image_to_tex(img: &egui::ImageData) -> Option<TexData> {
         px.extend_from_slice(&c.to_array());
     }
     Some(TexData { w: w as i32, h: h as i32, px })
+}
+
+/// 把一张 ImageDelta 合并进已有的 TexData。
+///
+/// egui 的字体图集是**局部更新**（`pos = Some([x, y])` 表示只更新那一块），
+/// 不能当成整张纹理替换，否则会丢掉其它字形。这里按 pos 逐块拷贝。
+fn merge_delta(tex: &mut TexData, img: &egui::ImageData, pos: Option<[usize; 2]>) {
+    let egui::ImageData::Color(ci) = img;
+    let [w, h] = ci.size;
+    if w == 0 || h == 0 {
+        return;
+    }
+    match pos {
+        None => {
+            // 整张替换
+            tex.w = w as i32;
+            tex.h = h as i32;
+            tex.px.clear();
+            tex.px.reserve(w * h * 4);
+            for c in &ci.pixels {
+                tex.px.extend_from_slice(&c.to_array());
+            }
+        }
+        Some([px0, py0]) => {
+            // 局部更新：目标必须放得下，否则扩容后拷贝
+            let need_w = (px0 + w) as i32;
+            let need_h = (py0 + h) as i32;
+            if need_w > tex.w || need_h > tex.h {
+                let new_w = tex.w.max(need_w);
+                let new_h = tex.h.max(need_h);
+                let mut np = vec![0u8; (new_w * new_h * 4) as usize];
+                // 拷回旧内容
+                for y in 0..tex.h.min(new_h) {
+                    for x in 0..tex.w.min(new_w) {
+                        let si = ((y * tex.w + x) * 4) as usize;
+                        let di = ((y * new_w + x) * 4) as usize;
+                        np[di..di + 4].copy_from_slice(&tex.px[si..si + 4]);
+                    }
+                }
+                tex.w = new_w;
+                tex.h = new_h;
+                tex.px = np;
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let si = (y * w + x) * 4;
+                    let di = (((py0 + y) * tex.w as usize) + (px0 + x)) * 4;
+                    if si + 3 >= ci.pixels.len() * 4 || di + 3 >= tex.px.len() {
+                        continue;
+                    }
+                    let c = ci.pixels[y * w + x].to_array();
+                    tex.px[di..di + 4].copy_from_slice(&c);
+                }
+            }
+        }
+    }
 }
 
 /// 双线性采样（uv 是 epaint 约定的纹理像素坐标）。
@@ -118,7 +176,8 @@ pub fn fill_tri(
                 continue;
             }
             let s = if let Some(t) = tex {
-                // epaint 的 uv 是归一化 0..1（UvRect 用 u16 定点），乘纹理尺寸得纹素坐标
+                // epaint 的 uv 是**归一化**的 0..1（见 tessellator 的 uv_normalizer），
+                // 所以要乘回纹理尺寸才能得到纹素坐标。
                 let u = v[0].uv.x * w0 + v[1].uv.x * w1 + v[2].uv.x * w2;
                 let vv = v[0].uv.y * w0 + v[1].uv.y * w1 + v[2].uv.y * w2;
                 sample_tex(t, u * t.w as f32, vv * t.h as f32)
@@ -129,17 +188,65 @@ pub fn fill_tri(
             if idx + 3 >= buf.len() {
                 continue;
             }
+            // 预乘 over：out = src + dst * (1 - src.a)
+            //
+            // 注意 src 各分量都在 **0..255**（纹理字节 × 顶点色字节 / 255），
+            // 所以 (1 - src.a) 之前必须先把 alpha 归一化到 0..1，
+            // 否则 (1.0 - 200.0) 这种大负数会把已铺好的底色减成透明空洞
+            // （表现为文字/图标在底色上"挖洞"）。
+            let mut src = [0.0f32; 4];
             for k in 0..4 {
                 let cv = (col[0][k] as f32 * w0 + col[1][k] as f32 * w1 + col[2][k] as f32 * w2) / 255.0;
-                let src = s[k] * cv; // 纹理 × 顶点色，预乘域
+                src[k] = s[k] * cv;
+            }
+            let keep = 1.0 - src[3] / 255.0;
+            for k in 0..4 {
                 let dst = buf[idx + k] as f32;
-                buf[idx + k] = (src + dst * (1.0 - src)).round().clamp(0.0, 255.0) as u8;
+                buf[idx + k] = (src[k] + dst * keep).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
 }
 
 // ---------- 公共后端 ----------
+
+/// 独立的字体度量通道。
+///
+/// egui 0.37 里 `Context::fonts` 是**懒初始化**的：`ctx.fonts` 为 `Option<Fonts>`，
+/// 直到第一次 `run_ui()`（内部 `begin_pass` → `update_fonts_mut`）才被创建，
+/// 在此之前调用 `ctx.fonts()` / `ctx.fonts_mut()` 会 panic
+/// （"No fonts available until first call to Context::run()"）。
+///
+/// 但各个视图都必须**先量宽**才能算出分层窗口的物理尺寸，量宽天然发生在 pass 之前，
+/// 所以这里自持一份 `epaint::Fonts`：用与 Context 完全相同的 `FontDefinitions`、
+/// `TextOptions` 和 pixels_per_point，量出来的尺寸与 pass 内部的布局逐像素一致。
+struct MeasureFonts {
+    fonts: epaint::Fonts,
+    options: epaint::TextOptions,
+    ppp: f32,
+    viewport: epaint::text::ViewportKey,
+}
+
+impl MeasureFonts {
+    fn new(defs: egui::FontDefinitions, options: epaint::TextOptions, ppp: f32) -> Self {
+        let mut fonts = epaint::Fonts::new(options, defs);
+        // 固定的 viewport key：本实例只服务一个窗口，缓存不会互相踩
+        let viewport = epaint::text::ViewportKey::new(0x0b17_0001);
+        fonts.begin_pass(options, viewport);
+        Self { fonts, options, ppp, viewport }
+    }
+
+    /// 开始"一帧"：回收上一帧没用到的 Galley 缓存（等价于 pass 内的 begin_pass）。
+    fn begin_frame(&mut self, ppp: f32) {
+        self.ppp = ppp;
+        self.fonts.begin_pass(self.options, self.viewport);
+    }
+
+    fn layout(&mut self, text: &str, font_id: egui::FontId) -> egui::Vec2 {
+        let mut view = self.fonts.with_pixels_per_point_for_viewport(self.ppp, self.viewport);
+        view.layout_no_wrap(text.to_owned(), font_id, egui::Color32::WHITE).size()
+    }
+}
 
 /// egui 软件后端：持有 Context 与纹理表，负责光栅化与像素块上传。
 /// 每个分层窗口持有一个实例。
@@ -150,6 +257,12 @@ pub struct SoftBackend {
     /// straight RGBA 像素块的纹理缓存（key = 内容 hash）
     image_cache: HashMap<u64, egui::TextureHandle>,
     last_scale: f32,
+    /// 当前目标 pixels_per_point（度量通道用，总是最新值）
+    scale: f32,
+    /// 字体定义（度量通道复用同一份，保证度量与渲染同源）
+    font_defs: egui::FontDefinitions,
+    /// pass 之外的字体度量通道（惰性创建：`Fonts::new` 很贵）
+    measure: RefCell<Option<MeasureFonts>>,
 }
 
 impl Default for SoftBackend {
@@ -161,7 +274,7 @@ impl Default for SoftBackend {
 impl SoftBackend {
     pub fn new() -> Self {
         let ctx = egui::Context::default();
-        install_fonts(&ctx);
+        let font_defs = install_fonts(&ctx);
         // CentralPanel 会铺一层不透明的 panel_fill，必须压成透明（逐像素 alpha 窗口）
         ctx.style_mut_of(egui::Theme::Dark, |st| {
             st.visuals.panel_fill = egui::Color32::TRANSPARENT;
@@ -171,6 +284,9 @@ impl SoftBackend {
             tex: HashMap::new(),
             image_cache: HashMap::new(),
             last_scale: 0.0,
+            scale: 1.0,
+            font_defs,
+            measure: RefCell::new(None),
         }
     }
 
@@ -180,20 +296,66 @@ impl SoftBackend {
     }
 
     /// 设置 pixels_per_point（scale 变化时才真正下发）。
+    ///
+    /// 每个视图在画之前都会先调它，所以这里顺带推进度量通道的"帧"，
+    /// 让 Galley 缓存按帧回收。
     pub fn set_scale(&mut self, scale: f32) {
         let scale = scale.max(0.5);
+        self.scale = scale;
         if (self.last_scale - scale).abs() > f32::EPSILON {
             self.ctx.set_pixels_per_point(scale);
             self.last_scale = scale;
         }
+        if let Some(m) = self.measure.get_mut().as_mut() {
+            m.begin_frame(scale);
+        }
+    }
+
+    /// 量一段文字的尺寸（**逻辑点**）。在 `run_ui` 之前调用也安全。
+    pub fn text_size(&self, text: &str, font_id: egui::FontId) -> egui::Vec2 {
+        let mut slot = self.measure.borrow_mut();
+        let m = slot.get_or_insert_with(|| {
+            let mut options = self.ctx.style_of(egui::Theme::Dark).visuals.text_options;
+            // 与 InputState::default().max_texture_side 一致（RawInput 未指定时的取值）
+            options.max_texture_side = 2048;
+            MeasureFonts::new(self.font_defs.clone(), options, self.scale.max(0.5))
+        });
+        m.layout(text, font_id)
+    }
+
+    /// 量一段文字的宽度（逻辑点）。
+    pub fn text_width(&self, text: &str, font_id: egui::FontId) -> f32 {
+        self.text_size(text, font_id).x
+    }
+
+    /// 量一段文字的高度（逻辑点）。
+    pub fn text_height(&self, text: &str, font_id: egui::FontId) -> f32 {
+        self.text_size(text, font_id).y
     }
 
     /// 消费一帧的纹理增量（上传 / 释放）。
     pub fn update_textures(&mut self, delta: &egui::TexturesDelta) {
         for (id, deltas) in &delta.set {
             for d in deltas {
-                if let Some(t) = image_to_tex(&d.image) {
-                    self.tex.insert(*id, t);
+                // 字体图集是**局部更新**（pos = Some），必须合并进已有纹理，
+                // 不能整体替换，否则会丢掉其它字形。
+                match self.tex.get_mut(id) {
+                    Some(t) => merge_delta(t, &d.image, d.pos),
+                    None => {
+                        if let Some(mut t) = image_to_tex(&d.image) {
+                            if let Some(pos) = d.pos {
+                                // 局部纹理：先占位到目标大小，再合并
+                                let need_w = (pos[0] + d.image.size()[0]) as i32;
+                                let need_h = (pos[1] + d.image.size()[1]) as i32;
+                                let mut np = vec![0u8; (need_w * need_h * 4) as usize];
+                                std::mem::swap(&mut t.px, &mut np);
+                                t.w = need_w;
+                                t.h = need_h;
+                                merge_delta(&mut t, &d.image, d.pos);
+                            }
+                            self.tex.insert(*id, t);
+                        }
+                    }
                 }
             }
         }
@@ -297,7 +459,17 @@ pub fn divider(p: &egui::Painter, x: f32, fh: f32) {
 
 /// 中文字体兜底：微软雅黑 + Segoe UI Symbol（天气/信封/剪贴板这些字形符号），
 /// 追加到比例字体族末尾做回退。
-pub fn install_fonts(ctx: &egui::Context) {
+///
+/// 返回同一份 `FontDefinitions`：pass 之外的度量通道要复用它，
+/// 否则量出来的宽度和渲染时的 Galley 不一致。
+pub fn install_fonts(ctx: &egui::Context) -> egui::FontDefinitions {
+    let fonts = build_font_definitions();
+    ctx.set_fonts(fonts.clone());
+    fonts
+}
+
+/// 构建三套字体定义（不设置到任何 Context）。
+fn build_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     let candidates = [
         "C:/Windows/Fonts/msyh.ttc",
@@ -313,5 +485,5 @@ pub fn install_fonts(ctx: &egui::Context) {
             fonts.families.entry(egui::FontFamily::Proportional).or_default().push(format!("soft_cjk{i}"));
         }
     }
-    ctx.set_fonts(fonts);
+    fonts
 }
