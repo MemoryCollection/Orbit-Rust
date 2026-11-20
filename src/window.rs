@@ -16,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, PostQuitMessage,
     SetTimer, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW,
     GWLP_USERDATA, HWND_TOPMOST, SWP_NOACTIVATE, WM_COPYDATA, WM_CREATE,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_RBUTTONUP, WM_TIMER,
 };
 
@@ -250,7 +250,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 app.render();
                 LRESULT(0)
             }
-            WM_DISPLAYCHANGE => {
+            WM_DISPLAYCHANGE | WM_DPICHANGED => {
+                // 分辨率/系统缩放变化：重读 DPI 再重绘。self.scale 只在这里和 init 更新，
+                // 不处理的话改缩放后内容仍按旧 scale 画进新尺寸的窗口（胶囊错位/裁字）
+                app.scale = GetDpiForWindow(hwnd) as f32 / 96.0;
                 app.render();
                 LRESULT(0)
             }
@@ -594,6 +597,8 @@ impl App {
             })
             .unwrap_or(self.pos);
         crate::tlog!("[pill] 点击闪烁图标 {}（{}）", f.name, f.key);
+        // 点击 = 悬停结束，先吊销守位线程（与 Dock 托盘同规则），别让它碰应用的真面板
+        crate::flyout::cancel(t.hwnd, t.pid);
         traymsg::click(&t, (cx, cy), dbl);
     }
 

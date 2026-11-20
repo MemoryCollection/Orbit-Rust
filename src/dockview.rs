@@ -157,14 +157,11 @@ impl DockView {
 
         let ctx = self.soft.ctx().clone();
         let soft = &mut self.soft;
+        // ppp 每帧走 RawInput（见 egui_soft::input 的注释）：不带会被 egui 当 1.0，
+        // 缩放 ≠ 1.0 时底板/图标/命中矩形整体错位
+        let input = soft.input(fw, fh);
         let out = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(fw, fh),
-                )),
-                ..Default::default()
-            },
+            input,
             |ui| {
                 let p = ui.painter().clone();
                 // ---- 底板：胶囊圆角 + 1px 内描边 + 顶面反光 ----

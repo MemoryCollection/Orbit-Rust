@@ -34,8 +34,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LR_LOADFROMFILE, WNDCLASSW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWLP_USERDATA,
     GW_OWNER, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, SWP_NOACTIVATE, SW_HIDE, SW_RESTORE,
-    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WS_EX_LAYERED,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -368,6 +368,8 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     let c = dock.tray_center(idx);
                     if let Some(t) = dock.tray_targets.get(&c).copied() {
                         crate::vlog!("[dock] 左键托盘#{idx}（回调消息{}）", if dbl { " 双击" } else { "" });
+                        // 点击 = 悬停结束，应用要开真面板了：先吊销守位线程，别让它碰真 UI
+                        flyout::cancel(t.hwnd, t.pid);
                         traymsg::click(&t, c, dbl);
                     } else if let Some(&real) = dock.tray_shown.get(idx) {
                         crate::vlog!("[dock] 左键托盘 显示#{idx} → 实际#{real}（UIA）");
@@ -401,6 +403,8 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     match dock.tray_targets.get(&c).copied() {
                         Some(t) => {
                             crate::vlog!("[dock] 右键托盘#{idx}（回调消息）");
+                            // 同左键：右键弹出的菜单也是应用的真 UI，守位线程必须先停
+                            flyout::cancel(t.hwnd, t.pid);
                             traymsg::right_click(&t, c);
                         }
                         None => {
@@ -438,7 +442,11 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 }
                 LRESULT(0)
             }
-            WM_DISPLAYCHANGE => {
+            WM_DISPLAYCHANGE | WM_DPICHANGED => {
+                // 分辨率/系统缩放变化：重读 DPI 再重绘（图标像素、槽位、窗口尺寸都跟着走）
+                dock.scale = GetDpiForWindow(hwnd) as f32 / 96.0;
+                // 托盘图标像素按新边长立刻重采一次，别等 2s 的重扫定时器
+                dock.poll_tray();
                 dock.render();
                 LRESULT(0)
             }

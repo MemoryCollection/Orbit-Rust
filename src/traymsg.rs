@@ -41,11 +41,6 @@ pub const NIN_POPUPOPEN: u32 = 0x0406;
 pub const NIN_POPUPCLOSE: u32 = 0x0407;
 /// 左键的"激活"语义（v3/v4 才有）
 const NIN_SELECT: u32 = 0x0400;
-/// WM_MOUSEHOVER：**悬停转发的关键**。Explorer 进入图标时发的是它，不是 WM_MOUSEMOVE；
-/// 应用大都用 TrackMouseEvent(TME_HOVER) 等这一条来弹自己的预览卡片
-const WM_MOUSEHOVER: u32 = 0x02A1;
-/// WM_MOUSELEAVE
-const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// 跨线程传递的裸字段（`Target` 里有 HWND，不能直接 Send）
 pub type Raw = (u32, usize, u32, u32, u32);
@@ -67,6 +62,9 @@ impl Target {
         Self { pid: r.0, hwnd: HWND(r.1 as *mut c_void), msg: r.2, uid: r.3, ver: r.4 }
     }
 }
+
+/// WM_CONTEXTMENU：v3/v4 右键时 Explorer 实际发的通知（替代 RBUTTONDOWN/UP）
+const WM_CONTEXTMENU: u32 = 0x007B;
 
 fn encode(ver: u32, uid: u32, event: u32, x: i32, y: i32) -> (u32, u32) {
     if ver >= 4 {
@@ -91,16 +89,14 @@ fn send(t: &Target, event: u32, x: i32, y: i32) {
     }
 }
 
-/// 悬停进入：WM_MOUSEHOVER 打头（应用等的是这条），v3/v4 再补 NIN_POPUPOPEN。
-/// 坐标用图标矩形中心而不是真实光标——微信会校验指针是否落在自己图标附近。
+/// 悬停进入。Explorer 进图标时发的回调事件只有 WM_MOUSEMOVE（WM_MOUSEHOVER 是
+/// TrackMouseEvent 在**真窗口**上产生的窗口消息，不是托盘回调里的事件值，不能混用）；
+/// v4 且自绘 tooltip 的应用由 NIN_POPUPOPEN 触发弹出。
 pub fn hover(t: &Target, center: (i32, i32)) {
-    send(t, WM_MOUSEHOVER, center.0, center.1);
-    if t.ver >= 3 {
+    send(t, WM_MOUSEMOVE, center.0, center.1);
+    if t.ver >= 4 {
         send(t, NIN_POPUPOPEN, center.0, center.1);
     }
-    // Explorer 的序列是 hover→popupopen，紧接着还有一条 move：
-    // 有些应用只在 WM_MOUSEMOVE 才开始跟踪指针
-    send(t, WM_MOUSEMOVE, center.0, center.1);
 }
 
 /// 悬停期间维持跟踪（真托盘大约 150ms 一条）
@@ -108,37 +104,58 @@ pub fn hover_move(t: &Target, center: (i32, i32)) {
     send(t, WM_MOUSEMOVE, center.0, center.1);
 }
 
-/// 悬停离开：先 MOUSELEAVE 让应用收卡片，再补 NIN_POPUPCLOSE
+/// 悬停离开：只有 v4 自绘 tooltip 的应用需要 NIN_POPUPCLOSE 收尾
 pub fn leave(t: &Target, center: (i32, i32)) {
-    send(t, WM_MOUSELEAVE, center.0, center.1);
-    if t.ver >= 3 {
+    if t.ver >= 4 {
         send(t, NIN_POPUPCLOSE, center.0, center.1);
     }
 }
 
-/// 左键：down/up + NIN_SELECT（先让出前台权限，否则弹出的窗口会被焦点锁挡住）
+/// 左键。**严格按 Explorer 的真实行为发**：
+///   v3/v4 —— 整个单击只发**一条 NIN_SELECT**（微软文档：v3 起 NIN_SELECT/WM_CONTEXTMENU
+///            **替代** WM_LBUTTONDOWN/UP）。以前这里连发 DOWN→UP→NIN_SELECT 三条，
+///            对"抬起和 SELECT 都切换窗口"的应用等于连续点两次——窗口开了又立刻关
+///            （小米电脑管家实测：点击闪退、左右键都弹不出窗口，就是这个原因）。
+///   v0-2  —— WM_LBUTTONDOWN + WM_LBUTTONUP；双击第二击 DBLCLK + UP（第一击不重放）。
 pub fn click(t: &Target, center: (i32, i32), dbl: bool) {
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(t.pid);
     }
-    send(t, if dbl { WM_LBUTTONDBLCLK } else { WM_LBUTTONDOWN }, center.0, center.1);
-    send(t, WM_LBUTTONUP, center.0, center.1);
+    let (x, y) = center;
+    crate::tlog!(
+        "[traymsg] click v{} msg={:#x} uid={} dbl={} hwnd={:#x}",
+        t.ver, t.msg, t.uid, dbl, t.hwnd.0 as usize
+    );
     if t.ver >= 3 {
-        send(t, NIN_SELECT, center.0, center.1);
+        // 双击的第二击对 v3/v4 来说也只是又一条 NIN_SELECT，应用自己按时间差认双击
+        send(t, NIN_SELECT, x, y);
+        return;
     }
+    if dbl {
+        send(t, WM_LBUTTONDBLCLK, x, y);
+        send(t, WM_LBUTTONUP, x, y);
+        return;
+    }
+    send(t, WM_LBUTTONDOWN, x, y);
+    send(t, WM_LBUTTONUP, x, y);
 }
 
-/// 右键：down + up（Explorer 的语义里还会补一条 WM_CONTEXTMENU）
+/// 右键。v3/v4 只发一条 WM_CONTEXTMENU（Explorer 的真实行为）；v0-2 发 DOWN + UP。
 pub fn right_click(t: &Target, center: (i32, i32)) {
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(t.pid);
     }
-    send(t, WM_RBUTTONDOWN, center.0, center.1);
-    send(t, WM_RBUTTONUP, center.0, center.1);
+    let (x, y) = center;
+    crate::tlog!(
+        "[traymsg] right_click v{} msg={:#x} uid={} hwnd={:#x}",
+        t.ver, t.msg, t.uid, t.hwnd.0 as usize
+    );
     if t.ver >= 3 {
-        // Explorer 对 v3/v4 会在 up 之后补一条 WM_CONTEXTMENU（同样走回调消息）
-        send(t, 0x007B, center.0, center.1);
+        send(t, WM_CONTEXTMENU, x, y);
+        return;
     }
+    send(t, WM_RBUTTONDOWN, x, y);
+    send(t, WM_RBUTTONUP, x, y);
 }
 
 

@@ -51,9 +51,14 @@ pub struct Icon {
 }
 
 impl Icon {
-    /// 两条注册是不是同一个图标：有 GUID 用 GUID，否则 hWnd+uID
+    /// 两条注册是不是同一个图标：**两边都带 GUID** 才按 GUID 认，否则按 hWnd+uID。
+    ///
+    /// 对齐 Explorer 的匹配规则：一次调用带 `NIF_GUID` 才按 GUID 找，否则按 hWnd+uID。
+    /// 以前"任一边有 GUID 就只比 GUID"会让 GUID 注册的图标错过**不带 GUID** 的
+    /// NIM_MODIFY / NIM_SETVERSION——闪烁灭帧收不到，协议版本更新不上
+    /// （v4 图标被当成 v0 编码消息，小米电脑管家实测点击行为错乱）。
     pub fn same(&self, o: &Icon) -> bool {
-        if self.guid != GUID::default() || o.guid != GUID::default() {
+        if self.guid != GUID::default() && o.guid != GUID::default() {
             self.guid == o.guid
         } else {
             self.hwnd == o.hwnd && self.uid == o.uid

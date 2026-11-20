@@ -167,15 +167,12 @@ impl PillUi {
         let (fw, fh) = (w as f32 / scale, h as f32 / scale);
 
         // ---- egui 一帧 ----
-        let input = egui::RawInput {
-            time: Some(self.t0.elapsed().as_secs_f64()),
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(fw, fh),
-            )),
-            events: std::mem::take(&mut self.input.events),
-            ..Default::default()
-        };
+        // ppp 必须每帧经 RawInput.viewports[ROOT].native_pixels_per_point 下发：
+        // egui 0.37 的 begin_pass 对缺失值 unwrap_or(1.0) 且不跨帧持久，
+        // 不带的话缩放 ≠ 1.0 时窗口按新 scale 尺寸、内容仍按 1.0 光栅化，整版错位。
+        let mut input = self.soft.input(fw, fh);
+        input.time = Some(self.t0.elapsed().as_secs_f64());
+        input.events = std::mem::take(&mut self.input.events);
 
         let mut rects_pts: Vec<[f32; 4]> = Vec::new();
         let mut events: Vec<PillEvent> = Vec::new();
@@ -325,6 +322,8 @@ impl PillUi {
             mix(&mut hash, &[f.dim as u8]);
         }
         mix(&mut hash, &v.alpha.to_bits().to_le_bytes());
+        // scale 变了必须上屏：即使宽高凑巧没变，命中矩形与光栅化密度都已不同
+        mix(&mut hash, &scale.to_bits().to_le_bytes());
         mix(&mut hash, &[matches!(v.shape, PillShape::Float) as u8, matches!(v.shape, PillShape::Island) as u8]);
         mix(&mut hash, &hov_w.map_or(0xffu8, |i| i as u8).to_le_bytes());
         mix(&mut hash, &hov_f.map_or(0xffu8, |i| i as u8).to_le_bytes());

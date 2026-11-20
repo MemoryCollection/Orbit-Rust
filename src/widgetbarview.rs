@@ -80,11 +80,10 @@ pub fn paint(
 
     let mut rects_pt: Vec<[f32; 4]> = Vec::new();
     let ctx = soft.ctx().clone();
+    // ppp 每帧走 RawInput（见 egui_soft::input 的注释），否则缩放 ≠ 1.0 时整版错位
+    let input = soft.input(fw, fh);
     let out = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh))),
-            ..Default::default()
-        },
+        input,
         |ui| {
             let p = ui.painter().clone();
             // 圆角胶囊底（半径 = 高/2）

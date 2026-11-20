@@ -170,6 +170,20 @@ pub fn watch(pid: u32, icon_hwnd: HWND, capsule: RECT, anchor_x: i32, label: &st
     std::thread::spawn(move || run(pid, key, stem, capsule, anchor_x, watch_id, generation, label, below));
 }
 
+/// 用户点击了某个托盘图标：悬停结束，应用接下来打开的是**真正的面板/主窗口**。
+/// 立刻吊销该图标的守位线程（`is_current` 判 false，各线程在下一个 35ms 轮询点退出），
+/// 防止守位线程把应用的真 UI 当成悬停弹窗挪走——小米电脑管家实测：点击后面板刚创建
+/// （ShowMainPanelStart）就被守位线程 SetWindowPos 挪动，进程直接闪退。
+/// 对齐 atrium 的原则："不碰抢到前台的窗口，那是用户真正打开的 UI"。
+pub fn cancel(icon_hwnd: HWND, pid: u32) {
+    let key = if icon_hwnd.0.is_null() {
+        usize::MAX - pid as usize
+    } else {
+        icon_hwnd.0 as usize
+    };
+    GENERATIONS.lock().unwrap().remove(&key);
+}
+
 fn run(
     pid: u32,
     key: usize,
