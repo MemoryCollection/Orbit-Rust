@@ -85,6 +85,8 @@ main.rs → app.rs（启动/消息循环）
 - **天气**：主源高德 Web 服务（`/v3/ip` 定位 → `/v3/weather/weatherInfo?extensions=all` 实况 + 四天预报，用 `AMAP_KEY`；免费额度 5000 次/月，30 分钟刷一次约 2900 次）。`/v3/ip` 拿不到 `adcode` 时退到 `/v3/geocode/geo`（用 IP 城市名反查）；高德整体失败则回退 Open-Meteo（免 key，`current` + `daily`，`ipwho.is` 定位）。定位缓存 3 小时、adcode 24 小时，失败 120s/240s/… 退避到 30 分钟。
 - **邮箱**：`native-tls`(schannel) 上的最小 IMAP4rev1 子集（LOGIN/SELECT/FETCH/STORE/LOGOUT），`UID FETCH n:m (UID FLAGS BODY.PEEK[HEADER.FIELDS(...)] BODY.PEEK[TEXT]<0.4096>)`；MIME 头 `=?UTF-8?B?..?=` 解码、base64 / quoted-printable / GBK 正文还原，再从"验证码/verification code"附近抓 4~8 位数字（兜底独立 6 位）。90 秒拉一次最近 6 封。
 - **邮件已读**：双向。拉取时读服务端 `FLAGS` 里的 `\Seen`（别的客户端读过也算已读）；用户点开邮件时由常驻后台线程 `UID STORE <uid> +FLAGS (\Seen)` 写回服务器，本地再留一份 UID 记录做离线兜底。STORE 失败只丢连接、下次点击重连，不重试轰炸服务器。
+- **邮件阅读窗**（`mailview.rs`）：点邮件标题在面板右侧弹出普通 popup 窗（UpdateLayeredWindow 分层窗带不了可见子控件），只读多行 EDIT 呈现正文——文本可选中、可 Ctrl+C、可滚动；「删除邮件」按钮经 `WM_COPYDATA`(dwData=`0x4D41494C` 魔数) 把 UID 同步发回胶囊窗口，由 `Mail::delete` 本地移除 + 后台线程 `UID STORE \Deleted` + `EXPUNGE` 真删服务器邮件，删除后 800ms 自动重拉列表。
+- **邮件解码**：`decode_words` 处理 RFC2047 编码字（多段相邻编码字按 `i += end+2` 跳转）；裸 QP 主题（无 `=?charset?` 包装，直接 `=XX=XX` 序列）在 `clean_subject` 里按字节解码兜底；`strip_tags` 先整块删除 `<style>`/`<script>` 内容再剥标签，正文不会混入 CSS。
 - **音乐**：WinRT `GlobalSystemMediaTransportControlsSessionManager`（`windows` crate 的 `Media_Control` feature）。独立 MTA 线程每 250ms 采样，通过 channel 把 `Sample { now, pos_ms, art }` 送回主线程；控制命令走反向 channel。没有播放器时整条音乐条隐藏。
 - **专辑封面**：同一次采样里拿 `MediaProperties.Thumbnail`，换曲时 `OpenReadAsync` → `DataReader` 读成字节（上限 8MB），PNG/JPEG 都行；实测 QQ 音乐/网易云这类播放器给的是 PNG。
 - **播放进度（歌词对齐的关键）**：部分播放器（实测 lx-music-desktop）只在换曲/暂停时写一次 `Position`，正常播放时它是冻结的（如 `Position=12ms`、`LastUpdatedTime` 也停在那一刻）。所以线程里维护一个**播放头**：曲目切换时 `playhead = Position + (现在 - LastUpdatedTime)`（把已经播过的一段补回来），之后"Position 变了就对锚，没变就按本地时钟 +dt"；暂停时不推进。主线程 `position_ms()` 再按"上次采样时刻"外推，两次采样之间也能对齐到 200ms 精度。实测与 LRC 时间戳误差在 0.1s 内。
@@ -183,7 +185,7 @@ main.rs → app.rs（启动/消息循环）
 - **兜底 UIA 路径的溢出区限制**：`TRAY_TAKEOVER=false` 时，溢出面板里的图标只有展开才在 UIA 树中。托管路径不受此限——应用重新注册时逐个 `NIM_ADD`，包括原本在溢出区的。
 - **托盘图标清晰度**：托管模式直接用 exe/应用提供的 `HICON`（经 `appicon` 优先取 256px），比旧方案从任务栏抠 16px 放大清晰得多；但个别应用只注册小 `hIcon` 时仍会略软。
 - **右键菜单位置**：由应用在自己图标的 Placement（已上报为 Dock 槽位）处弹出，一般贴着 Dock 图标；个别应用忽略 Placement 时位置可能偏离。
-- 邮件正文只取前 4KB，验证码在正文很后面时可能抓不到。
+- 邮件正文只取前 16KB（阅读窗展示用，超出部分截断）。
 - 邮件已读写回是"尽力而为"：QQ 邮箱偶尔会因连接被复用超时导致某次 STORE 失败（本地已读仍保留，再点一次即可补上）。
 - 剪贴板只记文字；复制文件/图片不记录（有意为之）。
 - 歌词只显示原文（LRC 的 `tlyric` 翻译没用上）、只显示一行，没有逐字卡拉 OK；搜歌靠"歌名 + 歌手"打分，同名翻唱可能匹配到别的版本。

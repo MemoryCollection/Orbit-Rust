@@ -18,7 +18,8 @@ use windows::Win32::Graphics::GdiPlus::{
     GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteFont,
     GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDeleteStringFormat,
     GdipDisposeImage, GdipDrawEllipse, GdipDrawImageRectI, GdipDrawPath, GdipDrawString, GdipFillEllipse,
-    GdipFillEllipseI, GdipFillPath, GdipFillRectangleI, GdipGetImageGraphicsContext,
+    GdipFillEllipseI, GdipFillPath, GdipFillRectangleI, GdipGetCellAscent, GdipGetEmHeight,
+    GdipGetImageGraphicsContext,
     GdipGetImageHeight, GdipGetImageWidth, GdipMeasureString, GdipSetInterpolationMode,
     GdipSetSmoothingMode, GdipSetTextRenderingHint, GdipStringFormatGetGenericDefault,
     GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, BitmapData, FillModeWinding, FontStyleBold,
@@ -197,15 +198,19 @@ pub fn draw_pill(
         GdipDeleteBrush(bg as *mut GpBrush);
         GdipDeletePath(path);
 
-        // 文本布局（与 content_width 严格一致）
+        // 文本布局（与 content_width 严格一致）。
+        // 垂直方向统一基线：以时间（最大字号）的居中位置定出基线，其余元素
+        // 全部对齐到同一基线，避免不同字体行盒留白不同造成的"有高有低"。
         let pad = cfg::PAD_X * scale;
         let gap = cfg::GAP * scale;
         let (tw, th) = measure_text(time, cfg::TIME_SIZE, FontKind::Latin, scale);
-        let (dw, dh) = measure_text(date, cfg::DATE_SIZE, FontKind::Cjk, scale);
+        let (dw, _dh) = measure_text(date, cfg::DATE_SIZE, FontKind::Cjk, scale);
         let mut x = pad;
+        let base = (fh - th) / 2.0 + font_ascent(cfg::TIME_SIZE * scale, FontKind::Latin);
         draw_string(g, time, cfg::TIME_ARGB, FontKind::Latin, cfg::TIME_SIZE * scale, x, (fh - th) / 2.0, fw, fh);
         x += tw + gap;
-        draw_string(g, date, cfg::DATE_ARGB, FontKind::Cjk, cfg::DATE_SIZE * scale, x, (fh - dh) / 2.0, fw, fh);
+        draw_string(g, date, cfg::DATE_ARGB, FontKind::Cjk, cfg::DATE_SIZE * scale, x,
+            base - font_ascent(cfg::DATE_SIZE * scale, FontKind::Cjk), fw, fh);
         x += dw;
 
         let bg_px = cfg::ICON_BG * scale;
@@ -233,16 +238,17 @@ pub fn draw_pill(
                 let mut cx = x + cfg::WIDGET_PAD_X * scale;
                 if !item.icon.is_empty() {
                     let icon = to_u16(&item.icon);
-                    let (iw, ih) = measure_text(&icon, cfg::WIDGET_ICON_SIZE, FontKind::Symbol, scale);
+                    let (iw, _) = measure_text(&icon, cfg::WIDGET_ICON_SIZE, FontKind::Symbol, scale);
                     draw_string(g, &icon, item.icon_argb, FontKind::Symbol,
-                        cfg::WIDGET_ICON_SIZE * scale, cx, (fh - ih) / 2.0, fw, fh);
+                        cfg::WIDGET_ICON_SIZE * scale, cx,
+                        base - font_ascent(cfg::WIDGET_ICON_SIZE * scale, FontKind::Symbol), fw, fh);
                     cx += iw + cfg::WIDGET_ICON_GAP * scale;
                 }
                 if !item.text.is_empty() {
                     let text = to_u16(&item.text);
-                    let (_, theight) = measure_text(&text, cfg::WIDGET_TEXT_SIZE, FontKind::Cjk, scale);
                     draw_string(g, &text, cfg::TEXT_ARGB, FontKind::Cjk,
-                        cfg::WIDGET_TEXT_SIZE * scale, cx, (fh - theight) / 2.0, fw, fh);
+                        cfg::WIDGET_TEXT_SIZE * scale, cx,
+                        base - font_ascent(cfg::WIDGET_TEXT_SIZE * scale, FontKind::Cjk), fw, fh);
                 }
                 x += hw + gap;
             }
@@ -1033,8 +1039,10 @@ pub fn draw_weather_panel(w: i32, h: i32, scale: f32, v: &WeatherView, hover_ref
         let s = |v: f32| v * scale;
         // 逻辑字号 → 物理像素（含字号倍率）
         let fs = |v: f32| v * k * scale;
-        // 左栏宽度：图标 + 文字列，随字号略放宽
-        let left_w = s(cfg::WEATHER_LEFT_W) + s(56.0 * (k - 1.0));
+        // 左栏宽度改为**按内容实测**：四行文字取最宽（超长封顶截断），
+        // 不再用固定栏宽——固定值比实际文字宽时会留出一条空白竖条，
+        // 把四天预报整体推右（用户反馈的"红框空白区"）。
+        // 左栏实际宽度在下方实况块里量出（需先测量各行文字）。
 
         // 标题：当地(白) + 天气(强调色)
         let t1 = to_u16("当地");
@@ -1079,11 +1087,26 @@ pub fn draw_weather_panel(w: i32, h: i32, scale: f32, v: &WeatherView, hover_ref
         let rep = to_u16(&v.report);
         let icon = to_u16(&v.icon);
         let (cond_w, ch) = measure_text(&cond, cfg::WEATHER_COND_SIZE * k, FontKind::Cjk, scale);
-        let (_cyw, cyh) = measure_text(&city, cfg::WEATHER_CITY_SIZE * k, FontKind::Cjk, scale);
+        let (city_w, cyh) = measure_text(&city, cfg::WEATHER_CITY_SIZE * k, FontKind::Cjk, scale);
 
-        // ① 图标与温度同一行
+        // 左栏内容宽度：① 图标+温度行 ② 天气·城市行 ③ 详情（原始测量）④ 来源行，
+        // 取最宽；超长行封顶（详情此时被 ellipsize 截到封顶宽），下限保证①②完整。
         let icon_box = s(60.0 * k);
         let (iw, _ih) = measure_text(&icon, cfg::WEATHER_ICON_SIZE * k, FontKind::Symbol, scale);
+        let (temp_w, _) = measure_text(&temp, cfg::WEATHER_TEMP_SIZE * k, FontKind::Latin, scale);
+        let det_w = v
+            .details
+            .iter()
+            .take(2)
+            .map(|l| measure_text(&to_u16(l), cfg::WEATHER_DETAIL_SIZE * k, FontKind::Cjk, scale).0)
+            .fold(0.0f32, f32::max);
+        let rep_w = measure_text(&rep, 10.0 * k, FontKind::Cjk, scale).0;
+        let cap = s(300.0 * k);
+        let row1 = icon_box + s(10.0 * k) + temp_w;
+        let row2 = cond_w + s(8.0 * k) + city_w;
+        let mut left_w = row1.max(row2).max(det_w).max(rep_w).min(cap);
+        left_w = left_w.max(row1).max(row2) + s(12.0 * k);
+
         draw_string(g, &icon, v.icon_argb, FontKind::Symbol, fs(cfg::WEATHER_ICON_SIZE),
             pad + (icon_box - iw) / 2.0, top, fw, fh);
         let tx = pad + icon_box + s(10.0 * k);
@@ -1106,8 +1129,8 @@ pub fn draw_weather_panel(w: i32, h: i32, scale: f32, v: &WeatherView, hover_ref
         }
         draw_string(g, &rep, cfg::TEXT_DIM_ARGB, FontKind::Cjk, fs(10.0), pad, y + s(LEFT_REP_GAP * k), fw, fh);
 
-        // 竖分隔线
-        let divx = pad + left_w + s(6.0);
+        // 竖分隔线：紧跟左栏实际内容，右侧空间全部让给四天预报
+        let divx = pad + left_w + s(10.0 * k);
         let div = solid_fill(cfg::DIVIDER_ARGB);
         let div_top = left_y;
         GdipFillRectangleI(g, div as *mut GpBrush, divx as i32, div_top as i32, 1, (s(140.0 * k)) as i32);
@@ -1351,6 +1374,39 @@ unsafe fn scratch_graphics() -> Option<*mut GpGraphics> {
     GdipGetImageGraphicsContext(bmp as _, &mut g);
     GdipDisposeImage(bmp as _);
     if g.is_null() { None } else { Some(g) }
+}
+
+/// 字体在 px 字号下、基线以上部分的高度（物理像素）。DrawString 以行框顶部对齐
+/// layout.Y，基线到行框顶 ≈ ascent。胶囊里所有文字/图标改用**统一基线**对齐：
+/// 各自按行盒垂直居中时，Latin/CJK/Symbol 的行框上下留白比例不同，
+/// 会出现"有高有低"的视觉错位；共基线后所有文字落在同一条线上。
+fn font_ascent(px: f32, kind: FontKind) -> f32 {
+    unsafe {
+        let name = match kind {
+            FontKind::Cjk => w!("Microsoft YaHei UI"),
+            FontKind::Symbol => w!("Segoe UI Symbol"),
+            FontKind::Latin => w!("Segoe UI Variable Display"),
+        };
+        let mut family: *mut GpFontFamily = null_mut();
+        GdipCreateFontFamilyFromName(name, null_mut(), &mut family);
+        if family.is_null() {
+            GdipCreateFontFamilyFromName(w!("Segoe UI"), null_mut(), &mut family);
+        }
+        if family.is_null() {
+            return px * 0.75;
+        }
+        // 与 create_font 一致：文字统一粗体、符号常规
+        let style = if kind == FontKind::Symbol { 0 } else { FontStyleBold.0 };
+        let mut em = 0u16;
+        let mut asc = 0u16;
+        GdipGetEmHeight(family, style, &mut em);
+        GdipGetCellAscent(family, style, &mut asc);
+        GdipDeleteFontFamily(family);
+        if em == 0 {
+            return px * 0.75;
+        }
+        px * asc as f32 / em as f32
+    }
 }
 
 unsafe fn create_font(kind: FontKind, px: f32, font: &mut *mut GpFont) -> bool {

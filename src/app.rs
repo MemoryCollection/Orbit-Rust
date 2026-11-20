@@ -14,6 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config as cfg;
 use crate::dock::Dock;
 use crate::hide;
+use crate::mailview;
 use crate::musicbar;
 use crate::panel;
 use crate::render;
@@ -90,6 +91,7 @@ pub fn run(hide_taskbar: bool) {
         RegisterClassW(&tip_wc);
 
         panel::init(hinstance.into());
+        mailview::init(hinstance.into());
 
         let app = Box::new(App::new());
         let app_ptr = Box::into_raw(app);

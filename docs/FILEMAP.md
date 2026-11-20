@@ -8,7 +8,7 @@
 | 文件 | 职责 |
 |---|---|
 | `src/main.rs` | 程序入口：`#![windows_subsystem = "windows"]`（不弹控制台）、初始化日志、解析 `--show-taskbar` / `--restore-taskbar`，调用 `app::run`（默认接管任务栏） |
-| `src/app.rs` | 启动流程：GDI+ / COM 初始化、注册三个窗口类（胶囊 / Dock / 提示条）、创建胶囊与 Dock、消息循环、退出清理（恢复任务栏） |
+| `src/app.rs` | 启动流程：GDI+ / COM 初始化、注册四个窗口类（胶囊 / Dock / 提示条 / 邮件阅读窗）、创建胶囊与 Dock、消息循环、退出清理（恢复任务栏） |
 | `src/window.rs` | 顶部胶囊窗口：置顶分层窗口、widget 布局与命中、悬停、时钟定时器、展开面板的开关/点击分发、音乐条的显隐/角度驱动；`primary_monitor()` 也在这里 |
 | `src/dock.rs` | 底部 Dock 窗口：钉选 `.lnk` + 运行中应用（按 exe 去重）、大图标提取与缩放、点击启动/切换窗口；**右侧托盘区**（持有 `TrayMirror`、2s 轮询、左右键转发、悬停提示条、与 Dock 图标去重） |
 | `src/panel.rs` | 展开面板窗口（天气卡片 / 剪贴板 / 邮件）：独立分层窗口、命中表 → 动作号、点击回传 `WM_ROW_CLICK`，自身不做业务判断 |
@@ -17,6 +17,7 @@
 | `src/weather.rs` | 天气数据：高德（实况 + 四天预报，失败回退 Open-Meteo）与出口 IP 定位，30 分钟刷新、失败指数退避；`describe()/glyph()` 码位映射 |
 | `src/lyric.rs` | 歌词数据：按曲目搜网易云 → 取 LRC → 解析时间轴 → 按播放进度取当前行；换歌才请求，结果（含"无歌词"）内存缓存 |
 | `src/mail.rs` | 邮箱数据：IMAP over TLS（最小 IMAP4rev1 子集）拉最近 N 封、MIME 解码、验证码抽取；已读双向同步（读服务端 `\Seen`，点开时后台 `UID STORE +FLAGS (\Seen)` 写回） |
+| `src/mailview.rs` | 邮件阅读窗：点邮件标题弹出的普通 popup 窗（分层面板带不了子控件），只读多行 EDIT 呈正文（可选中/Ctrl+C/滚动），深色主题；「删除邮件」经 `WM_COPYDATA`(dwData=0x4D41494C) 把 UID 发回胶囊 → `Mail::delete`（本地移除 + 后台 `\Deleted`+EXPUNGE 真删） |
 | `src/music.rs` | 音乐数据：SMTC 读当前曲目 + 播放进度（锚点 + 本地推进）+ 专辑封面字节，播放/暂停/切歌；采样在独立 MTA 线程 |
 | `src/clipboard.rs` | 剪贴板历史：`AddClipboardFormatListener` 监听线程、只收文字（文件/图片过滤）、去重、固定置顶、敏感内容过滤、落盘 |
 | `src/settings.rs` | 可调设置：`<exe>/data/settings.txt`（key=value），运行时查 mtime 热更新；`weather_text_scale` / `lyric_position` / `lyric_size` |

@@ -121,8 +121,6 @@ pub const ACCENT_ARGB: u32 = 0xFF_5A_A9_FF;
 pub const WEATHER_PANEL_W: f32 = 560.0;
 /// 卡片高度基准（实际高度取 `WEATHER_PANEL_H * 0.88 * 字号倍率`，左栏更高时再撑高）
 pub const WEATHER_PANEL_H: f32 = 190.0;
-/// 左栏（实况）宽度：图标 + 文字列
-pub const WEATHER_LEFT_W: f32 = 200.0;
 /// 大字号温度
 pub const WEATHER_TEMP_SIZE: f32 = 34.0;
 /// 左侧大图标

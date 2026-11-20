@@ -170,6 +170,19 @@ pub fn contains(pt: POINT) -> bool {
     }
 }
 
+/// 面板当前的屏幕矩形 (left, top, width, height)；不可见时返回 None
+pub fn rect() -> Option<(i32, i32, i32, i32)> {
+    let h = hwnd();
+    if h.is_invalid() || !visible() {
+        return None;
+    }
+    unsafe {
+        let mut r = RECT::default();
+        GetWindowRect(h, &mut r).ok()?;
+        Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+    }
+}
+
 impl Panel {
     fn render(&mut self) {
         let (w, h) = self.size;

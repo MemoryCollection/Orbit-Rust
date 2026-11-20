@@ -15,6 +15,7 @@ mod hide;
 mod json;
 mod lyric;
 mod mail;
+mod mailview;
 mod music;
 mod musicbar;
 mod net;

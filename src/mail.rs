@@ -22,13 +22,18 @@ pub struct MailItem {
     pub subject: String,
     pub code: Option<String>,
     pub read: bool,
+    /// 正文纯文本（截断存储），点击标题在阅读窗里展示
+    pub body: String,
     /// 服务器上本来就是 `\Seen`（别的客户端读过）
     seen_on_server: bool,
 }
 
-/// 后台把已读写回服务器
-enum SeenCmd {
+/// 后台写回服务器的命令
+enum MailCmd {
+    /// 标记已读（\Seen）
     Mark(String),
+    /// 删除邮件（\Deleted + EXPUNGE）
+    Delete(String),
 }
 
 /// 胶囊上邮箱 widget 要显示的东西
@@ -53,7 +58,7 @@ pub struct Mail {
     /// 启动后第一次拉取只建立基线：已有邮件的验证码不算"新识别到"
     baseline_done: bool,
     /// 把 \Seen 写回服务器的工作线程
-    seen_tx: Sender<SeenCmd>,
+    seen_tx: Sender<MailCmd>,
     rx: Option<Receiver<Result<Vec<MailItem>, String>>>,
     next_at: Instant,
     failures: u32,
@@ -68,7 +73,7 @@ impl Default for Mail {
             consumed: false,
             read: load_read(),
             baseline_done: false,
-            seen_tx: spawn_seen_worker(),
+            seen_tx: spawn_mail_worker(),
             rx: None,
             next_at: Instant::now(),
             failures: 0,
@@ -179,8 +184,23 @@ impl Mail {
         }
         // 内容哈希兜底的键不是真 UID，不能拿去 STORE
         if !uid.is_empty() && uid.chars().all(|c| c.is_ascii_digit()) {
-            let _ = self.seen_tx.send(SeenCmd::Mark(uid.to_string()));
+            let _ = self.seen_tx.send(MailCmd::Mark(uid.to_string()));
         }
+    }
+
+    /// 删除一封邮件：本地列表立即移除，后台 `STORE \Deleted` + `EXPUNGE` 真删。
+    /// 内容哈希兜底的键（非纯数字）只能删本地。返回是否找到了这封邮件。
+    pub fn delete(&mut self, uid: &str) -> bool {
+        let found = self.items.iter().any(|m| m.uid == uid);
+        self.items.retain(|m| m.uid != uid);
+        if found {
+            if !uid.is_empty() && uid.chars().all(|c| c.is_ascii_digit()) {
+                let _ = self.seen_tx.send(MailCmd::Delete(uid.to_string()));
+            }
+            // 立刻再拉一次，让列表与服务端尽快一致
+            self.next_at = Instant::now() + Duration::from_millis(800);
+        }
+        found
     }
 }
 
@@ -373,7 +393,7 @@ fn fetch(account: (String, u16, String, String)) -> Result<Vec<MailItem>, String
     let want = cfg::MAIL_FETCH.min(exists);
     let from = exists - want + 1;
     c.send(&format!(
-        "A3 FETCH {from}:{exists} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE CONTENT-TYPE CONTENT-TRANSFER-ENCODING)] BODY.PEEK[TEXT]<0.4096>)"
+        "A3 FETCH {from}:{exists} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE CONTENT-TYPE CONTENT-TRANSFER-ENCODING)] BODY.PEEK[TEXT]<0.16384>)"
     ))?;
     let (all, done) = c.until("A3")?;
     let _ = c.send("A9 LOGOUT");
@@ -400,7 +420,9 @@ fn fetch(account: (String, u16, String, String)) -> Result<Vec<MailItem>, String
         // 服务端没给 UID 时用内容哈希兜底（仍能跨重启保持已读状态）
         let uid = uid_of(&r.text).unwrap_or_else(|| format!("h{:016x}", hash64(&from, &subject)));
         let seen = has_seen(&r.text);
-        items.push(MailItem { uid, from, subject, code, read: false, seen_on_server: seen });
+        // 正文截断存储（阅读窗展示用；验证码提取本就基于这段文本）
+        let body: String = text.chars().take(12000).collect();
+        items.push(MailItem { uid, from, subject, code, read: false, body, seen_on_server: seen });
     }
     items.reverse(); // 最新的在前
     Ok(items)
@@ -417,9 +439,9 @@ fn has_seen(text: &str) -> bool {
 
 // ---------- 已读写回服务器 ----------
 
-/// 常驻线程：持有可选连接，收到命令就 `UID STORE +FLAGS (\Seen)`。
+/// 常驻线程：持有可选连接，收到命令就写回服务器（已读 `\Seen` / 删除 `\Deleted`+EXPUNGE）。
 /// 失败就丢掉连接，下次点击重新登录（不做重试，避免后台反复敲服务器）。
-fn spawn_seen_worker() -> Sender<SeenCmd> {
+fn spawn_mail_worker() -> Sender<MailCmd> {
     let (tx, rx) = channel();
     std::thread::Builder::new()
         .name("orbit-mail-seen".into())
@@ -427,15 +449,33 @@ fn spawn_seen_worker() -> Sender<SeenCmd> {
             let Some(account) = creds() else { return };
             let mut conn: Option<Conn> = None;
             let mut tag = 0u32;
-            while let Ok(SeenCmd::Mark(uid)) = rx.recv() {
+            while let Ok(cmd) = rx.recv() {
                 if conn.is_none() {
                     conn = connect(&account).ok().map(|(c, _)| c);
                 }
                 let Some(c) = conn.as_mut() else { continue };
                 tag += 1;
-                let t = format!("S{tag}");
-                let ok = c.send(&format!("{t} UID STORE {uid} +FLAGS (\\Seen)")).is_ok()
-                    && matches!(c.until(&t), Ok((_, done)) if done.starts_with(&format!("{t} OK")));
+                let ok = match cmd {
+                    MailCmd::Mark(uid) => {
+                        let t = format!("S{tag}");
+                        c.send(&format!("{t} UID STORE {uid} +FLAGS (\\Seen)")).is_ok()
+                            && matches!(c.until(&t), Ok((_, done)) if done.starts_with(&format!("{t} OK")))
+                    }
+                    MailCmd::Delete(uid) => {
+                        let t = format!("S{tag}");
+                        let del = c.send(&format!("{t} UID STORE {uid} +FLAGS (\\Deleted)")).is_ok()
+                            && matches!(c.until(&t), Ok((_, done)) if done.starts_with(&format!("{t} OK")));
+                        if !del {
+                            false
+                        } else {
+                            // 真正清掉带 \Deleted 的邮件
+                            tag += 1;
+                            let t2 = format!("S{tag}");
+                            c.send(&format!("{t2} EXPUNGE")).is_ok()
+                                && matches!(c.until(&t2), Ok((_, done)) if done.starts_with(&format!("{t2} OK")))
+                        }
+                    }
+                };
                 if !ok {
                     conn = None;
                 }
@@ -513,7 +553,21 @@ fn clean_from(s: &str) -> String {
 }
 
 fn clean_subject(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // 裸 QP 兜底：主题没有 RFC2047 包装、直接是 "=XX=XX" 十六进制序列时，
+    // 按字节解码再检测编码（QQ 邮箱部分邮件主题长这样）
+    if s.len() > 8 {
+        let eq = s.bytes().filter(|&b| b == b'=').count();
+        let hex_pair = s.bytes().filter(|&b| b.is_ascii_hexdigit()).count();
+        if eq * 3 > s.len() && hex_pair * 2 > s.len() {
+            let raw = qp_decode(s.as_bytes());
+            let decoded = bytes_to_string(&raw);
+            if decoded != s && decoded.is_char_boundary(0) {
+                return decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+            }
+        }
+    }
+    s
 }
 
 // ---------- 正文 ----------
@@ -595,14 +649,41 @@ fn body_text(raw: &[u8], top_charset: Option<&str>, top_cte: &str) -> String {
 }
 
 fn strip_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    // 先整块丢掉 <style>/<script> 的内容（CSS/JS 不是正文，之前会混进阅读窗）
+    let no_style = remove_block(s, "<style", "</style>");
+    let no_script = remove_block(&no_style, "<script", "</script>");
+    let mut out = String::with_capacity(no_script.len());
     let mut in_tag = false;
-    for c in s.chars() {
+    for c in no_script.chars() {
         match c {
             '<' => in_tag = true,
             '>' => in_tag = false,
             _ if !in_tag => out.push(c),
             _ => {}
+        }
+    }
+    out
+}
+
+/// 整块删除 `<open ...> ... </close>`（含内容）；找不到闭合就丢到结尾。
+fn remove_block(s: &str, open: &str, close: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        match lower[i..].find(open) {
+            Some(p) => {
+                let start = i + p;
+                out.push_str(&s[i..start]);
+                i = match lower[start..].find(close) {
+                    Some(q) => start + q + close.len(),
+                    None => s.len(),
+                };
+            }
+            None => {
+                out.push_str(&s[i..]);
+                break;
+            }
         }
     }
     out
@@ -717,7 +798,9 @@ fn decode_words(s: &str) -> String {
                     qp_decode(data.replace('_', " ").as_bytes())
                 };
                 out.push_str(&charset_str(&raw, Some(charset)));
-                i += end + 4;
+                // "?=" 只占 2 字节；之前 +4 会把相邻编码字的开头啃掉一半，
+                // 出现 "定?utf-8?" 这样的残段
+                i += end + 2;
                 continue;
             }
         }

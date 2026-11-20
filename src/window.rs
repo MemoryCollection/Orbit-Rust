@@ -5,6 +5,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -14,9 +15,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, PostQuitMessage,
     SetTimer, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW,
-    GWLP_USERDATA, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, SWP_NOACTIVATE, WM_CREATE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCHITTEST, WM_TIMER,
+    GWLP_USERDATA, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, SWP_NOACTIVATE, WM_COPYDATA, WM_CREATE,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCHITTEST, WM_TIMER,
 };
 
 use crate::clipboard::{self, Clipboard};
@@ -24,6 +25,7 @@ use crate::config as cfg;
 use crate::hide;
 use crate::lyric::Lyrics;
 use crate::mail::{Badge, Mail};
+use crate::mailview;
 use crate::music::{Cmd as MusicCmd, Music};
 use crate::musicbar;
 use crate::panel::{self, Content, WM_ROW_CLICK};
@@ -211,6 +213,22 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             WM_ROW_CLICK => {
                 app.on_panel_click(w.0 as u32);
                 LRESULT(0)
+            }
+            // 邮件阅读窗的"删除邮件"按钮：WM_COPYDATA(dwData=MAIL_DELETE_MAGIC) 带 UID
+            WM_COPYDATA => {
+                let cds = l.0 as *const COPYDATASTRUCT;
+                if !cds.is_null() && (*cds).dwData == mailview::MAIL_DELETE_MAGIC {
+                    let (ptr, n) = ((*cds).lpData as *const u16, (*cds).cbData as usize / 2);
+                    let uid = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, n));
+                    crate::tlog!("[mail] 删除请求 uid={uid}");
+                    if app.mail.delete(&uid) {
+                        app.render();
+                        app.reload_panel();
+                    }
+                    LRESULT(1)
+                } else {
+                    DefWindowProcW(hwnd, msg, w, l)
+                }
             }
             // 音乐条的封面按钮：左键播放/暂停，右键下一首
             m if m == musicbar::WM_TOGGLE => {
@@ -534,9 +552,17 @@ impl App {
                     let tab = self.panel_tab;
                     let Some(&i) = self.mail.visible(tab).get(id as usize) else { return };
                     let uid = self.mail.items[i].uid.clone();
+                    crate::tlog!("[mail] 点开邮件 #{id} items[{i}] uid={uid} body={}字", self.mail.items[i].body.chars().count());
                     self.mail.mark_read(&uid);
                     self.render();
                     self.reload_panel();
+                    // 打开阅读窗：正文可选中复制；窗内可删除。
+                    // 位置贴在邮件面板右侧（面板被遮住时收进屏幕）。
+                    if let Some(m) = self.mail.items.iter().find(|m| m.uid == uid) {
+                        let (px, py, pw, _) =
+                            panel::rect().unwrap_or((self.pos.0 + self.pill.0 / 2, self.pos.1 + self.pill.1, 0, 0));
+                        mailview::show(self.hwnd, self.scale, &m.subject, &m.from, &m.body, &m.uid, px + pw + 8, py);
+                    }
                 }
             }
             Some(WidgetKind::Clipboard) => {
@@ -677,7 +703,7 @@ impl App {
                 }
                 let subtitle = match &self.mail.error {
                     Some(e) => format!("{} · {e}", cfg::MAIL_USER),
-                    None => format!("{} · {} 封未读", cfg::MAIL_USER, self.mail.unread()),
+                    None => format!("{} · {} 封未读 · 点标题阅读", cfg::MAIL_USER, self.mail.unread()),
                 };
                 Content::List {
                     title: "邮箱".into(),
