@@ -1,0 +1,5 @@
+/target
+/.workbuddy
+*.log
+tools/*/target
+tools/_shots/
