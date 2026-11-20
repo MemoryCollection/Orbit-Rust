@@ -195,10 +195,20 @@ pub const DOCK_ICON: f32 = 44.0;
 pub const DOCK_SLOT: f32 = 46.0;
 /// 相邻图标间距
 pub const DOCK_GAP: f32 = 6.0;
-/// 左右内边距
-pub const DOCK_PAD_X: f32 = 8.0;
-/// 圆角半径
-pub const DOCK_RADIUS: f32 = 18.0;
+/// 左右内边距（比图标间隙略大，图标才不显得顶到边；也要盖过胶囊端部的圆弧）
+pub const DOCK_PAD_X: f32 = 12.0;
+/// 圆角半径：等于一半高度 → 完全胶囊形（高度变小时按 `min(DOCK_RADIUS, 高/2)` 收）
+pub const DOCK_RADIUS: f32 = 28.0;
+/// 底板内描边（1px 亮边，让深色底板从壁纸上"站起来"）
+pub const DOCK_EDGE_ARGB: u32 = 0x24_FF_FF_FF;
+/// 底板顶部高光渐层（很淡，玻璃质感；与内描边叠出层次）
+pub const DOCK_GLOW_ARGB: u32 = 0x16_FF_FF_FF;
+/// 图标 / 托盘图标悬停圆底
+pub const DOCK_HOVER_ARGB: u32 = 0x44_FF_FF_FF;
+/// 悬停圆底的描边（比填充亮一点，边缘才不糊）
+pub const DOCK_HOVER_EDGE_ARGB: u32 = 0x3A_FF_FF_FF;
+/// 悬停时图标放大量（逻辑点）：配合圆底让图标"浮"起来
+pub const DOCK_HOVER_GROW: f32 = 2.0;
 /// 距屏幕底部距离
 pub const DOCK_BOTTOM_MARGIN: i32 = 8;
 /// 运行中窗口重扫间隔（毫秒）

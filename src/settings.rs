@@ -43,9 +43,9 @@ const SCALE_MAX: f32 = 1.8;
 /// 歌词字号上下限
 const LYRIC_MIN: f32 = 10.0;
 const LYRIC_MAX: f32 = 26.0;
-/// 胶囊透明度上下限（再低就看不清了）
-const ALPHA_MIN: f32 = 0.2;
-const ALPHA_MAX: f32 = 1.0;
+/// 胶囊透明度上下限（再低就看不清了）；滑条量程直接用这两个值
+pub const ALPHA_MIN: f32 = 0.2;
+pub const ALPHA_MAX: f32 = 1.0;
 /// AtomicU32 的 0 表示"还没加载"
 const UNLOADED: u32 = 0;
 
@@ -216,12 +216,21 @@ pub fn pill_alpha() -> f32 {
     }
 }
 
-pub fn set_pill_alpha(v: f32) {
+/// 拖动滑条时的**即时预览**：只改内存 + 通知重绘，不写盘。
+///
+/// 滑条每移一点就 `save()` 会不停重写 settings.txt（还要跟主线程的文件监视打架），
+/// 所以拖动过程只走这里，松手时再 `persist_pill_alpha()` 落盘。
+pub fn preview_pill_alpha(v: f32) {
     let v = v.clamp(ALPHA_MIN, ALPHA_MAX);
     if (v - pill_alpha()).abs() < 1e-4 {
         return;
     }
     PILL_ALPHA.store(v.to_bits(), Ordering::Relaxed);
+    bump();
+}
+
+/// 把当前透明度落盘（滑条松手 / 键盘微调后调用）
+pub fn persist_pill_alpha() {
     save();
     bump();
 }

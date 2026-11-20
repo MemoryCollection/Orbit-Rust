@@ -428,11 +428,31 @@ impl SettingsApp {
                 );
                 ui.end_row();
 
-                let alpha = settings::pill_alpha();
+                // 透明度：滑条（拖动时只做即时预览，松手才落盘）
+                let mut alpha = settings::pill_alpha();
                 ui.label(row_label("透明度"));
-                if let Some(d) = stepper(ui, &format!("{alpha:.2}"), alpha > 0.2 + 1e-3, alpha < 1.0 - 1e-3) {
-                    settings::set_pill_alpha(alpha + d as f32 * 0.05);
-                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    // Slider 的宽度取 spacing.slider_width（add_sized 管不到它）
+                    ui.spacing_mut().slider_width = CTRL_W - 116.0;
+                    let r = ui.add(
+                        egui::Slider::new(&mut alpha, settings::ALPHA_MIN..=settings::ALPHA_MAX)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    if r.changed() {
+                        settings::preview_pill_alpha(alpha);
+                    }
+                    // 松手（或点击轨道、键盘微调这类一次性改动）才写盘
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        settings::persist_pill_alpha();
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}%", settings::pill_alpha() * 100.0))
+                            .size(12.5)
+                            .monospace(),
+                    );
+                });
                 ui.end_row();
 
                 ui.label(row_label("形状"));
@@ -789,14 +809,7 @@ impl SettingsApp {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Orbit 设置").size(16.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("✕").size(12.0))
-                            .fill(egui::Color32::TRANSPARENT)
-                            .small(),
-                    )
-                    .clicked()
-                {
+                if close_button(ui).clicked() {
                     self.do_hide(ctx);
                 }
             });
@@ -893,6 +906,32 @@ impl SettingsApp {
 }
 
 // ---------- 小部件 ----------
+
+/// 标题栏关闭按钮：**自绘**两条斜线组成 ✕。
+///
+/// 不能用文字 `✕`（U+2715）：本机字体（雅黑 / 黑体）没有这个字形，
+/// 未启用 default_fonts 时也没有 emoji 兜底，会渲染成一个空白豆腐块。
+fn close_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let p = ui.painter();
+    if hovered {
+        p.rect_filled(rect, 6.0_f32, argb(0x2E_FF_FF_FF));
+    }
+    let c = rect.center();
+    let s = 4.5;
+    let stroke = egui::Stroke::new(
+        1.5,
+        if hovered {
+            egui::Color32::WHITE
+        } else {
+            argb(0xCC_FF_FF_FF)
+        },
+    );
+    p.line_segment([c + egui::vec2(-s, -s), c + egui::vec2(s, s)], stroke);
+    p.line_segment([c + egui::vec2(s, -s), c + egui::vec2(-s, s)], stroke);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
 
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(2.0);
