@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, SoftBackend};
+use crate::egui_soft::{argb, glass_board, SoftBackend};
 
 /// 封面在条内的逻辑位置与边长：(x, y, 边长)（逻辑点，相对窗口左上角）。
 /// 与 render::cover_box 的数值口径一致（乘 scale 即物理像素）。
@@ -66,11 +66,11 @@ pub fn paint(
         input,
         |ui| {
             let p = ui.painter().clone();
-            // 圆角底
-            p.rect_filled(
+            // 圆角底，与顶部胶囊同一画法
+            glass_board(
+                &p,
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
                 egui::CornerRadius::same((fh / 2.0).min(255.0) as u8),
-                argb(cfg::pill_bg_effective()),
             );
 
             let (cx0, cy0, d) = cover_box(fh);

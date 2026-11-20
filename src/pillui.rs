@@ -15,7 +15,7 @@ use std::time::Instant;
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, widget_icon, SoftBackend};
+use crate::egui_soft::{argb, glass_board, widget_icon, SoftBackend};
 use crate::render::{FlashView, PillShape, WidgetItem};
 
 // ---------- 对外接口 ----------
@@ -199,11 +199,7 @@ impl PillUi {
                         sw: sw as u8,
                         se: se as u8,
                     };
-                    p.rect_filled(bg_rect, bg_cr, argb(cfg::pill_bg_effective()));
-                    // 霓虹主题：沿边缘叠一圈内发光
-                    if cfg::cur().glow {
-                        crate::egui_soft::glow_edges(&p, bg_rect, bg_cr, cfg::cur().dock_edge);
-                    }
+                    glass_board(&p, bg_rect, bg_cr);
 
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         // egui 会在每个控件后面自动加 `item_spacing`（默认 8 点），

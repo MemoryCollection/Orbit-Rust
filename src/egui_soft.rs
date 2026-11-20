@@ -553,6 +553,19 @@ pub fn widget_icon(p: &egui::Painter, center: egui::Pos2, cell: f32, kind: u8, c
     }
 }
 
+/// 玻璃底板：只铺底色 +（霓虹主题）内发光，与顶部胶囊同一画法。
+/// 胶囊 / Dock / 模块条 / 音乐条共用，保证"玻璃面"视觉一致。
+///
+/// 注意：**不画描边**。1px 贴边描边的抗锯齿羽化会溢出窗口边界，
+/// 叠到壁纸上就是"Dock 外圈一圈没裁干净的白边"（用户实测）。
+/// 玻璃面的立体感靠底色本身的透明度和霓虹内发光，不再靠亮边。
+pub fn glass_board(p: &egui::Painter, board: egui::Rect, cr: egui::CornerRadius) {
+    p.rect_filled(board, cr, argb(cfg::pill_bg_effective()));
+    if cfg::cur().glow {
+        glow_edges(p, board, cr, cfg::cur().dock_edge);
+    }
+}
+
 /// 分隔线（竖 1px，垂直居中）。顶部胶囊已去掉分割线，保留给其它视图备用。
 #[allow(dead_code)]
 pub fn divider(p: &egui::Painter, x: f32, fh: f32) {

@@ -8,7 +8,7 @@
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, glow_edges, SoftBackend};
+use crate::egui_soft::{argb, glass_board, SoftBackend};
 
 /// Dock 一帧的绘制输出（与原 render::DockRender 同语义，rgba 改为预乘域）。
 pub struct DockPainted {
@@ -168,17 +168,9 @@ impl DockView {
                 let board = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
                 let radius = cfg::cur().dock_radius.min(cross * 0.5);
                 let cr = egui::CornerRadius::same(radius.round() as u8);
-                p.rect_filled(board, cr, argb(cfg::pill_bg_effective()));
-                p.rect_stroke(
-                    board.shrink(0.5),
-                    cr,
-                    egui::Stroke::new(1.0, argb(cfg::cur().dock_edge)),
-                    egui::StrokeKind::Inside,
-                );
-                // 霓虹主题：再沿边缘叠一圈内发光
-                if cfg::cur().glow {
-                    glow_edges(&p, board, cr, cfg::cur().dock_edge);
-                }
+                // 底色 + 内描边（描边内移到 shrink(1.5)，羽化不出窗——
+                // 画在 shrink(0.5) 时会往壁纸溢一圈白边）
+                glass_board(&p, board, cr);
                 // 迎光面的细反光：水平条画在上缘，竖排条画在左缘；两端内缩掉圆角，
                 // 免得直角的亮线从圆角里探出去
                 if vertical {
@@ -534,13 +526,8 @@ impl DockView {
                 let p = ui.painter().clone();
                 let board = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
                 let rad = egui::CornerRadius::same(cfg::cur().panel_radius.min(12.0) as u8);
+                // 按胶囊的画法：只铺底，不画描边（描边羽化会溢出窗口边界成白边）
                 p.rect_filled(board, rad, argb(cfg::cur().panel_bg));
-                p.rect_stroke(
-                    board.shrink(0.5),
-                    rad,
-                    egui::Stroke::new(1.0, argb(cfg::cur().panel_border)),
-                    egui::StrokeKind::Inside,
-                );
                 for (i, label) in labels.iter().enumerate() {
                     let ry = pad + i as f32 * row_h;
                     let row = egui::Rect::from_min_size(

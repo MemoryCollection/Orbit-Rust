@@ -97,11 +97,7 @@ pub fn paint_list(
                 egui::CornerRadius::same(cfg::cur().panel_radius as u8),
                 argb(cfg::cur().panel_bg),
             );
-            p.rect_stroke(
-                egui::Rect::from_min_size(egui::pos2(0.5, 0.5), egui::vec2(fw - 1.0, fh - 1.0)),
-                egui::CornerRadius::same(cfg::cur().panel_radius as u8),
-                egui::Stroke::new(1.0, argb(cfg::cur().panel_border)), egui::StrokeKind::Inside,
-            );
+            // 按胶囊的画法：只铺底不描边（描边羽化溢出窗口边界会成白边）
 
             // 标题
             let title_y = if subtitle.is_empty() {
@@ -235,14 +231,10 @@ pub fn paint_weather(
         input,
         |ui| {
             let p = ui.painter().clone();
-            // 底板 + 描边
+            // 底板（按胶囊的画法：只铺底不描边，描边羽化会溢出窗口成白边）
             p.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
                 egui::CornerRadius::same(cfg::cur().panel_radius as u8), argb(cfg::cur().panel_bg));
-            p.rect_stroke(
-                egui::Rect::from_min_size(egui::pos2(0.5, 0.5), egui::vec2(fw - 1.0, fh - 1.0)),
-                egui::CornerRadius::same(cfg::cur().panel_radius as u8),
-                egui::Stroke::new(1.0, argb(cfg::cur().panel_border)), egui::StrokeKind::Inside);
 
             // 标题：当地 + 天气（强调色）
             let t1w = tw(s, "当地", 15.0 * k);
