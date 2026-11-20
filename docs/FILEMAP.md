@@ -15,7 +15,13 @@
 | `src/panel.rs` | 展开面板窗口（天气卡片 / 剪贴板 / 邮件）：独立分层窗口、命中表 → 动作号、点击回传 `WM_ROW_CLICK`，自身不做业务判断 |
 | `src/musicbar.rs` | 音乐条窗口：贴在胶囊左/右/下方的小窗 = 旋转的圆形专辑封面（中心播放/暂停按钮）+ 当前歌词；没有播放时整条隐藏；只有封面圆接鼠标（左键播放/暂停、右键下一首），其余穿透 |
 | `src/widgetbar.rs` | **分离模块条**窗口：每侧最多 `WIDGET_BAR_MAX_SLOT`(3) 条独立分层小窗，按 (侧, 编号) 一一对应、懒创建。`window.rs` 把同侧同编号的 widget 合成一组传进来（`sync(Frame)` 一帧统一定位/显隐，从胶囊往外按编号排，编号 1 贴得最近），条与胶囊同高同底色；整窗默认穿透，只有 widget 矩形接鼠标，点击 `PostMessage(胶囊, WM_WIDGET_CLICK, 类型号)` 由 `App::on_widget` 分发 |
-| `src/render.rs` | 全部绘制：胶囊/ Dock 圆角底板、文本（三种字体族）、widget、图标合成（字形蒙版 + 位图 `blit_bitmap`，胶囊右侧托盘闪烁图标用）、面板与天气卡片、音乐条（封面解码/旋转/按钮/歌词）、`present()` 上屏、图标捕获、高质量缩放、BGRA 转换（设置页绘制已迁往 `settingsui.rs` 的 egui 版） |
+| `src/render.rs` | **仅剩非绘制能力**（UI 绘制已全迁 egui）：GDI+ 生命周期（startup/shutdown）、`present()` 上屏（premultiplied BGRA → UpdateLayeredWindow）、程序/托盘图标捕获 `capture_icon_rgba`、高质量缩放 `resize_rgba`、封面 `decode_cover`/`rotate_cover`、文本测量 `measure_text`（供面板尺寸预算）、`premultiplied_rgba_to_bgra`；数据结构 `WidgetItem`/`FlashView`/`PillShape`/`PanelRow`/`WeatherView` 等 |
+| `src/egui_soft.rs` | **公共 egui 软件后端**：持有 `egui::Context` + 纹理表；`rasterize()` 把 epaint 网格光栅化成预乘 RGBA（`fill_tri` 重心插值 + 双线性纹理采样 + 预乘 over 合成）；`soft_image()` 上传 straight RGBA 像素块成 egui 纹理（内容 hash 复用）；`install_fonts` 注入中文字体；`argb`/`divider` 工具。所有分层窗口共用这套模式（egui 逻辑点布局 → 本后端 → `present()`） |
+| `src/pillui.rs` | 胶囊的 egui 绘制（window.rs 持 `PillUi`）：时钟 + widget 区 + 闪烁图标格；预量宽用 egui 字体度量，命中矩形按逻辑点收集后乘 scale；`PillEvent`（widget/闪烁图标点击与悬停进出）回 wndproc 按旧语义分发；变化检测 hash 让纯鼠标路过帧跳过上屏 |
+| `src/dockview.rs` | Dock + 悬停提示条的 egui 绘制：`paint()` 画底板/应用图标/分隔线/托盘图标/返回桌面细条（支持竖排四锚位），`paint_tooltip()` 画提示条；`dock_size()` 逻辑尺寸预算；图标字节 `soft_image()` 上传后画；命中矩形物理像素返回给 dock.rs 的 wndproc |
+| `src/widgetbarview.rs` | 分离模块条的 egui 绘制：与胶囊 widget 区同构（圆角底 + 图标字 + 文本 + 悬停底），`bar_width()` 逻辑宽度预算；每窗口在 widgetbar.rs 里 thread_local 一份 `SoftBackend` |
+| `src/musicbarview.rs` | 音乐条的 egui 绘制：旋转封面（`render::rotate_cover` 后上传纹理）+ 占位圆/音符 + 中心播放/暂停按钮（convex_polygon 三角 / 两根竖条）+ 歌词；`cover_box`/`fixed_w`/`text_w`/`ellipsize` 逻辑尺寸工具；musicbar.rs 里 thread_local 一份 `SoftBackend` |
+| `src/panelview.rs` | 展开面板的 egui 绘制：`paint_list()` 通用列表（标题/副标题/标签页/行/固定按钮，命中区动作号 `0..999`/`PIN_BASE+`/`TAB_BASE+` 不变）、`paint_weather()` 天气宽卡片（左栏实况 + 右栏四天预报 + 刷新按钮，字号倍率 k）；面板尺寸仍复用 `render::panel_size`/`weather_panel_size`（纯字体测量） |
 | `src/weather.rs` | 天气数据：高德（实况 + 四天预报，失败回退 Open-Meteo）与出口 IP 定位，30 分钟刷新、失败指数退避；`describe()/glyph()` 码位映射 |
 | `src/lyric.rs` | 歌词数据：按曲目搜网易云 → 取 LRC → 解析时间轴 → 按播放进度取当前行；换歌才请求，结果（含"无歌词"）内存缓存 |
 | `src/mail.rs` | 邮箱数据：IMAP over TLS（最小 IMAP4rev1 子集）拉最近 N 封、MIME 解码、验证码抽取；已读双向同步（读服务端 `\Seen`，点开时后台 `UID STORE +FLAGS (\Seen)` 写回）；`test_account()` 供设置页「测试连通」（建连 + LOGIN 实测） |
@@ -45,7 +51,6 @@
 | `tools/trayhostcheck/` | harness：用 `#[path]` 直接引入产品模块 `src/trayhost.rs`，不启动完整 Orbit 就能验证图标表捕获（GUID 图标、空名字图标、`NIM_ADD/MODIFY/DELETE`） |
 | `tools/hidecheck/` | 任务栏隐藏 A/B 工具：`hide`（autohide+SWP_HIDEWINDOW）/ `show`（还原）/ `back`（移回原位）/ `unlayer`（清分层残留），打印 state/visible/rect/workarea |
 | `tools/flyouttest/` | 悬停弹窗重定位的离线验证：`#[path]` 引入 `flyout.rs`，派生子进程造一个 `WS_POPUP\|WS_EX_TOOLWINDOW` 假弹窗（初始摆在旧托盘角 1500,900），调 `flyout::watch(..., anchor_x)` 后打印实际位置 vs 期望（鼠标 x 居中、下沿贴胶囊上沿）。`flyouttest [anchor_x]`，实测 1043→(883,595)、1900→(982,595) 夹取正确；不依赖微信/不碰任务栏 |
-| `tools/pillcheck/` | 渲染离线验证：`#[path]` 引入 `config.rs` + `render.rs`，按模式出图到 `tools/_shots/`：`split`（一个模块一条）/ `merge`（同侧合并）/ `pill`（`layout_<模式>_<缩放>.bmp`，核对分组布局与日期字体）、`dock` / `dock_notray`（Dock + 托盘 + 返回桌面细长条，打印命中矩形）、`settings`（设置卡片，核对排版：时钟三行的单选预览块、七段位置、托盘逐图标开关与「返回桌面」格、恢复按钮）；不开窗口、不碰任务栏 |
 
 ## 文档
 

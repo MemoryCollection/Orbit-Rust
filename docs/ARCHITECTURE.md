@@ -1,24 +1,30 @@
 # Orbit 架构总览
 
-悬浮任务栏：顶部胶囊（时钟/日期 + 可分离出去的模块条 + 展开面板）+ 胶囊旁的音乐条（旋转封面 + 歌词）+ 底部 Dock（钉选与运行中应用）浮在所有窗口上方，不占用工作区。目标 Win11 23H2 (22631)、主屏、低内存（原生 Win32 + GDI+，无 WebView）。胶囊支持整体透明度与三种形状（悬浮 / 吸顶刘海 / 吸底），Dock 支持下/上/左/右四个锚位。
+悬浮任务栏：顶部胶囊（时钟/日期 + 可分离出去的模块条 + 展开面板）+ 胶囊旁的音乐条（旋转封面 + 歌词）+ 底部 Dock（钉选与运行中应用）浮在所有窗口上方，不占用工作区。目标 Win11 23H2 (22631)、主屏、低内存（原生 Win32 + egui 软件后端，无 WebView）。**UI 绘制已全部迁到 egui**：各窗口用 egui 立即模式布局 → epaint 网格 → 公共软件光栅化（`egui_soft`）→ 预乘 RGBA → `render::present()`（UpdateLayeredWindow）；`render.rs` 只剩图标捕获/缩放、封面旋转、文本测量等非绘制能力。胶囊支持整体透明度与三种形状（悬浮 / 吸顶刘海 / 吸底），Dock 支持下/上/左/右四个锚位。
 
 ## 模块关系
 
 ```
 main.rs → app.rs（启动/消息循环）
             ├─ window.rs  顶部胶囊（WS_POPUP + LAYERED + TOPMOST + NOACTIVATE）
-            │    ├─ render.rs  GDI+ → 逐像素 alpha → present() → UpdateLayeredWindow
+            │    ├─ pillui.rs  胶囊 egui 布局（时钟+widget+闪烁图标）→ 公共软件后端
             │    ├─ weather.rs 后台线程拉高德（回退 Open-Meteo）
             │    ├─ mail.rs    后台线程 IMAP 拉邮件 + 验证码抽取
             │    ├─ music.rs   后台 MTA 线程采样 SMTC（曲目 + 播放头 + 专辑封面）
             │    ├─ lyric.rs   按曲目搜网易云取 LRC，按播放进度取当前句
-            │    ├─ musicbar.rs 音乐条（旋转封面 + 播放按钮 + 当前歌词，胶囊旁的一条独立小窗）
-            │    ├─ widgetbar.rs 分离模块条（每侧最多 3 条，承载被分离出去的 widget；同侧同编号合并成一条）
+            │    ├─ musicbar.rs 音乐条窗口壳（音乐条内容由 musicbarview 画）
+            │    ├─ widgetbar.rs 分离模块条窗口壳（每侧最多 3 条，同侧同编号合并）
             │    ├─ clipboard.rs 后台线程监听剪贴板
             │    ├─ clock.rs   时钟模块（日期 + 时间合并成一段，格式由设置决定）
-            │    ├─ panel.rs   展开面板（点 widget 弹出，回传动作号）
+            │    ├─ panel.rs   展开面板窗口壳（点 widget 弹出，回传动作号）
             │    └─ tray.rs    托盘镜像数据层（优先消费 trayhost 托管表，UIA+PrintWindow 兜底）
             ├─ dock.rs    底部 Dock（同款分层窗口，独立 wndproc + 2s 重扫定时器 + 悬停提示条 ORBIT_TIP）
+            ├─ egui_soft.rs   公共 egui 软件后端：Context/纹理/字体 + epaint 网格→预乘 RGBA 光栅化
+            ├─ dockview.rs    Dock + 提示条的 egui 绘制
+            ├─ widgetbarview.rs 分离模块条的 egui 绘制
+            ├─ musicbarview.rs  音乐条的 egui 绘制（封面旋转仍用 render::rotate_cover）
+            ├─ panelview.rs  展开面板（列表+天气卡片）的 egui 绘制
+            ├─ render.rs  仅剩：图标/封面捕获与缩放、封面旋转、文本测量、present() 上屏（无 UI 绘制）
             ├─ trayhost.rs 完整托盘托管：假 Shell_TrayWnd + TaskbarCreated + WM_COPYDATA 图标表
             ├─ traymsg.rs 托盘回调消息转发（按 v0/3/4 编码，不动光标）
             ├─ flyout.rs  悬停预览卡片重定位（搬到 Dock/胶囊的上/下方并守位）
@@ -29,14 +35,16 @@ main.rs → app.rs（启动/消息循环）
             └─ hide.rs    原生任务栏真隐藏（ABM_SETSTATE(AUTOHIDE) + SWP_HIDEWINDOW）
 ```
 
-所有窗口共用 `render::present()` 上屏；各自持有自己的状态结构（`window::App` / `dock::Dock` / `panel::Panel`），通过窗口 `GWLP_USERDATA` 取回。音乐条窗口（`musicbar`）、分离模块条窗口（`widgetbar`，每侧最多 `WIDGET_BAR_MAX_SLOT` 条，按 (侧, 编号) 懒创建）和提示条窗口（`ORBIT_TIP`）没有状态结构：内容与几何全部由胶囊窗口按需传入，前两者只把点击 `PostMessage` 回胶囊，后者只是 Dock 的一块画布（`WS_EX_TRANSPARENT` 点击穿透）。设置页（`settingsui`）是唯一例外：egui/eframe 小窗跑在独立线程里，自己接鼠标键盘、自己写设置，谁也不通知——胶囊与 Dock 靠比对 `settings::version()` 发现变化后重绘。
+所有分层窗口共用同一条绘制链路：**egui 立即模式布局（逻辑点）→ `egui_soft` 公共软件光栅化 → 预乘 RGBA → `render::present()`（UpdateLayeredWindow）**。这是本项目的重要设计约束——这些窗口依赖 NOACTIVATE + 逐像素 alpha + 圆角命中，不能换成 eframe 原生窗口（普通窗口不支持逐像素透明）。egui 后端按窗口分布：胶囊=`pillui`（window.rs 持 `PillUi`）、Dock+提示条=`DockView`（dock.rs 持字段）、模块条=`SoftBackend`（widgetbar 每窗口 thread_local 一份）、音乐条=`SoftBackend`（musicbar thread_local）、面板=`SoftBackend`（Panel 持字段）。各窗口仍持有自己的状态结构（`window::App` / `dock::Dock` / `panel::Panel`），通过窗口 `GWLP_USERDATA` 取回；音乐条/模块条/提示条仍无独立状态、内容几何由胶囊按需传入。设置页（`settingsui`）是唯一例外：egui/eframe 小窗跑在独立线程里，自己接鼠标键盘、自己写设置，谁也不通知——胶囊与 Dock 靠比对 `settings::version()` 发现变化后重绘。
+
+> 常见坑（egui 软件后端）：① 输出是**预乘 RGBA**，整体透明度要连 RGB 一起乘，再换 BGRA 上屏（`premultiplied_rgba_to_bgra`）；② 命中矩形要在逻辑点收集后乘 scale 转物理像素；③ 图标/封面像素块先 `SoftBackend::soft_image()` 上传成 egui 纹理再 `p.image()`；④ 变化检测（hash）必须保留，否则定时器空转光栅化；⑤ 中文字体靠 `install_fonts` 读系统微软雅黑注入 egui 字体族。
 
 ## 关键设计
 
 ### 悬浮窗口（三个窗口共同点）
 - 不注册 AppBar（ABM_NEW），所以不占用工作区，浏览器可全屏。
 - 置顶 + `WS_EX_NOACTIVATE`（点击不抢焦点）；圆角外区域 `WM_NCHITTEST → HTTRANSPARENT` 点击穿透。
-- 每帧绘制到 GDI+ 位图 → premultiplied BGRA → `UpdateLayeredWindow`，透明度烘焙进像素，改透明度只需重绘。
+- 每帧用 egui 布局 → epaint 网格 → `egui_soft` 软件光栅化成预乘 RGBA → premultiplied BGRA → `UpdateLayeredWindow`，透明度烘焙进像素，改透明度只需重绘。
 - 注册窗口类时必须给 `hCursor`（`LoadCursorW(None, IDC_ARROW)`），否则系统会套用"程序启动中"的转圈光标。
 - **位置固定**：胶囊贴主屏顶部居中，Dock 贴主屏底部居中，均不可拖动。两者的**水平居中都按 `rcMonitor` 计算**（同一基准）；垂直方向任务栏还活着时 Dock 用 `rcWork`（落在任务栏上方），任务栏被接管后用 `rcMonitor.bottom`（贴屏幕底）。
 - **没有控制台**：`main.rs` 里 `#![windows_subsystem = "windows"]`，双击 exe 不会弹 cmd 窗口；所有诊断输出改走 `trace.rs` 写 `<exe>/orbit.log`。
@@ -46,7 +54,7 @@ main.rs → app.rs（启动/消息循环）
 
 1. 各数据模块（weather / clipboard / mail）自己管数据与后台线程，暴露 `tick() -> bool`（有新数据就返回 true）。
 2. `window::App::build_widgets()` 把它们翻译成 `render::WidgetItem { icon, icon_argb, text }`，同时记录 `WidgetKind` 决定点击行为，并按模块布局分成「胶囊里的 / 左条的 / 右条的」三份。
-3. `render::draw_pill()` 统一排版并返回每个 widget 的命中矩形 `widget_rects`；分离出去的那些走 `render::draw_widget_bar()`（同一套 `draw_widget_strip` 排版，文本按**垂直中线对齐**）。
+3. `pillui::paint()` 用 egui 统一排版并返回每个 widget 的命中矩形（逻辑点 × scale 转物理像素）；分离出去的那些走 `widgetbarview::paint()`（同一套 widget 排布代码，文本按**垂直中线对齐**）。
 4. 点击按 `WidgetKind` 分发（胶囊内直接命中；模块条经 `WM_WIDGET_CLICK` 带类型号回传）。无数据的 widget 不占位（不会留空白）。
 
 **模块布局 = 排序列表 + 每模块模式**（取代旧的「左1/左2/左3/右1/右2/右3」编码）：`data/settings.txt` 里 `module_order` 是逗号分隔的模块名排序列表（`time,weather,mail,clipboard`，时间日期固定第一不可移动），`weather_mode` / `mail_mode` / `clipboard_mode` 各取 `pill`（留在胶囊里）/ `left` / `right` / `off`（隐藏）。规则：**同侧的模块合并成同一条**，同侧第几个就排第几条（上限 `WIDGET_BAR_MAX_SLOT = 3`，与预建窗口数一致）；`off` 的模块直接丢弃（胶囊/条里都没有）。设置页里这一行是**芯片（Chip）列表**：时间日期芯片固定画在最前（不可拖不可点），其余芯片**可拖动排序**（按下后 SetCapture，拖过相邻芯片中心就交换并即时写 `module_order`）、点击循环切换状态（胶囊 → 左条 → 右条 → 隐藏）。所有模块（含时间日期之外的全部）都能这样隐藏/显示。分离条与胶囊**同高（`PILL_H`）、同底色、同圆角**，条与条、条与胶囊之间都留 `WIDGET_BAR_GAP`；没有内容的那条自动隐藏。分离条窗口带整体透明度（与胶囊 `pill_alpha` 一致，烘焙进像素）。后期新模块只要往 `build_widgets` 的列表里加一项、配一个 `xxx_mode` 键并在 `module_order`/`MODULES` 里登记，就自动获得同样的分离/分组/隐藏能力。
@@ -55,7 +63,7 @@ main.rs → app.rs（启动/消息循环）
 
 **图标统一视觉尺寸**：胶囊里的图标都是 `Segoe UI Symbol` 字形，但同一字号下墨迹大小差很多（`☁` 比 `✉`/`▤` 大一圈）。所以图标不是直接 `DrawString`，而是先把字形渲染成 alpha 蒙版（`render::build_mask`，按字形+字号缓存），量出墨迹包围盒，再按**墨迹面积**缩放到 `WIDGET_GLYPH_INK`、居中贴进固定 `WIDGET_ICON_CELL` 的格子里。收益：换任何字形观感都一致，格子宽度固定 → 间距均匀、胶囊宽度稳定；贴图在像素取出后对 RGBA 直接做软合成 + 超采样，缩小时不糊。
 
-**日期与时间是同一个模块**（用户要求合并）：`clock.rs` 把两者拼成**一段**文本，`draw_pill` 只画一次、只量一次宽，整段同字号同颜色（`TIME_SIZE = 20`、`FontKind::Latin` 粗体，汉字由 GDI+ 自动回退），和后面的 widget 区之间才画分隔线。格式是 **strftime 风格的格式串**（`data/settings.txt` 的 `clock_format`，默认 `%Y-%m-%d %H:%M:%S`）：支持 `%Y` 四位年、`%y` 两位年、`%m` 月、`%d` 日、`%H` 24 时、`%I` 12 时、`%M` 分、`%S` 秒、`%p` 上午/下午、`%a` 周五、`%A` 星期五、`%%` 百分号，用户可自由组合任意样式；设置页里是一行**单行文本编辑框**（点进去直接打字、左右/Home/End 移光标、回车/失焦提交）+ 下方**实时预览**行（`clock::sample`，设置页开 1s 定时器重画，秒跟着走）。带 `%S` 的格式下"变化比较"会把秒算进去，秒一跳就重绘；不带的仍然只在分钟变化时重绘。老版本的 `clock_order`/`time_format`/`date_format` 三键在读取时自动迁移成等价格式串。
+**日期与时间是同一个模块**（用户要求合并）：`clock.rs` 把两者拼成**一段**文本，`pillui` 只画一次、只量一次宽（egui 字体度量），整段同字号同颜色（`TIME_SIZE = 20`，egui 比例字体 + 系统微软雅黑/符号字体回退），和后面的 widget 区之间才画分隔线。格式是 **strftime 风格的格式串**（`data/settings.txt` 的 `clock_format`，默认 `%Y-%m-%d %H:%M:%S`）：支持 `%Y` 四位年、`%y` 两位年、`%m` 月、`%d` 日、`%H` 24 时、`%I` 12 时、`%M` 分、`%S` 秒、`%p` 上午/下午、`%a` 周五、`%A` 星期五、`%%` 百分号，用户可自由组合任意样式；设置页里是一行**单行文本编辑框**（点进去直接打字、左右/Home/End 移光标、回车/失焦提交）+ 下方**实时预览**行（`clock::sample`，设置页开 1s 定时器重画，秒跟着走）。带 `%S` 的格式下"变化比较"会把秒算进去，秒一跳就重绘；不带的仍然只在分钟变化时重绘。老版本的 `clock_order`/`time_format`/`date_format` 三键在读取时自动迁移成等价格式串。
 
 **胶囊的水平居中只按胶囊自己**（`w = content_width(...)`，`rcMonitor` 取中）：分离出去的模块条、音乐条都不参与居中，条只按胶囊往外排（撞到屏幕边才内收）。
 
@@ -135,7 +143,7 @@ main.rs → app.rs（启动/消息循环）
 - **吸附位置的连锁反应**：胶囊吸底时，展开面板自动弹到胶囊**上方**（`panel_top_y` 按 `panel::content_size` 预算高度），托盘悬停卡片也改守位到胶囊**下方**（`flyout::watch` 的 `below = true`），保证任何形状下卡片都不出屏。
 
 ### Dock 锚位
-**底部 Dock 的命名**：窗口类名 `ORBIT_DOCK`（`src/dock.rs`，结构体 `Dock`），中文叫"底部 Dock"。`dock_anchor` 支持 `bottom`（默认，贴工作区下沿居中）/ `top`（贴主屏上沿）/ `left` / `right`（左右两侧竖排居中）：竖排模式 `dock_size` 返回 (宽, 高) 互换、`draw_dock` 用主轴抽象（`cross`/`long`）复用同一套布局，分隔线、悬停底、返回桌面细长条都跟着转向；Dock 在顶部时悬停卡片守位到 Dock 下方（`below`），提示条 `ORBIT_TIP` 也按锚位改到不遮挡的一侧。
+**底部 Dock 的命名**：窗口类名 `ORBIT_DOCK`（`src/dock.rs`，结构体 `Dock`），中文叫"底部 Dock"。`dock_anchor` 支持 `bottom`（默认，贴工作区下沿居中）/ `top`（贴主屏上沿）/ `left` / `right`（左右两侧竖排居中）：竖排模式 `dockview::dock_size` 返回 (宽, 高) 互换、`dockview::paint` 用主轴抽象（`cross`/`long`）复用同一套布局，分隔线、悬停底、返回桌面细长条都跟着转向；Dock 在顶部时悬停卡片守位到 Dock 下方（`below`），提示条 `ORBIT_TIP` 也按锚位改到不遮挡的一侧。
 
 ### 设置页面（settingsui.rs）
 

@@ -341,7 +341,7 @@ impl PillUi {
 
         // ---- 变化检测：内容 / 尺寸 / 悬停 / 事件，任一变了才算真要上屏 ----
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut mix = |h: &mut u64, b: &[u8]| {
+        let mix = |h: &mut u64, b: &[u8]| {
             for &x in b {
                 *h = (*h ^ x as u64).wrapping_mul(0x100_0000_01b3);
             }
