@@ -264,11 +264,13 @@ impl DockView {
                         let (rx, ry) = if vertical { (rc, pos) } else { (pos, rc) };
                         tray_rects_pt.push([rx, ry, tslot, tslot]);
                         if Some(i) == hovered_tray {
+                            // 与任务图标同一套悬停药丸（半径同样 +3），槽位一样大才对得齐
                             let center = egui::pos2(rx + tslot / 2.0, ry + tslot / 2.0);
-                            p.circle_filled(center, tslot / 2.0, argb(cfg::cur().dock_hover));
+                            let rr = tslot * 0.5 + 3.0;
+                            p.circle_filled(center, rr, argb(cfg::cur().dock_hover));
                             p.circle_stroke(
                                 center,
-                                tslot / 2.0 - 0.5,
+                                rr - 0.5,
                                 egui::Stroke::new(1.0, argb(cfg::cur().dock_hover_edge)),
                             );
                         }
@@ -279,7 +281,7 @@ impl DockView {
                                     bc,
                                     egui::vec2(tisz + 2.0, tisz + 2.0),
                                 ),
-                                egui::CornerRadius::same((tisz * 0.26) as u8),
+                                egui::CornerRadius::same((tisz * 0.22) as u8),
                                 argb(cfg::cur().icon_backing),
                             );
                         }
@@ -305,11 +307,13 @@ impl DockView {
                     }
                 }
 
-                // 末端"返回桌面"按钮
+                // 末端"返回桌面"细竖条：一根短圆角条，不做图标按钮（克制、不抢视觉）
                 if show_desktop {
-                    let bw = cfg::DOCK_DESKTOP_W.min(cross - 8.0).max(10.0);
-                    // 正方形按钮（高度上限取 Dock 高度的一个比例，竖排时主轴方向也只占这么长）
-                    let bh = (cross * cfg::DOCK_DESKTOP_H).min(bw).max(10.0);
+                    // 条的"厚度"永远垂直于 Dock 主轴（横排 → 竖条，竖排 → 横条），
+                    // 条的长度横跨 Dock 厚度方向（`DOCK_DESKTOP_H` 占位，留上下呼吸）
+                    let thin = cfg::DOCK_DESKTOP_W.min(cross - 12.0).max(2.0);
+                    let span = (cross * cfg::DOCK_DESKTOP_H).max(8.0);
+                    let (bw, bh) = if vertical { (span, thin) } else { (thin, span) };
                     let (bx, by) = if vertical {
                         (0.0, long - pad - bh)
                     } else {
@@ -321,69 +325,32 @@ impl DockView {
                         (bx, (cross - bh) / 2.0)
                     };
                     let bar = egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(bw, bh));
-                    let r_bar = (bw * 0.34).min(bh * 0.5);
+                    let r_bar = thin / 2.0;
 
-                    // 按钮底：用"文字色 + 低 alpha"当填充——深色主题下是提亮的白，
-                    // 浅色主题下是压暗的黑，两种主题都能和胶囊底分层，图标也始终看得清。
+                    // 颜色用"文字色 + 低 alpha"：深色主题下是提亮的白，浅色主题下是压暗的黑，
+                    // 两种主题都能和底板分层；悬停时整条提到强调色，并向外放一圈柔光
+                    // （向内画，窗口边不会裁掉）
                     let text = cfg::cur().text;
-                    let fill_a = if hovered_desktop { 0.20 } else { 0.09 };
                     if hovered_desktop {
-                        // 悬停：外圈再垫一层更淡的方形光晕（向内画，窗口边不会裁掉）
                         p.rect_filled(
-                            bar.expand(3.0),
-                            r_bar + 3.0,
-                            argb(crate::egui_soft::with_alpha(text, 0.08)),
+                            bar.expand(2.5),
+                            r_bar + 2.5,
+                            argb(crate::egui_soft::with_alpha(text, 0.10)),
                         );
                     }
-                    p.rect_filled(bar, r_bar, argb(crate::egui_soft::with_alpha(text, fill_a)));
-                    p.rect_stroke(
-                        bar,
-                        r_bar,
-                        egui::Stroke::new(
-                            1.0,
-                            argb(if hovered_desktop {
-                                crate::egui_soft::with_alpha(cfg::cur().accent, 0.75)
-                            } else {
-                                crate::egui_soft::with_alpha(text, 0.16)
-                            }),
-                        ),
-                        egui::StrokeKind::Inside,
-                    );
-
-                    // 显示器图标：屏 + 立柱 + 底座
-                    let col = argb(text);
-                    let sw = (bw * 0.055).clamp(1.1, 1.6);
-                    let stroke = egui::Stroke::new(sw, col);
-                    let c = bar.center();
-                    let mw = bw * 0.52;
-                    let mh = mw * 0.66;
-                    let screen = egui::Rect::from_center_size(
-                        egui::pos2(c.x, c.y - bh * 0.09),
-                        egui::vec2(mw, mh),
-                    );
-                    p.rect_stroke(
-                        screen,
-                        egui::CornerRadius::same(2),
-                        stroke,
-                        egui::StrokeKind::Inside,
-                    );
-                    let foot_y = screen.bottom() + bh * 0.13;
-                    p.line_segment(
-                        [egui::pos2(c.x, screen.bottom()), egui::pos2(c.x, foot_y)],
-                        stroke,
-                    );
-                    p.line_segment(
-                        [
-                            egui::pos2(c.x - mw * 0.34, foot_y),
-                            egui::pos2(c.x + mw * 0.34, foot_y),
-                        ],
-                        stroke,
-                    );
-
-                    desktop_rect_pt = Some(if vertical {
-                        [0.0, ry - cfg::DOCK_DESKTOP_GAP, cross, bh + cfg::DOCK_DESKTOP_GAP]
+                    let fill = if hovered_desktop {
+                        crate::egui_soft::with_alpha(cfg::cur().accent, 0.95)
                     } else {
-                        [rx - cfg::DOCK_DESKTOP_GAP, 0.0, bw + cfg::DOCK_DESKTOP_GAP, cross]
+                        crate::egui_soft::with_alpha(text, 0.28)
+                    };
+                    p.rect_filled(bar, r_bar, argb(fill));
+
+                    // 命中区要比细条宽一圈，否则 7 点宽根本点不准；两侧都是空白，不会抢图标
+                    let gap = cfg::DOCK_DESKTOP_GAP;
+                    desktop_rect_pt = Some(if vertical {
+                        [0.0, ry - gap, cross, bh + gap * 2.0]
+                    } else {
+                        [rx - gap, 0.0, bw + gap * 2.0, cross]
                     });
                 }
             },

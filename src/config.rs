@@ -204,29 +204,28 @@ pub const DOCK_HOVER_GROW: f32 = 2.0;
 pub const DOCK_BOTTOM_MARGIN: i32 = 8;
 /// 运行中窗口重扫间隔（毫秒）
 pub const DOCK_POLL_MS: u32 = 2000;
-/// Dock 托盘区：图标边长。比应用图标小一号——托盘图标本身分辨率低，
-/// 铺满同尺寸会把"糊"放大，缩一点反而更精致
-/// 源像素只有 16~24px，放大走 Catmull-Rom（见 tray::resize_premul）
-pub const DOCK_TRAY_RATIO: f32 = 0.84;
-pub const DOCK_TRAY_ICON: f32 = DOCK_ICON * DOCK_TRAY_RATIO;
-/// Dock 托盘区：槽位（比任务图标槽位同步收小，图标仍垂直居中）
-pub const DOCK_TRAY_SLOT: f32 = DOCK_SLOT * DOCK_TRAY_RATIO;
+/// Dock 托盘区：图标边长。**与任务图标完全一致**，底下一排图标因此等大；
+/// 源像素只有 16~24px，铺满 44 点靠 Catmull-Rom 放大（见 `tray::resize_premul`），
+/// 个别只注册小 `hIcon` 的程序会略软，这是"一样大"的代价
+pub const DOCK_TRAY_ICON: f32 = DOCK_ICON;
+/// Dock 托盘区：槽位（= 任务图标槽位，悬停圆底大小才对得上）
+pub const DOCK_TRAY_SLOT: f32 = DOCK_SLOT;
 /// Dock 托盘区：图标间距
 pub const DOCK_TRAY_GAP: f32 = DOCK_GAP;
 /// Dock 托盘区与左侧应用图标之间的间距（分隔线两侧各留这么多）
 pub const DOCK_TRAY_SEP: f32 = 8.0;
 
-// ---------- Dock：返回桌面按钮（右端圆角按钮）----------
+// ---------- Dock：返回桌面（右端细竖条）----------
 
-/// 返回桌面按钮开关（右端那个带显示器图标的按钮，点一下显示/还原桌面）
+/// 返回桌面开关（右端那条短竖条，点一下显示/还原桌面）
 pub const SHOW_DESKTOP_BTN: bool = true;
-/// 按钮边长
-pub const DOCK_DESKTOP_W: f32 = 26.0;
-/// 按钮与图标区之间的间距。左侧按同样的宽度留一块空白占位，
+/// 细竖条宽度（垂直于 Dock 主轴）
+pub const DOCK_DESKTOP_W: f32 = 7.0;
+/// 细竖条与图标区之间的间距。左侧按同样的宽度留一块空白占位，
 /// 图标组才仍然是屏幕居中（右侧多宽、左侧就空多宽）
-pub const DOCK_DESKTOP_GAP: f32 = 8.0;
-/// 按钮高度占 Dock 高度的比例（留一点上下呼吸，不顶满）
-pub const DOCK_DESKTOP_H: f32 = 0.84;
+pub const DOCK_DESKTOP_GAP: f32 = 10.0;
+/// 细竖条长度占 Dock 厚度的比例（留足上下呼吸，不顶满）
+pub const DOCK_DESKTOP_H: f32 = 0.62;
 
 // ---------- 托盘镜像 ----------
 
