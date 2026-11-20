@@ -153,7 +153,7 @@ impl DockView {
                 let board = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
                 let radius = cfg::cur().dock_radius.min(cross * 0.5);
                 let cr = egui::CornerRadius::same(radius.round() as u8);
-                p.rect_filled(board, cr, argb(cfg::cur().pill_bg));
+                p.rect_filled(board, cr, argb(cfg::pill_bg_effective()));
                 p.rect_stroke(
                     board.shrink(0.5),
                     cr,

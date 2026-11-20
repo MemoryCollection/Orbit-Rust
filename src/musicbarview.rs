@@ -71,7 +71,7 @@ pub fn paint(
             p.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
                 egui::CornerRadius::same((fh / 2.0).min(255.0) as u8),
-                argb(cfg::cur().pill_bg),
+                argb(cfg::pill_bg_effective()),
             );
 
             let (cx0, cy0, d) = cover_box(fh);

@@ -6,6 +6,28 @@
 
 pub use crate::theme::cur;
 
+/// 考虑「透明度滑条」之后的胶囊/Dock/模块条底色。
+///
+/// 滑条拉到 100%（`>= 0.999`）时**强制实底**（alpha = 0xFF）：主题自带的半透明底色
+/// （玻璃 2.0 / Material 3 的 `pill_bg` alpha 是 0xC0~0xF0）在 100% 时不该再透出桌面。
+/// 低于 100% 时保持主题原色——平铺的半透明是主题设计的一部分，叠加的压暗由
+/// `window.rs` 的整帧 alpha 乘法负责。
+///
+/// 只动**底色**的 alpha：文字、图标、描边颜色一律不碰，保证任何时候都可读。
+pub fn pill_bg_effective() -> u32 {
+    let bg = crate::theme::cur().pill_bg;
+    if crate::settings::pill_alpha() >= 0.999 {
+        opaque(bg)
+    } else {
+        bg
+    }
+}
+
+/// 只把 alpha 字节提到 0xFF，RGB 原样保留
+pub fn opaque(c: u32) -> u32 {
+    (0xFF << 24) | (c & 0x00FF_FFFF)
+}
+
 /// 胶囊高度
 pub const PILL_H: f32 = 44.0;
 /// 左右内边距
@@ -273,3 +295,15 @@ pub const MUSIC_PLACEHOLDER: &str = "♪";
 
 /// 固定（置顶）标记的宽度：点这里切换固定状态
 pub const PIN_W: f32 = 26.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_keeps_rgb_and_forces_alpha() {
+        assert_eq!(opaque(0xC0_16_18_1E), 0xFF_16_18_1E);
+        assert_eq!(opaque(0xFF_12_34_56), 0xFF_12_34_56);
+        assert_eq!(opaque(0x00_FF_FF_FF), 0xFF_FF_FF_FF);
+    }
+}

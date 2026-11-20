@@ -58,22 +58,20 @@
 
 ## 3. 当前工作区状态（重要）
 
-### 3.1 已完成但【未提交】的功能（前两轮遗留，勿重复做）
-`git status` 显示 18 个文件有未提交改动，包括：
+### 3.1 已完成的功能（已提交 `9037447`）
+前两轮遗留的改动已经全部落进提交 `9037447`（工作区干净）：
 - 程序图标四角透明化 + 重生成 `assets/orbit.ico`（`appicon.rs`、`tools/icon/make_icon.py`）。
 - 胶囊/Dock 图标缩放滑条 + 重置（`settings.rs`、`settingsui.rs`、`dock.rs` 等）。
 - 托盘图标缩小 + 放大清晰度（`tray.rs`、`render.rs` 的 `capture_icon_rgba` / `fit_icon`）。
 - 胶囊去分割线、邮箱/剪贴板矢量图标（`egui_soft.rs::widget_icon`、`pillui.rs`、`widgetbarview.rs`）。
 - Dock「返回桌面」按钮从细长条改成圆角显示器图标按钮（`dockview.rs`）。
 - `config.rs` 颜色/圆角常量已全部删掉，改为 `cfg::cur().xxx`（106 处调用点）。
+- `theme.rs` 三套风格 × 深浅色 6 主题。
 
-> 建议：开发前先 `git add -A && git commit` 或至少确认这些改动是可用的。
-> 之前 `git push` 因代理 502 失败，本地已提交 `fcf81fc`，远程可能落后。
+> 远程可能落后：之前 `git push` 因代理 502 失败过。
 
-### 3.2 本次已做一半的改动（需继续 + 验证）
-**`src/theme.rs` 已被重写**，但**尚未编译验证**。当前内容：
-- 删除了旧的 6 套：`glass / liquid / mica / paper / neon / terminal`。
-- 新增 6 个主题（`ALL` 数组）：
+### 3.2 主题系统现状（2026-11-20 收尾）
+**`src/theme.rs` 已编译通过并有测试保护**。当前 `ALL` 数组：
 
 | key | name | dark |
 |-----|------|------|
@@ -84,10 +82,13 @@
 | `m3_light` | Material 3 · 浅色 | false |
 | `m3_dark` | Material 3 · 深色 | true |
 
-- 主题内部测试已更新（`each_style_has_both_modes` 等）。
+- 旧的 `glass / liquid / mica / paper / neon / terminal` 已删除，老 `settings.txt` 由
+  `settings::legacy_theme_key()` 就近映射（见任务 B）。
+- 透明度滑条 100% = 实底，由 `config::pill_bg_effective()` 统一处理（见任务 C）。
 
-### 3.3 尚未做的（本次计划核心待办）
-见第 4 节。
+### 3.3 尚未做的
+- Material 3 的**弹簧动效 / 真涟漪**（任务 E，已定二期）。
+- 设置页本体视觉人工确认（任务 D，环境抓不到 GL 窗口）。
 
 ---
 
@@ -98,19 +99,19 @@
 - [x] `cargo test` 全量 → 15/15 通过，无破坏。
 - 结论：`theme.rs` 重写（删旧 6 套、新增三风格×深浅色 6 主题）**编译与测试均已通过**。
 
-### 任务 B：旧主题 key 迁移 + 设置页文案
-- 文件：`src/settings.rs`
-- 旧 `settings.txt` 里的 `theme=glass` 等旧 key 已无法被 `index_of()` 反查，会**静默回落默认**。
-  需处理：`load()` 里 `theme` 键解析失败时应明确落到一个合理默认（当前 `index_of` 返回 `None` 时
-  `tkey` 保持 `cur().key`，即不覆盖——行为可接受，但建议确认）。
-- `append_missing()` 里 `"theme"` 的注释行还是旧的 6 套 key 说明，需改成新的 6 套：
-  ```
-  # 外观主题：calm_light/calm_dark（平静）/ glass2_light/glass2_dark（玻璃 2.0）/
-  # m3_light/m3_dark（Material 3）
-  ```
-- `BODY`（`ensure_file` 用）里若也写了旧 theme 说明，一并更新。
+### 任务 B：旧主题 key 迁移 + 设置页文案 —— ✅ 已完成
+- [x] `src/settings.rs` 新增 `legacy_theme_key()`：旧 6 个 key 就近映射到新主题，
+      深浅色不反（`glass`/`liquid`→`glass2_dark`、`mica`→`glass2_light`、
+      `paper`→`calm_light`、`neon`→`m3_dark`、`terminal`→`calm_dark`）。
+      `load()` 的 `theme` 分支：先 `index_of()`，失败再走映射，都不中就保持当前主题。
+- [x] `BODY`（新建文件用）补上 `theme=calm_light` 与新的 6 套说明；
+      `append_missing()` 的 `"theme"` 注释行同步改成新 6 套。
+- [x] 文件头注释补 `theme` 键说明 + `pill_alpha` 100% 的语义。
+- [x] 新增测试 `legacy_theme_keys_map_to_new_styles`（断言映射存在、深浅色一致）。
+- 实测：把 `settings.txt` 写成 `theme=glass` 启动，实际渲染为 `glass2_dark`
+      （胶囊底色像素 `#16181E`），迁移生效。
 
-### 任务 C：透明度 100% = 完全不透明（精确改点）
+### 任务 C：透明度 100% = 完全不透明（精确改点）—— ✅ 已完成
 
 **现状（已核实）：**
 - `src/window.rs:416-422`：`pill_alpha` 的处理是 `if alpha < 0.999 { 整体乘 alpha }`，
@@ -152,13 +153,26 @@ pub fn pill_bg_effective() -> u32 {
 - 若想更彻底（Dock 的内描边 `dock_edge`、反光 `dock_glow` 也随实底变），可一并判断，
   但**默认不做**，避免实底时亮边/高光显得突兀；先交付底色实底即可。
 
-### 任务 D：设置页主题选择器确认
-- `src/settingsui.rs` 的色块选择器用 `crate::theme::ALL` 遍历，**自动跟随新 6 套**，无需改逻辑。
-- 需确认：色块下方显示 `cfg::cur().name` 正常；选中框、悬停名正常。
-- 色块用「模拟壁纸中性底 + 叠 `pill_bg`」的画法（`settingsui.rs:468-486`）——新主题半透明底
-  仍能区分，理论上 OK。
+**实际落地（与上面方案一致）：**
+- `config.rs`：`pill_bg_effective()` + 纯函数 `opaque(c)`（只提 alpha 字节），
+  配了单元测试 `opaque_keeps_rgb_and_forces_alpha`。
+- 4 处底色绘制点全部改为 `argb(cfg::pill_bg_effective())`：
+  `pillui.rs` / `dockview.rs` / `widgetbarview.rs` / `musicbarview.rs`。
+- 实测像素：6 套主题在 100% 时底色 alpha 均为 255（RGB 与主题一致）；
+  玻璃 2.0 深色拉到 90% 时预乘 RGB 为 `(15,16,21)`（≈ 0xC0×0.9），半透明照旧。
+- 副作用（已知、可接受）：Dock 与音乐条**不受滑条数值调节**（`pill_alpha` 只整帧压胶囊
+  与模块条），但它们也吃 100% 这条规则——所以玻璃主题在默认 100% 下是实底，
+  想看毛玻璃效果需把滑条往 100% 以下拉一点。
 
-### 任务 E：Material 3 的「弹簧动效 + 涟漪反馈」落点
+### 任务 D：设置页主题选择器确认 —— ✅ 逻辑已确认，视觉待人工看一眼
+- `src/settingsui.rs` 的色块选择器用 `crate::theme::ALL` 遍历，**自动跟随新 6 套**，无需改逻辑。
+- 已确认：色块下方显示 `cfg::cur().name`；选中框用 `t.accent`、悬停名 `t.name`；都按主题取色。
+- 色块用「模拟壁纸中性底 + 叠 `pill_bg`」的画法（`settingsui.rs:468-486`）——新主题半透明底
+  仍能区分。
+- **注意**：设置页是 eframe/GL 渲染的普通窗口，`PrintWindow` 只能拿到原生标题栏、
+  `ImageGrab` 在无交互桌面时会失败 → 本轮**无法截图**验证设置页视觉，需本机人工点一下。
+
+### 任务 E：Material 3 的「弹簧动效 + 涟漪反馈」落点（标注二期，本轮不做）
 - 说明：本项目是**逐帧软件光栅化的分层窗口**，没有动画循环，也没有真正的"点击涟漪"回调通道。
 - 现实可落地范围（按成本递增）：
   1. **圆角/分层/取色**：已通过 theme 字段覆盖（大圆角、卡片分层靠 panel_border/panel_bg 对比）。✅ 已做
@@ -169,14 +183,17 @@ pub fn pill_bg_effective() -> u32 {
      **建议二期**。
 - 结论：主题系统层面已能表达 M3 的静态特征；动效类建议在计划里标注「二期」，先交付静态风格统一。
 
-### 任务 F：编译 + 实跑截图验证（关键）
-- [ ] `cargo test`（theme 4 个测试 + settings 若干）→ 全绿。
-- [ ] `cargo build --release`
-- [ ] 逐套主题实跑，抓窗口截图验证（已有工具 `tools/_shots/grab_window.py`，抓 `ORBIT_CAPSULE` / `ORBIT_DOCK` / `ORBIT_WIDGETBAR`）：
-  1. 深浅色各 3 套共 6 套，检查胶囊文字对比度、图标衬底、Dock 图标清晰度、面板配色。
-  2. 浅色主题下关闭按钮（设置页）斜线是否可见（用 `cur().text`，浅色下应为深色）。
-  3. 透明度拉到 100%，确认胶囊/Dock 为实底不透明。
-  4. 切换主题后所有窗口（胶囊/模块条/音乐条/Dock/面板/设置页）统一切换。
+### 任务 F：编译 + 实跑截图验证（关键）—— ✅ 已完成
+- [x] `cargo test` → **17/17 通过**（theme 4 个 + config 1 个 + settings 6 个 + 其它）。
+- [x] `cargo build --release` 成功。
+- [x] 6 套主题实跑截图（`tools/_shots/t_<key>_pill.png` / `_dock.png`，对照图 `_themes_sheet.png`）：
+  1. 深浅色各 3 套：胶囊文字对比度、图标衬底、Dock 图标清晰度、天气面板配色均正常。
+     浅色主题 Dock 图标有白衬底（`icon_backing`），深色主题无衬底，彩色图标不发脏。
+  2. 浅色主题下「返回桌面」按钮（Dock 右端）实测为深灰描边 + 浅灰底，清晰可见。
+  3. 透明度拉到 100%：胶囊 / 模块条 / Dock 底色 alpha 全为 255。
+  4. 切主题（改 `settings.txt` 的 `theme=` 后等 ~1s）胶囊、模块条、Dock 同帧一起变，
+     天气面板同样跟随。
+- 无法自动验证：设置页本体的视觉（GL 窗口抓不到，见任务 D）。
 - 启动方式：后台运行 `./target/release/orbit.exe`（`run_in_background: true`）；
   设置页打开：`FindWindowW("ORBIT_CAPSULE")` + `PostMessageW(WM_RBUTTONUP=0x0205)`。
 
@@ -194,8 +211,9 @@ pub fn pill_bg_effective() -> u32 {
 3. **生僻 Unicode 字形不可用**：所有"图标"都不要用 U+2715 之类（雅黑无字形）。
    关闭按钮是 painter 自绘斜线（`settingsui.rs::close_button`），不要改回字符。
 4. **egui Slider 宽度**由 `ui.spacing_mut().slider_width` 控制，`add_sized` 管不到。
-5. **主题热切换**不重建窗口，靠 `version()` 轮询；手改 `settings.txt` 的 `theme=` 不会热加载，
-   只有设置页点选才生效（或重启）。
+5. **主题热切换**不重建窗口，靠 `version()` 轮询；**手改 `settings.txt` 的 `theme=` 也会热加载**
+   （`reload_if_changed()` → `load()` → `theme::set_index()`，实测约 1s 生效，6 套都验证过）。
+   注意落盘的文件可能仍留着旧 key（只有下次 `save()` 才改写），不影响运行。
 6. **霓虹发光已弃用**：新 6 套主题 `glow` 全为 `false`；`glow_edges` 代码可保留但不会触发。
 7. **`ALL` 数组下标 = 设置页顺序**，测试 `set_index_clamps` 断言了 `cur().key == "calm_light"`，
    改动顺序/名称时要同步改测试。
@@ -204,9 +222,10 @@ pub fn pill_bg_effective() -> u32 {
 
 ## 6. 交付标准
 
-- [ ] `cargo test` 全绿（theme 测试 4 个 + settings 测试若干）。
-- [ ] `cargo build --release` 成功。
-- [ ] 6 套主题截图确认可读性、统一性。
-- [ ] 透明度 100% 实底验证通过。
-- [ ] 设置页切换任意主题，所有窗口统一切换。
-- [ ] （建议）`git commit` 落盘，并尝试 `git push`（代理可能 502，失败则记录）。
+- [x] `cargo test` 全绿 → **17/17**（theme 4 + config 1 + settings 6 + clock/json/lyric 6）。
+- [x] `cargo build --release` 成功（1m23s，仅 dead_code 警告）。
+- [x] 6 套主题截图确认可读性、统一性（`tools/_shots/t_*_pill.png`、`_dock.png`、`_themes_sheet.png`）。
+- [x] 透明度 100% 实底验证通过（6 套底色 alpha = 255；90% 时预乘 RGB 按 0xC0×0.9 变暗）。
+- [x] 切换主题后所有窗口统一切换（胶囊 / 模块条 / Dock / 天气面板实测同帧跟随）。
+- [ ] 设置页本体视觉：环境抓不到 GL 窗口，需人工确认（逻辑无改动，色块遍历 `theme::ALL`）。
+- [ ] `git commit` 落盘并尝试 `git push`（代理可能 502，失败则记录）。

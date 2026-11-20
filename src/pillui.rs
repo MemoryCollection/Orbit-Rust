@@ -212,7 +212,7 @@ impl PillUi {
                         sw: sw as u8,
                         se: se as u8,
                     };
-                    p.rect_filled(bg_rect, bg_cr, argb(cfg::cur().pill_bg));
+                    p.rect_filled(bg_rect, bg_cr, argb(cfg::pill_bg_effective()));
                     // 霓虹主题：沿边缘叠一圈内发光
                     if cfg::cur().glow {
                         crate::egui_soft::glow_edges(&p, bg_rect, bg_cr, cfg::cur().dock_edge);

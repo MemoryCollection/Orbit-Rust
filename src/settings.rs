@@ -10,9 +10,15 @@
 //! - `module_order`       顶部胶囊模块的排列（拖动排序写回）：`weather,mail,clipboard`
 //! - `weather_mode` / `mail_mode` / `clipboard_mode`
 //!   模块摆哪：`pill`（留在胶囊里）/ `left`（分离到胶囊左侧一条）/ `right` / `off`（隐藏）
-//! - `pill_alpha`         胶囊（含分离模块条）整体透明度 0.2 ~ 1.0，默认 1.0
+//! - `pill_alpha`         胶囊（含分离模块条）整体透明度 0.2 ~ 1.0，默认 1.0。
+//!                         拉到 100% 时底色**强制实底**（半透明主题也变不透明），
+//!                         见 `config::pill_bg_effective`
 //! - `pill_scale`         胶囊（含模块条 / 音乐条）整体大小 0.8 ~ 1.35，默认 1.0
 //! - `icon_scale`         Dock 图标（连同 Dock 高度与托盘图标）大小 0.8 ~ 1.35，默认 1.0
+//! - `theme`              外观主题 key（`calm_light` / `calm_dark` / `glass2_light` /
+//!                         `glass2_dark` / `m3_light` / `m3_dark`）；三套风格各带深浅色。
+//!                         老版本的 `glass`/`liquid`/`mica`/`paper`/`neon`/`terminal`
+//!                         会被 `legacy_theme_key` 就近映射到新 key
 //! - `pill_anchor`        胶囊位置/形状：`float`（悬浮顶部，默认）/ `island`（吸顶刘海，
 //!                          顶部两角方形）/ `bottom`（吸底，底部两角方形）
 //! - `dock_anchor`        底部 Dock 位置：`bottom`（默认）/ `top` / `left` / `right`
@@ -1025,6 +1031,21 @@ fn migrate_date_style(s: &str) -> &'static str {
     }
 }
 
+/// 老版本（三套风格之前）的 6 个主题 key → 新三套风格里最接近的变体。
+///
+/// 旧 key 已经不在 `theme::ALL` 里，反查会失败；不映射的话用户升级后主题会
+/// 悄悄跳回默认，这里给它一个"就近"的落点，至少深浅色不反。
+fn legacy_theme_key(old: &str) -> Option<&'static str> {
+    match old.trim().to_lowercase().as_str() {
+        "glass" | "liquid" => Some("glass2_dark"),
+        "mica" => Some("glass2_light"),
+        "paper" => Some("calm_light"),
+        "neon" => Some("m3_dark"),
+        "terminal" => Some("calm_dark"),
+        _ => None,
+    }
+}
+
 /// 老版三件套 → 一条格式串（clock_order/time_format/date_format → clock_format）
 fn migrate_clock(order: &str, time: &str, date: &str) -> String {
     let t = migrate_time_style(time);
@@ -1078,6 +1099,9 @@ pill_alpha=1.0
 # 胶囊整体大小 / Dock 图标大小（1.0 为基准，0.8 ~ 1.35；设置页里有滑条和「重置」）
 pill_scale=1
 icon_scale=1
+# 外观主题（每套都有深色 + 浅色）：calm_light/calm_dark（平静极简）/
+# glass2_light/glass2_dark（玻璃拟态 2.0）/ m3_light/m3_dark（Material 3）
+theme=calm_light
 # 胶囊位置形状：float（悬浮顶部，默认）/ island（吸顶刘海）/ bottom（吸底）
 pill_anchor=float
 # Dock 靠屏幕哪条边：bottom（默认）/ top / left / right
@@ -1131,8 +1155,8 @@ fn append_missing() {
         ("pill_scale", "# 胶囊 / Dock 图标大小（1.0 为基准，0.8 ~ 1.35）\npill_scale=1\nicon_scale=1\n"),
         (
             "theme",
-            "# 外观主题：glass（深色玻璃）/ liquid（液态玻璃）/ mica（云母浅色）\n\
-             # paper（纸质极简）/ neon（霓虹赛博）/ terminal（硬边终端）\ntheme=glass\n",
+            "# 外观主题：calm_light/calm_dark（平静极简）/ glass2_light/glass2_dark（玻璃 2.0）\n\
+             # m3_light/m3_dark（Material 3）；设置页里点色块切换\ntheme=calm_light\n",
         ),
         ("pill_anchor", "# 胶囊位置形状：float / island（吸顶刘海）/ bottom（吸底）\npill_anchor=float\n"),
         ("dock_anchor", "# Dock 靠屏幕哪条边：bottom / top / left / right\ndock_anchor=bottom\n"),
@@ -1241,6 +1265,9 @@ fn load() {
             "theme" => {
                 if crate::theme::index_of(v).is_some() {
                     tkey = v.to_string();
+                } else if let Some(new) = legacy_theme_key(v) {
+                    // 老版本的 6 套风格已删除：就近映射到新三套里最像的一个变体
+                    tkey = new.to_string();
                 }
             }
             "pill_anchor" => {
@@ -1474,6 +1501,26 @@ mod tests {
         assert_eq!(migrate_place("pill"), Some((ModuleMode::Pill, 0)));
         assert_eq!(migrate_place("right3"), Some((ModuleMode::BarRight, 3)));
         assert_eq!(migrate_place("左下"), None);
+    }
+
+    #[test]
+    fn legacy_theme_keys_map_to_new_styles() {
+        // 老的 6 套风格已删除：深浅色不能反，且映射结果必须是现在真实存在的 key
+        for (old, want_dark) in [
+            ("glass", true),
+            ("liquid", true),
+            ("mica", false),
+            ("paper", false),
+            ("neon", true),
+            ("terminal", true),
+        ] {
+            let new = legacy_theme_key(old).unwrap_or_else(|| panic!("{old} 没映射"));
+            let i = crate::theme::index_of(new).unwrap_or_else(|| panic!("{new} 不存在"));
+            assert_eq!(crate::theme::ALL[i].dark, want_dark, "{old} → {new} 深浅反了");
+        }
+        // 不认识的值不算老 key（交给默认主题）
+        assert_eq!(legacy_theme_key("calm_light"), None);
+        assert_eq!(legacy_theme_key("随便写的"), None);
     }
 
     #[test]
