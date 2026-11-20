@@ -261,6 +261,9 @@ pub const TRAY_USE_EXE_ICON: bool = true;
 pub const TRAY_ICON_MAX_DIFF: f32 = 0.34;
 /// 闪烁采样周期（毫秒）：应用用"图标一闪一闪"提示新消息时，Dock 按同样节奏跟随
 pub const TRAY_FLASH_MS: u32 = 70;
+/// 托盘表"瞬时为空"的宽限期（毫秒）：应用重注册图标时 `NOTIFYICONDATA` 表会空一瞬，
+/// 这期间沿用上一批托盘槽位，别让 Dock 的尺寸跟着塌下去再长回来
+pub const TRAY_EMPTY_HOLD_MS: u128 = 1500;
 /// 把"鼠标停在 Dock 的托盘图标上"转发成真实图标的悬停：向图标的宿主窗口投它注册时的
 /// 回调消息（wParam/lParam 按 uVersion 0/3/4 编码，坐标用图标矩形中心），**不移动光标**。
 /// 回调消息号系统没有 API 可查，靠 `traymsg` 从目标进程内存里挖 `NOTIFYICONDATAW`，

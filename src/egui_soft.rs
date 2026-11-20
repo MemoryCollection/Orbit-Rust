@@ -299,16 +299,40 @@ impl SoftBackend {
     ///
     /// 每个视图在画之前都会先调它，所以这里顺带推进度量通道的"帧"，
     /// 让 Galley 缓存按帧回收。
+    ///
+    /// 注意：**不能**用 `ctx.set_pixels_per_point` 下发！Dock / 弹窗 / 提示条共用
+    /// 一个 Context 且各自的 ppp 不同（Dock 带 icon_k 因子，弹窗/提示条不带），
+    /// 每次切换都会触发 egui 的 `new_zoom_factor` 路径——下一帧 egui 会无视传入的
+    /// `screen_rect`，改用"上一帧 content_rect × 缩放比"，把别的视图的矩形套到
+    /// 当前帧上（Dock 底部被弹窗高度裁掉 = 用户看到的"托盘消失"）。
+    /// 正确做法是 `input()` 里按帧带 `native_pixels_per_point`，egui 自己算 ppp。
     pub fn set_scale(&mut self, scale: f32) {
         let scale = scale.max(0.5);
         self.scale = scale;
-        if (self.last_scale - scale).abs() > f32::EPSILON {
-            self.ctx.set_pixels_per_point(scale);
-            self.last_scale = scale;
-        }
+        self.last_scale = scale;
         if let Some(m) = self.measure.get_mut().as_mut() {
             m.begin_frame(scale);
         }
+    }
+
+    /// 构建一帧的 RawInput：screen_rect（逻辑点）+ 本帧的 native_pixels_per_point。
+    ///
+    /// ppp 走 `viewports[ROOT].native_pixels_per_point`（`pixels_per_point =
+    /// zoom_factor × native`），zoom_factor 恒为 1.0，egui 就永远不会走
+    /// "zoom 变更 → 沿用上一帧矩形"的覆盖路径，多视图共用 Context 也安全。
+    pub fn input(&self, fw: f32, fh: f32) -> egui::RawInput {
+        let mut ri = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(fw, fh),
+            )),
+            ..Default::default()
+        };
+        ri.viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .native_pixels_per_point = Some(self.scale);
+        ri
     }
 
     /// 量一段文字的尺寸（**逻辑点**）。在 `run_ui` 之前调用也安全。

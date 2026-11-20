@@ -443,14 +443,9 @@ impl DockView {
         }
 
         let ctx = self.soft.ctx().clone();
+        let input = self.soft.input(fw, fh);
         let out = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(fw, fh),
-                )),
-                ..Default::default()
-            },
+            input,
             |ui| {
                 let p = ui.painter().clone();
                 p.rect_filled(
@@ -535,14 +530,9 @@ impl DockView {
 
         let mut rows_pt: Vec<[f32; 4]> = Vec::with_capacity(labels.len());
         let ctx = self.soft.ctx().clone();
+        let input = self.soft.input(fw, fh);
         let out = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(fw, fh),
-                )),
-                ..Default::default()
-            },
+            input,
             |ui| {
                 let p = ui.painter().clone();
                 let board = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));

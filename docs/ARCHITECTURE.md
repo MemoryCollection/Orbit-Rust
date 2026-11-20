@@ -249,6 +249,21 @@ main.rs → app.rs（启动/消息循环）
     `dockview` 用同一个 `active_bar()` 画（托盘程序在最前时，用户也能看见它在 Dock 上）。
     注意 `hide_dock_duplicates()` 会把"有托盘图标的那份 Dock 应用项"藏掉，所以这类程序
     平时只剩托盘图标这一个入口，指示条必须画在托盘槽位上。
+23. **弹窗打开后"托盘消失"（已修）**：点折叠多开图标弹出 `ORBIT_WINLIST` 的瞬间，
+    Dock 下半截（托盘区）会变成透明、点击穿透到桌面——用户看到的就是"托盘没了"。
+    根因不在托盘表，而是 **egui Context 共享 + ppp 翻转**：Dock 与弹窗/提示条共用同一个
+    `SoftBackend`（即同一个 `egui::Context`），但两者 ppp 不同（Dock = `scale·icon_k()`≈0.95，
+    弹窗 = `scale`=1.0）。旧实现用 `ctx.set_pixels_per_point` 切换 ppp，egui 0.37 会把它记成
+    `new_zoom_factor`，下一帧 `begin_pass` **无视传入的 `screen_rect`**，改用
+    "上一帧 content_rect × 缩放比"——于是 Dock 的 pass 拿到弹窗的矩形（190×102）当裁剪，
+    底板只画到 102 行，下面全透明；反过来弹窗 pass 也拿过 Dock 的矩形。分层窗口 alpha=0
+    的像素会被系统命中测试穿透（`WindowFromPoint` 直达桌面 `SysListView32`），视觉上
+    Dock 被截断、点托盘没反应。修复（`egui_soft.rs`）：**不再调 `set_pixels_per_point`**，
+    改为每帧通过 `RawInput.viewports[ROOT].native_pixels_per_point` 携带各自的 ppp
+    （`pixels_per_point = zoom_factor × native`，zoom_factor 恒 1.0），egui 按 pass 计算、
+    互不串台。排查手法：分层窗口命中穿透探针（`WindowFromPoint` 轮询 Dock 三个采样点）+
+    坏帧落盘（渲染完扫描底部 1/4 平均 alpha）+ 双端 pass 裁剪矩形日志，三路证据对齐后
+    锁定 egui 的 zoom-override 路径。
 
 ### 托盘完整托管（trayhost.rs）—— 核心架构
 

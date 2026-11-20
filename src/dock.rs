@@ -181,6 +181,9 @@ pub struct Dock {
     seen_settings: u64,
     /// 上次绘制用的图标缩放（变了要把应用图标 / 托盘像素按新尺寸重抓）
     icon_scale: f32,
+    /// 托盘表"变成空"的起始时刻：应用重注册图标时 `NOTIFYICONDATA` 表会短暂为空，
+    /// 这时要是直接按 0 个托盘图标算尺寸，Dock 会瞬间塌掉半截再长回来
+    tray_empty_since: Option<Instant>,
 
     // ---- 同程序多开的窗口选择弹窗 ----
     /// 弹窗窗口句柄（ORBIT_WINLIST，独立分层窗）
@@ -488,6 +491,7 @@ impl Dock {
             last_lclick: None,
             seen_settings: 0,
             icon_scale: 1.0,
+            tray_empty_since: None,
             winlist: HWND::default(),
             winlist_rows: Vec::new(),
             winlist_hover: None,
@@ -1015,10 +1019,11 @@ impl Dock {
         let n = self.tray.items.len();
         if !settings::show_tray() {
             self.tray_shown.clear();
+            self.tray_empty_since = None;
             return;
         }
         let hidden = settings::hidden_tray();
-        self.tray_shown = (0..n)
+        let next: Vec<usize> = (0..n)
             .filter(|&i| {
                 self.tray
                     .items
@@ -1026,6 +1031,21 @@ impl Dock {
                     .map_or(false, |it| !hidden.iter().any(|k| *k == it.key()))
             })
             .collect();
+        // 托盘表在应用"删了又加"（重注册图标、微信提示闪一下）的那一瞬间会是空的。
+        // 直接把它当成"托盘真的没图标了"会让 Dock 少掉整块托盘区——用户看到的就是
+        // 胶囊被截断半截、1 秒后又长回来。宽限期内先沿用上一批槽位，真空了自然会收起。
+        if next.is_empty() && !self.tray_shown.is_empty() {
+            let since = *self.tray_empty_since.get_or_insert_with(Instant::now);
+            if since.elapsed().as_millis() < cfg::TRAY_EMPTY_HOLD_MS {
+                crate::vlog!(
+                    "[dock] 托盘表瞬时为空，沿用上一批 {} 个图标（不缩尺寸）",
+                    self.tray_shown.len()
+                );
+                return;
+            }
+        }
+        self.tray_empty_since = None;
+        self.tray_shown = next;
     }
 
     /// 同一个进程的图标同时出现在托盘和 Dock 应用位时：隐藏"任务栏图标"，
