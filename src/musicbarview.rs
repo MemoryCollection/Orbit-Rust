@@ -71,7 +71,7 @@ pub fn paint(
             p.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
                 egui::CornerRadius::same((fh / 2.0).min(255.0) as u8),
-                argb(cfg::BG_ARGB),
+                argb(cfg::cur().pill_bg),
             );
 
             let (cx0, cy0, d) = cover_box(fh);
@@ -96,7 +96,7 @@ pub fn paint(
                 p.circle_filled(center, d / 2.0, argb(0x26_FF_FF_FF));
                 let icon = cfg::MUSIC_PLACEHOLDER;
                 let fid = egui::FontId::proportional(cfg::LYRIC_ICON_SIZE * 1.7);
-                p.text(center, egui::Align2::CENTER_CENTER, icon, fid, argb(cfg::ACCENT_ARGB));
+                p.text(center, egui::Align2::CENTER_CENTER, icon, fid, argb(cfg::cur().accent));
             }
             // 封面细白描边
             p.circle_stroke(
@@ -119,12 +119,12 @@ pub fn paint(
                 p.rect_filled(
                     egui::Rect::from_min_size(egui::pos2(center.x - gapw / 2.0 - bw, y), egui::vec2(bw, bh)),
                     r,
-                    argb(cfg::TIME_ARGB),
+                    argb(cfg::cur().text),
                 );
                 p.rect_filled(
                     egui::Rect::from_min_size(egui::pos2(center.x + gapw / 2.0, y), egui::vec2(bw, bh)),
                     r,
-                    argb(cfg::TIME_ARGB),
+                    argb(cfg::cur().text),
                 );
             } else {
                 // 播放：三角形
@@ -136,7 +136,7 @@ pub fn paint(
                     egui::pos2(base_x, center.y + half_h),
                     egui::pos2(tip_x, center.y),
                 ];
-                p.add(egui::Shape::convex_polygon(pts, argb(cfg::TIME_ARGB), egui::Stroke::NONE));
+                p.add(egui::Shape::convex_polygon(pts, argb(cfg::cur().text), egui::Stroke::NONE));
             }
 
             // 歌词（控制在前、歌词在后）
@@ -146,7 +146,7 @@ pub fn paint(
                 egui::Align2::LEFT_CENTER,
                 text,
                 egui::FontId::proportional(font),
-                argb(cfg::TEXT_ARGB),
+                argb(cfg::cur().text_body),
             );
         },
     );

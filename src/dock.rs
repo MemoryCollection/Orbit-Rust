@@ -210,7 +210,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 pt.x -= wr.left;
                 pt.y -= wr.top;
                 let (dw, dh) = dock.size;
-                if inside_round(pt.x as f32, pt.y as f32, dw as f32, dh as f32, cfg::DOCK_RADIUS * dock.scale) {
+                if inside_round(pt.x as f32, pt.y as f32, dw as f32, dh as f32, cfg::cur().dock_radius * dock.scale) {
                     LRESULT(HTCLIENT as isize)
                 } else {
                     LRESULT(HTTRANSPARENT as isize)

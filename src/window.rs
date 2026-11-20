@@ -496,9 +496,9 @@ impl App {
         if cfg::SHOW_MAIL && (!self.mail.items.is_empty() || self.mail.error.is_some()) {
             // 平时只有图标；识别到验证码显示验证码；有未读但没有验证码就提示有新邮件
             let (text, argb) = match self.mail.badge() {
-                Badge::Code(code) => (code, cfg::SUN_ARGB),
-                Badge::Unread => ("新邮件".to_string(), cfg::ACCENT_ARGB),
-                Badge::None => (String::new(), cfg::TEXT_DIM_ARGB),
+                Badge::Code(code) => (code, cfg::cur().sun),
+                Badge::Unread => ("新邮件".to_string(), cfg::cur().accent),
+                Badge::None => (String::new(), cfg::cur().icon_dim),
             };
             all.push((WidgetKind::Mail, WidgetItem { icon: "✉".to_string(), icon_argb: argb, text }));
         }
@@ -508,7 +508,7 @@ impl App {
                 WidgetKind::Clipboard,
                 WidgetItem {
                     icon: "▤".to_string(),
-                    icon_argb: cfg::TEXT_DIM_ARGB,
+                    icon_argb: cfg::cur().icon_dim,
                     text: String::new(),
                 },
             ));
@@ -925,11 +925,11 @@ impl App {
                                 format!("{} / {}", d.day_weather, d.night_weather)
                             };
                             let (note, note_argb) = if !d.day_power.is_empty() {
-                                (format!("{}{}级", d.day_wind, d.day_power), cfg::TEXT_DIM_ARGB)
+                                (format!("{}{}级", d.day_wind, d.day_power), cfg::cur().icon_dim)
                             } else if d.rain > 0 {
-                                (format!("{}%", d.rain), cfg::ACCENT_ARGB)
+                                (format!("{}%", d.rain), cfg::cur().accent)
                             } else {
-                                (String::new(), cfg::TEXT_DIM_ARGB)
+                                (String::new(), cfg::cur().icon_dim)
                             };
                             render::WeatherDay {
                                 label: d.label.clone(),
@@ -955,7 +955,7 @@ impl App {
                         title: clipboard::preview(&c.text, 40),
                         sub: String::new(),
                         value: c.at.clone(),
-                        value_argb: cfg::DATE_ARGB,
+                        value_argb: cfg::cur().text_dim,
                         pin: Some(c.pinned),
                     });
                 }
@@ -984,11 +984,11 @@ impl App {
                     rows.push(PanelRow {
                         // 未读用强调色，已读压暗；点开即已读
                         icon: "✉".into(),
-                        icon_argb: if m.read { cfg::TEXT_DIM_ARGB } else { cfg::ACCENT_ARGB },
+                        icon_argb: if m.read { cfg::cur().icon_dim } else { cfg::cur().accent },
                         title: if m.subject.is_empty() { "(无主题)".into() } else { m.subject.clone() },
                         sub: m.from.clone(),
                         value: m.code.clone().unwrap_or_default(),
-                        value_argb: cfg::SUN_ARGB,
+                        value_argb: cfg::cur().sun,
                         pin: None,
                     });
                 }
@@ -1013,14 +1013,14 @@ fn weather_color(code: u8, day: bool) -> u32 {
     match code {
         0 | 1 => {
             if day {
-                cfg::SUN_ARGB
+                cfg::cur().sun
             } else {
-                cfg::MOON_ARGB
+                cfg::cur().moon
             }
         }
-        2 | 3 | 45 | 48 => cfg::CLOUD_ARGB,
-        51..=67 | 80..=99 => cfg::RAIN_ARGB,
-        _ => cfg::TEXT_DIM_ARGB,
+        2 | 3 | 45 | 48 => cfg::cur().cloud,
+        51..=67 | 80..=99 => cfg::cur().rain,
+        _ => cfg::cur().icon_dim,
     }
 }
 

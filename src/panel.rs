@@ -248,7 +248,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                 pt.x -= wr.left;
                 pt.y -= wr.top;
                 let (pw, ph) = p.size;
-                if inside_round(pt.x as f32, pt.y as f32, pw as f32, ph as f32, crate::config::PANEL_RADIUS * p.scale) {
+                if inside_round(pt.x as f32, pt.y as f32, pw as f32, ph as f32, crate::config::cur().panel_radius * p.scale) {
                     LRESULT(HTCLIENT as isize)
                 } else {
                     LRESULT(HTTRANSPARENT as isize)

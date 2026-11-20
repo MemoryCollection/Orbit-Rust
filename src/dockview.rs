@@ -8,7 +8,7 @@
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, SoftBackend};
+use crate::egui_soft::{argb, glow_edges, SoftBackend};
 
 /// Dock 一帧的绘制输出（与原 render::DockRender 同语义，rgba 改为预乘域）。
 pub struct DockPainted {
@@ -141,25 +141,29 @@ impl DockView {
                 let p = ui.painter().clone();
                 // ---- 底板：胶囊圆角 + 1px 内描边 + 顶面反光 ----
                 let board = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
-                let radius = cfg::DOCK_RADIUS.min(cross * 0.5);
+                let radius = cfg::cur().dock_radius.min(cross * 0.5);
                 let cr = egui::CornerRadius::same(radius.round() as u8);
-                p.rect_filled(board, cr, argb(cfg::BG_ARGB));
+                p.rect_filled(board, cr, argb(cfg::cur().pill_bg));
                 p.rect_stroke(
                     board.shrink(0.5),
                     cr,
-                    egui::Stroke::new(1.0, argb(cfg::DOCK_EDGE_ARGB)),
+                    egui::Stroke::new(1.0, argb(cfg::cur().dock_edge)),
                     egui::StrokeKind::Inside,
                 );
+                // 霓虹主题：再沿边缘叠一圈内发光
+                if cfg::cur().glow {
+                    glow_edges(&p, board, cr, cfg::cur().dock_edge);
+                }
                 // 迎光面的细反光：水平条画在上缘，竖排条画在左缘；两端内缩掉圆角，
                 // 免得直角的亮线从圆角里探出去
                 if vertical {
                     let a = egui::pos2(1.0, radius);
                     let b = egui::pos2(1.0, fh - radius);
-                    grad_quad(&p, a, b, 1.0, argb(cfg::DOCK_GLOW_ARGB), argb(cfg::DOCK_GLOW_ARGB));
+                    grad_quad(&p, a, b, 1.0, argb(cfg::cur().dock_glow), argb(cfg::cur().dock_glow));
                 } else {
                     let a = egui::pos2(radius, 1.0);
                     let b = egui::pos2(fw - radius, 1.0);
-                    grad_quad(&p, a, b, 1.0, argb(cfg::DOCK_GLOW_ARGB), argb(cfg::DOCK_GLOW_ARGB));
+                    grad_quad(&p, a, b, 1.0, argb(cfg::cur().dock_glow), argb(cfg::cur().dock_glow));
                 }
 
                 // 沿主轴排布；首端留细长条等长占位
@@ -174,11 +178,23 @@ impl DockView {
                         // 只剩一圈弧线看不出是"底"
                         let c = rect.center();
                         let rr = slot * 0.5 + 3.0;
-                        p.circle_filled(c, rr, argb(cfg::DOCK_HOVER_ARGB));
+                        p.circle_filled(c, rr, argb(cfg::cur().dock_hover));
                         p.circle_stroke(
                             c,
                             rr - 0.5,
-                            egui::Stroke::new(1.0, argb(cfg::DOCK_HOVER_EDGE_ARGB)),
+                            egui::Stroke::new(1.0, argb(cfg::cur().dock_hover_edge)),
+                        );
+                    }
+                    // 浅色主题下彩色图标直接压在浅底上会发脏，先垫一层圆角白底
+                    if !buf.is_empty() && cfg::cur().icon_backing != 0 {
+                        let br = egui::Rect::from_center_size(
+                            rect.center(),
+                            egui::vec2(isz + 2.0, isz + 2.0),
+                        );
+                        p.rect_filled(
+                            br,
+                            egui::CornerRadius::same((isz * 0.22) as u8),
+                            argb(cfg::cur().icon_backing),
                         );
                     }
                     if !buf.is_empty() {
@@ -215,7 +231,7 @@ impl DockView {
                     }
                     let dc = (cross - cfg::DIVIDER_H) / 2.0;
                     // 两端淡出的细分隔线（纯 1px 实线在深底上太硬）
-                    let line = argb(cfg::DIVIDER_ARGB);
+                    let line = argb(cfg::cur().divider);
                     if vertical {
                         let y = pos + 0.5;
                         fade_line(
@@ -239,11 +255,22 @@ impl DockView {
                         tray_rects_pt.push([rx, ry, tslot, tslot]);
                         if Some(i) == hovered_tray {
                             let center = egui::pos2(rx + tslot / 2.0, ry + tslot / 2.0);
-                            p.circle_filled(center, tslot / 2.0, argb(cfg::DOCK_HOVER_ARGB));
+                            p.circle_filled(center, tslot / 2.0, argb(cfg::cur().dock_hover));
                             p.circle_stroke(
                                 center,
                                 tslot / 2.0 - 0.5,
-                                egui::Stroke::new(1.0, argb(cfg::DOCK_HOVER_EDGE_ARGB)),
+                                egui::Stroke::new(1.0, argb(cfg::cur().dock_hover_edge)),
+                            );
+                        }
+                        if !buf.is_empty() && cfg::cur().icon_backing != 0 {
+                            let bc = egui::pos2(rx + tslot / 2.0, ry + tslot / 2.0);
+                            p.rect_filled(
+                                egui::Rect::from_center_size(
+                                    bc,
+                                    egui::vec2(tisz + 2.0, tisz + 2.0),
+                                ),
+                                egui::CornerRadius::same((tisz * 0.26) as u8),
+                                argb(cfg::cur().icon_backing),
                             );
                         }
                         if !buf.is_empty() {
@@ -283,9 +310,9 @@ impl DockView {
                         (bx, (cross - bhei) / 2.0)
                     };
                     let color = if hovered_desktop {
-                        cfg::DOCK_DESKTOP_HOVER_ARGB
+                        cfg::cur().dock_desktop_hover
                     } else {
-                        cfg::DOCK_DESKTOP_ARGB
+                        cfg::cur().dock_desktop
                     };
                     let bar = egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(bwid, bhei));
                     let r_bar = (bw / 2.0).max(1.0);
@@ -375,15 +402,15 @@ impl DockView {
                 let p = ui.painter().clone();
                 p.rect_filled(
                     egui::Rect::from_min_size(egui::pos2(0.5, 0.5), egui::vec2(fw - 1.0, fh - 1.0)),
-                    egui::CornerRadius::same(cfg::TIP_RADIUS as u8),
-                    argb(cfg::TIP_BG_ARGB),
+                    egui::CornerRadius::same(cfg::cur().tip_radius as u8),
+                    argb(cfg::cur().tip_bg),
                 );
                 p.text(
                     egui::pos2(pad_x, pad_y),
                     egui::Align2::LEFT_TOP,
                     &s,
                     font.clone(),
-                    argb(cfg::TIP_TEXT_ARGB),
+                    argb(cfg::cur().tip_text),
                 );
             },
         );

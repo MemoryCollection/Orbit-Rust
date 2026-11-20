@@ -95,13 +95,13 @@ pub fn paint_list(
             // 底板 + 描边
             p.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
-                egui::CornerRadius::same(cfg::PANEL_RADIUS as u8),
-                argb(cfg::PANEL_BG_ARGB),
+                egui::CornerRadius::same(cfg::cur().panel_radius as u8),
+                argb(cfg::cur().panel_bg),
             );
             p.rect_stroke(
                 egui::Rect::from_min_size(egui::pos2(0.5, 0.5), egui::vec2(fw - 1.0, fh - 1.0)),
-                egui::CornerRadius::same(cfg::PANEL_RADIUS as u8),
-                egui::Stroke::new(1.0, argb(cfg::PANEL_BORDER_ARGB)), egui::StrokeKind::Inside,
+                egui::CornerRadius::same(cfg::cur().panel_radius as u8),
+                egui::Stroke::new(1.0, argb(cfg::cur().panel_border)), egui::StrokeKind::Inside,
             );
 
             // 标题
@@ -110,10 +110,10 @@ pub fn paint_list(
             } else {
                 head_h / 2.0 - th(s, title, cfg::PANEL_TITLE_SIZE) + 2.0
             };
-            txt(&p, pad, title_y, title, cfg::PANEL_TITLE_SIZE, cfg::TIME_ARGB);
+            txt(&p, pad, title_y, title, cfg::PANEL_TITLE_SIZE, cfg::cur().text);
             if !subtitle.is_empty() {
                 let sh = th(s, subtitle, cfg::PANEL_SUB_SIZE);
-                txt(&p, pad, head_h - sh - 4.0, subtitle, cfg::PANEL_SUB_SIZE, cfg::DATE_ARGB);
+                txt(&p, pad, head_h - sh - 4.0, subtitle, cfg::PANEL_SUB_SIZE, cfg::cur().text_dim);
             }
 
             // 右上标签页
@@ -132,14 +132,14 @@ pub fn paint_list(
                     let active = k == tab_active;
                     if active {
                         p.rect_filled(egui::Rect::from_min_size(egui::pos2(x, ty), egui::vec2(twid, tab_h)),
-                            egui::CornerRadius::same(7), argb(cfg::HOVER_ARGB));
+                            egui::CornerRadius::same(7), argb(cfg::cur().hover));
                     } else if hovered == Some(TAB_BASE + k as u32) {
                         p.rect_filled(egui::Rect::from_min_size(egui::pos2(x, ty), egui::vec2(twid, tab_h)),
                             egui::CornerRadius::same(7), argb(0x14FF_FFFF));
                     }
                     let lx = x + (twid - label_w) / 2.0;
                     let ly = ty + (tab_h - th(s, label, cfg::PANEL_SUB_SIZE)) / 2.0;
-                    let c = if active { cfg::TIME_ARGB } else { cfg::DATE_ARGB };
+                    let c = if active { cfg::cur().text } else { cfg::cur().text_dim };
                     txt(&p, lx, ly, label, cfg::PANEL_SUB_SIZE, c);
                     hits.push((rect, TAB_BASE + k as u32));
                     x += twid + 4.0;
@@ -150,7 +150,7 @@ pub fn paint_list(
             let row_h = cfg::PANEL_ROW_H;
             if rows.is_empty() {
                 let eh = th(s, empty, cfg::PANEL_ROW_SUB);
-                txt(&p, pad, head_h + (row_h - eh) / 2.0, empty, cfg::PANEL_ROW_SUB, cfg::DATE_ARGB);
+                txt(&p, pad, head_h + (row_h - eh) / 2.0, empty, cfg::PANEL_ROW_SUB, cfg::cur().text_dim);
             }
             for (i, row) in rows.iter().enumerate() {
                 let y = head_h + i as f32 * row_h;
@@ -159,7 +159,7 @@ pub fn paint_list(
                 if hovered == Some(id) {
                     p.rect_filled(
                         egui::Rect::from_min_size(egui::pos2(pad * 0.5, y + 1.0), egui::vec2(fw - pad, row_h - 2.0)),
-                        egui::CornerRadius::same(8), argb(cfg::HOVER_ARGB));
+                        egui::CornerRadius::same(8), argb(cfg::cur().hover));
                 }
 
                 let mut x = pad;
@@ -175,12 +175,12 @@ pub fn paint_list(
                 if row.sub.is_empty() {
                     let tt = ellipsize(s, &row.title, room, cfg::PANEL_ROW_TITLE);
                     let tth = th(s, &tt, cfg::PANEL_ROW_TITLE);
-                    txt(&p, x, y + (row_h - tth) / 2.0, &tt, cfg::PANEL_ROW_TITLE, cfg::TEXT_ARGB);
+                    txt(&p, x, y + (row_h - tth) / 2.0, &tt, cfg::PANEL_ROW_TITLE, cfg::cur().text_body);
                 } else {
                     let tt = ellipsize(s, &row.title, room, cfg::PANEL_ROW_TITLE);
-                    txt(&p, x, y + 8.0, &tt, cfg::PANEL_ROW_TITLE, cfg::TEXT_ARGB);
+                    txt(&p, x, y + 8.0, &tt, cfg::PANEL_ROW_TITLE, cfg::cur().text_body);
                     let ss = ellipsize(s, &row.sub, room, cfg::PANEL_ROW_SUB);
-                    txt(&p, x, y + 26.0, &ss, cfg::PANEL_ROW_SUB, cfg::DATE_ARGB);
+                    txt(&p, x, y + 26.0, &ss, cfg::PANEL_ROW_SUB, cfg::cur().text_dim);
                 }
                 if vw > 0.0 {
                     let rh = th(s, &row.value, cfg::PANEL_VALUE_SIZE);
@@ -188,7 +188,7 @@ pub fn paint_list(
                         &row.value, cfg::PANEL_VALUE_SIZE, row.value_argb);
                 }
                 if let Some(pinned) = row.pin {
-                    let (star, color) = if pinned { ("★", cfg::PINNED_ARGB) } else { ("☆", cfg::TEXT_DIM_ARGB) };
+                    let (star, color) = if pinned { ("★", cfg::cur().pin) } else { ("☆", cfg::cur().icon_dim) };
                     let sw = tw(s, star, 13.0);
                     let sh = th(s, star, 13.0);
                     let sx = fw - pad - pin_w + (pin_w - sw) / 2.0;
@@ -240,16 +240,16 @@ pub fn paint_weather(
             // 底板 + 描边
             p.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
-                egui::CornerRadius::same(cfg::PANEL_RADIUS as u8), argb(cfg::PANEL_BG_ARGB));
+                egui::CornerRadius::same(cfg::cur().panel_radius as u8), argb(cfg::cur().panel_bg));
             p.rect_stroke(
                 egui::Rect::from_min_size(egui::pos2(0.5, 0.5), egui::vec2(fw - 1.0, fh - 1.0)),
-                egui::CornerRadius::same(cfg::PANEL_RADIUS as u8),
-                egui::Stroke::new(1.0, argb(cfg::PANEL_BORDER_ARGB)), egui::StrokeKind::Inside);
+                egui::CornerRadius::same(cfg::cur().panel_radius as u8),
+                egui::Stroke::new(1.0, argb(cfg::cur().panel_border)), egui::StrokeKind::Inside);
 
             // 标题：当地 + 天气（强调色）
             let t1w = tw(s, "当地", 15.0 * k);
-            txt(&p, pad, 9.0 * k, "当地", 15.0 * k, cfg::TIME_ARGB);
-            txt(&p, pad + t1w, 9.0 * k, "天气", 15.0 * k, cfg::ACCENT_ARGB);
+            txt(&p, pad, 9.0 * k, "当地", 15.0 * k, cfg::cur().text);
+            txt(&p, pad + t1w, 9.0 * k, "天气", 15.0 * k, cfg::cur().accent);
 
             // 右上刷新
             let refresh_w = 28.0 * k;
@@ -258,23 +258,23 @@ pub fn paint_weather(
                 p.rect_filled(
                     egui::Rect::from_min_size(egui::pos2(refresh_rect[0] - 6.0, refresh_rect[1]),
                         egui::vec2(refresh_rect[2] + 12.0, refresh_rect[3])),
-                    egui::CornerRadius::same(6), argb(cfg::HOVER_ARGB));
+                    egui::CornerRadius::same(6), argb(cfg::cur().hover));
             }
             let rw = tw(s, "刷新", cfg::WEATHER_DETAIL_SIZE * k);
             let rh = th(s, "刷新", cfg::WEATHER_DETAIL_SIZE * k);
             txt(&p, refresh_rect[0] + (refresh_w - rw) / 2.0,
                 refresh_rect[1] + (refresh_rect[3] - rh) / 2.0,
-                "刷新", cfg::WEATHER_DETAIL_SIZE * k, cfg::DATE_ARGB);
+                "刷新", cfg::WEATHER_DETAIL_SIZE * k, cfg::cur().text_dim);
 
             // 时间 + 日期（右对齐到刷新左侧）
             let twid = tw(s, &v.time, 14.0 * k);
             let thh = th(s, &v.time, 14.0 * k);
             let tx = refresh_rect[0] - 14.0 * k - twid;
-            txt(&p, tx, 9.0 * k, &v.time, 14.0 * k, cfg::TIME_ARGB);
+            txt(&p, tx, 9.0 * k, &v.time, 14.0 * k, cfg::cur().text);
             let dw = tw(s, &v.date, cfg::WEATHER_DETAIL_SIZE * k);
             let dh = th(s, &v.date, cfg::WEATHER_DETAIL_SIZE * k);
             txt(&p, tx - 8.0 * k - dw, 9.0 * k + (thh - dh) / 2.0,
-                &v.date, cfg::WEATHER_DETAIL_SIZE * k, cfg::DATE_ARGB);
+                &v.date, cfg::WEATHER_DETAIL_SIZE * k, cfg::cur().text_dim);
 
             // ---- 左：实况 ----
             let top = 34.0 * k;
@@ -296,26 +296,26 @@ pub fn paint_weather(
 
             // ① 图标 + 大号温度
             txt(&p, pad + (icon_box - iw) / 2.0, top, &v.icon, cfg::WEATHER_ICON_SIZE * k, v.icon_argb);
-            txt(&p, pad + icon_box + 10.0 * k, top + 2.0 * k, &v.temp, cfg::WEATHER_TEMP_SIZE * k, cfg::TIME_ARGB);
+            txt(&p, pad + icon_box + 10.0 * k, top + 2.0 * k, &v.temp, cfg::WEATHER_TEMP_SIZE * k, cfg::cur().text);
             // ② 天气 · 城市
             let sub_y = top + LEFT_SUB_DY * k;
-            txt(&p, pad, sub_y, &v.condition, cfg::WEATHER_COND_SIZE * k, cfg::TIME_ARGB);
+            txt(&p, pad, sub_y, &v.condition, cfg::WEATHER_COND_SIZE * k, cfg::cur().text);
             txt(&p, pad + cond_w + 8.0 * k, sub_y + (cond_h - city_h),
-                &v.city, cfg::WEATHER_CITY_SIZE * k, cfg::DATE_ARGB);
+                &v.city, cfg::WEATHER_CITY_SIZE * k, cfg::cur().text_dim);
             // ③ 详情 + 来源
             let mut y = top + LEFT_DET_DY * k;
             for line in v.details.iter().take(2) {
                 let t = ellipsize(s, line, left_w, cfg::WEATHER_DETAIL_SIZE * k);
-                txt(&p, pad, y, &t, cfg::WEATHER_DETAIL_SIZE * k, cfg::DATE_ARGB);
+                txt(&p, pad, y, &t, cfg::WEATHER_DETAIL_SIZE * k, cfg::cur().text_dim);
                 y += LEFT_DET_STEP * k;
             }
-            txt(&p, pad, y + LEFT_REP_GAP * k, &v.report, 10.0 * k, cfg::TEXT_DIM_ARGB);
+            txt(&p, pad, y + LEFT_REP_GAP * k, &v.report, 10.0 * k, cfg::cur().icon_dim);
 
             // 竖分隔线
             let divx = pad + left_w + 10.0 * k;
             p.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(divx, top), egui::vec2(1.0, 140.0 * k)),
-                0.0_f32, argb(cfg::DIVIDER_ARGB));
+                0.0_f32, argb(cfg::cur().divider));
 
             // ---- 右：四天 ----
             let days_y = 44.0 * k;
@@ -325,20 +325,20 @@ pub fn paint_weather(
                 let cw = (fw - start - pad) / cols;
                 for (i, d) in v.days.iter().take(4).enumerate() {
                     let center = start + i as f32 * cw + cw / 2.0;
-                    let argb_day = if i == 0 { cfg::TIME_ARGB } else { cfg::DATE_ARGB };
+                    let argb_day = if i == 0 { cfg::cur().text } else { cfg::cur().text_dim };
 
                     let lw = tw(s, &d.label, cfg::WEATHER_DAY_LABEL * k);
                     txt(&p, center - lw / 2.0, days_y + 1.0 * k, &d.label, cfg::WEATHER_DAY_LABEL * k, argb_day);
                     let icw = tw(s, &d.icon, cfg::WEATHER_DAY_ICON * k);
                     txt(&p, center - icw / 2.0, days_y + 21.0 * k, &d.icon, cfg::WEATHER_DAY_ICON * k, d.icon_argb);
                     let hw = tw(s, &d.high, cfg::WEATHER_DAY_HIGH * k);
-                    txt(&p, center - hw / 2.0, days_y + 46.0 * k, &d.high, cfg::WEATHER_DAY_HIGH * k, cfg::TIME_ARGB);
+                    txt(&p, center - hw / 2.0, days_y + 46.0 * k, &d.high, cfg::WEATHER_DAY_HIGH * k, cfg::cur().text);
                     let lw2 = tw(s, &d.low, cfg::WEATHER_DAY_LOW * k);
-                    txt(&p, center - lw2 / 2.0, days_y + 66.0 * k, &d.low, cfg::WEATHER_DAY_LOW * k, cfg::DATE_ARGB);
+                    txt(&p, center - lw2 / 2.0, days_y + 66.0 * k, &d.low, cfg::WEATHER_DAY_LOW * k, cfg::cur().text_dim);
                     if !d.text.is_empty() {
                         let t = ellipsize(s, &d.text, cw - 2.0, cfg::WEATHER_DAY_TEXT * k);
                         let tww = tw(s, &t, cfg::WEATHER_DAY_TEXT * k);
-                        txt(&p, center - tww / 2.0, days_y + 86.0 * k, &t, cfg::WEATHER_DAY_TEXT * k, cfg::TEXT_ARGB);
+                        txt(&p, center - tww / 2.0, days_y + 86.0 * k, &t, cfg::WEATHER_DAY_TEXT * k, cfg::cur().text_body);
                     }
                     if !d.note.is_empty() {
                         let t = ellipsize(s, &d.note, cw - 2.0, cfg::WEATHER_DAY_WIND * k);

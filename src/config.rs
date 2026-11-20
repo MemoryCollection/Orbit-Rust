@@ -1,5 +1,10 @@
 //! 全局样式与行为常量：所有尺寸/颜色/透明度集中在这里调。
 //! 数值为 96 DPI 基准，物理像素 = 值 × scale。
+//!
+//! **尺寸**（字号 / 间距 / 高度）是编译期常量；**颜色与圆角**已抽到 `crate::theme`，
+//! 取法是 `cfg::cur().pill_bg` 这样——换一套主题不用改这里，设置页切换即可。
+
+pub use crate::theme::cur;
 
 /// 胶囊高度
 pub const PILL_H: f32 = 44.0;
@@ -16,16 +21,7 @@ pub const DIVIDER_H: f32 = 22.0;
 /// 胶囊距屏幕顶部距离
 pub const TOP_MARGIN: i32 = 6;
 
-/// 胶囊背景（近黑，205/255 不透明）
-pub const BG_ARGB: u32 = 0xCD_1C_1C_1A;
-/// 时间文字（纯白）
-pub const TIME_ARGB: u32 = 0xFF_FF_FF_FF;
-/// 日期文字（75% 白）
-pub const DATE_ARGB: u32 = 0xBF_FF_FF_FF;
-/// 分隔线（22% 白）
-pub const DIVIDER_ARGB: u32 = 0x38_FF_FF_FF;
-/// 悬停背景（20% 白）
-pub const HOVER_ARGB: u32 = 0x33_FF_FF_FF;
+// 颜色统一走 `cfg::cur().*`（见 theme.rs）：pill_bg / text / text_dim / divider / hover …
 
 /// 托盘图标区总开关（托盘区在底部 Dock 右侧，不在顶部胶囊里）
 pub const SHOW_TRAY: bool = true;
@@ -87,18 +83,6 @@ pub const FLASH_ICON: f32 = 22.0;
 /// 闪烁判定窗口：最后一次"灭帧"后多久内还算"正在闪烁"（毫秒）。
 /// 微信亮/灭各约 250ms，留 2.5s 宽限，闪烁一停图标就从胶囊里收走。
 pub const FLASH_WINDOW_MS: u64 = 2500;
-/// widget 文本（90% 白）
-pub const TEXT_ARGB: u32 = 0xE6_FF_FF_FF;
-/// widget 图标（70% 白）
-pub const TEXT_DIM_ARGB: u32 = 0xB3_FF_FF_FF;
-/// 天气图标：白天晴天（暖金）
-pub const SUN_ARGB: u32 = 0xFF_FF_C4_54;
-/// 天气图标：夜间（淡蓝白）
-pub const MOON_ARGB: u32 = 0xFF_BC_D4_FF;
-/// 天气图标：雨雪雷（冷蓝）
-pub const RAIN_ARGB: u32 = 0xFF_86_B8_F0;
-/// 天气图标：阴/多云（浅灰）
-pub const CLOUD_ARGB: u32 = 0xFF_C9_CF_D6;
 /// 天气目标城市（留空 = 按出口 IP 自动定位）
 pub const WEATHER_CITY: &str = "";
 /// 高德 Web 服务 key（留空则只用 Open-Meteo）。免费额度 5000 次/月，
@@ -126,12 +110,6 @@ pub const MAIL_FETCH: usize = 6;
 
 // ---------- 展开面板 ----------
 
-/// 面板背景（不透明：面板压在窗口上，半透明会被背景文字透出来）
-pub const PANEL_BG_ARGB: u32 = 0xFF_1E_1E_1C;
-/// 面板描边
-pub const PANEL_BORDER_ARGB: u32 = 0x33_FF_FF_FF;
-/// 圆角半径
-pub const PANEL_RADIUS: f32 = 14.0;
 /// 内边距
 pub const PANEL_PAD: f32 = 16.0;
 /// 标题区高度（含副标题）
@@ -154,8 +132,6 @@ pub const PANEL_VALUE_SIZE: f32 = 13.0;
 pub const PANEL_ICON_GAP: f32 = 8.0;
 /// 标题与右侧数值的间距
 pub const PANEL_VALUE_GAP: f32 = 14.0;
-/// 强调色（"天气"二字、降水概率）
-pub const ACCENT_ARGB: u32 = 0xFF_5A_A9_FF;
 
 // ---------- 天气面板（宽卡片，左当前 / 右四天）----------
 
@@ -197,16 +173,9 @@ pub const DOCK_SLOT: f32 = 46.0;
 pub const DOCK_GAP: f32 = 6.0;
 /// 左右内边距（比图标间隙略大，图标才不显得顶到边；也要盖过胶囊端部的圆弧）
 pub const DOCK_PAD_X: f32 = 12.0;
-/// 圆角半径：等于一半高度 → 完全胶囊形（高度变小时按 `min(DOCK_RADIUS, 高/2)` 收）
-pub const DOCK_RADIUS: f32 = 28.0;
-/// 底板内描边（1px 亮边，让深色底板从壁纸上"站起来"）
-pub const DOCK_EDGE_ARGB: u32 = 0x24_FF_FF_FF;
-/// 底板顶部高光渐层（很淡，玻璃质感；与内描边叠出层次）
-pub const DOCK_GLOW_ARGB: u32 = 0x16_FF_FF_FF;
-/// 图标 / 托盘图标悬停圆底
-pub const DOCK_HOVER_ARGB: u32 = 0x44_FF_FF_FF;
-/// 悬停圆底的描边（比填充亮一点，边缘才不糊）
-pub const DOCK_HOVER_EDGE_ARGB: u32 = 0x3A_FF_FF_FF;
+/// 圆角半径：等于一半高度 → 完全胶囊形（高度变小时按 `min(dock_radius, 高/2)` 收）
+///
+/// 实际值随主题变（`cfg::cur().dock_radius`），这里只保留名字方便检索。
 /// 悬停时图标放大量（逻辑点）：配合圆底让图标"浮"起来
 pub const DOCK_HOVER_GROW: f32 = 2.0;
 /// 距屏幕底部距离
@@ -234,9 +203,6 @@ pub const DOCK_DESKTOP_W: f32 = 7.0;
 pub const DOCK_DESKTOP_GAP: f32 = 9.0;
 /// 细长条高度（占 Dock 高度的比例）
 pub const DOCK_DESKTOP_H: f32 = 0.62;
-/// 细长条常态 / 悬停颜色
-pub const DOCK_DESKTOP_ARGB: u32 = 0x4D_FF_FF_FF;
-pub const DOCK_DESKTOP_HOVER_ARGB: u32 = 0xD9_FF_FF_FF;
 
 // ---------- 托盘镜像 ----------
 
@@ -271,16 +237,10 @@ pub const TIP_TEXT_SIZE: f32 = 12.5;
 pub const TIP_PAD_X: f32 = 10.0;
 /// 提示条上下内边距
 pub const TIP_PAD_Y: f32 = 5.0;
-/// 提示条圆角
-pub const TIP_RADIUS: f32 = 8.0;
 /// 提示条与 Dock 的间距
 pub const TIP_GAP: i32 = 6;
 /// 提示条最大宽度（超出按省略号截断）
 pub const TIP_MAX_W: f32 = 260.0;
-/// 提示条背景（比 Dock 更实一点，压在桌面/窗口上也读得清）
-pub const TIP_BG_ARGB: u32 = 0xF2_1C_1C_1A;
-/// 提示条文字
-pub const TIP_TEXT_ARGB: u32 = 0xFF_FF_FF_FF;
 
 // ---------- 音乐条（旋转封面 + 歌词）----------
 
@@ -311,5 +271,3 @@ pub const MUSIC_PLACEHOLDER: &str = "♪";
 
 /// 固定（置顶）标记的宽度：点这里切换固定状态
 pub const PIN_W: f32 = 26.0;
-/// 固定的条目在列表中用强调色星标
-pub const PINNED_ARGB: u32 = 0xFF_FF_D5_4F;

@@ -445,6 +445,36 @@ pub fn argb(v: u32) -> egui::Color32 {
     )
 }
 
+/// 给颜色的 RGB 换一个 alpha（仍是 0xAARRGGBB）
+pub fn with_alpha(c: u32, a: f32) -> u32 {
+    let a = (a.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (a << 24) | (c & 0x00FF_FFFF)
+}
+
+/// 沿边缘的**内发光**：由外向内画几圈 alpha 递减的描边，模拟霓虹灯管的光晕。
+///
+/// 为什么向内：分层窗口的尺寸恰好等于形状尺寸，向外画会被窗口边裁掉；
+/// 向内画反而更像"灯管边缘在发光"。圆角逐层收一点，免得内圈弧线错位。
+pub fn glow_edges(p: &egui::Painter, rect: egui::Rect, cr: egui::CornerRadius, color: u32) {
+    for k in 0..3 {
+        let kf = k as f32;
+        let d = 1.0 + kf * 1.7;
+        let shrink = (kf * 1.7).round() as u8;
+        let c = egui::CornerRadius {
+            nw: cr.nw.saturating_sub(shrink),
+            ne: cr.ne.saturating_sub(shrink),
+            sw: cr.sw.saturating_sub(shrink),
+            se: cr.se.saturating_sub(shrink),
+        };
+        p.rect_stroke(
+            rect.shrink(d),
+            c,
+            egui::Stroke::new(1.4, argb(with_alpha(color, 0.28 - kf * 0.09))),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 /// 分隔线（竖 1px，垂直居中）。
 pub fn divider(p: &egui::Painter, x: f32, fh: f32) {
     p.rect_filled(
@@ -453,7 +483,7 @@ pub fn divider(p: &egui::Painter, x: f32, fh: f32) {
             egui::vec2(1.0, cfg::DIVIDER_H),
         ),
         0,
-        argb(cfg::DIVIDER_ARGB),
+        argb(cfg::cur().divider),
     );
 }
 

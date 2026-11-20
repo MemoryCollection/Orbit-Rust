@@ -32,6 +32,7 @@ mod settings;
 mod settingsui;
 mod store;
 mod widgetbarview;
+mod theme;
 mod trace;
 mod tray;
 mod weather;

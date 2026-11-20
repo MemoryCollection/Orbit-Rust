@@ -91,7 +91,7 @@ pub fn paint(
             p.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
                 egui::CornerRadius::same((fh / 2.0).min(255.0) as u8),
-                argb(cfg::BG_ARGB),
+                argb(cfg::cur().pill_bg),
             );
 
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -107,7 +107,7 @@ pub fn paint(
                     );
                     rects_pt.push([rect.left(), rect.top(), rect.width(), rect.height()]);
                     if Some(i) == hovered {
-                        p.rect_filled(rect, 8.0_f32, argb(cfg::HOVER_ARGB));
+                        p.rect_filled(rect, 8.0_f32, argb(cfg::cur().hover));
                     }
                     let mut cx = rect.left() + padx;
                     if !item.icon.is_empty() {
@@ -129,7 +129,7 @@ pub fn paint(
                             egui::Align2::LEFT_CENTER,
                             &item.text,
                             txt_font.clone(),
-                            argb(cfg::TEXT_ARGB),
+                            argb(cfg::cur().text_body),
                         );
                     }
                 }

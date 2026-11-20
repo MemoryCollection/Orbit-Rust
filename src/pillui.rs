@@ -202,11 +202,19 @@ impl PillUi {
                         PillShape::Island => (0.0, 0.0, r, r),
                         PillShape::Bottom => (r, r, 0.0, 0.0),
                     };
-                    p.rect_filled(
-                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
-                        egui::CornerRadius { nw: nw as u8, ne: ne as u8, sw: sw as u8, se: se as u8 },
-                        argb(cfg::BG_ARGB),
-                    );
+                    let bg_rect =
+                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
+                    let bg_cr = egui::CornerRadius {
+                        nw: nw as u8,
+                        ne: ne as u8,
+                        sw: sw as u8,
+                        se: se as u8,
+                    };
+                    p.rect_filled(bg_rect, bg_cr, argb(cfg::cur().pill_bg));
+                    // 霓虹主题：沿边缘叠一圈内发光
+                    if cfg::cur().glow {
+                        crate::egui_soft::glow_edges(&p, bg_rect, bg_cr, cfg::cur().dock_edge);
+                    }
 
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(cfg::PAD_X);
@@ -216,7 +224,7 @@ impl PillUi {
                             egui::Align2::LEFT_CENTER,
                             v.clock,
                             time_font.clone(),
-                            argb(cfg::TIME_ARGB),
+                            argb(cfg::cur().text),
                         );
                         ui.add_space(cw);
 
@@ -235,7 +243,7 @@ impl PillUi {
                                 rects_pts.push([rect.left(), rect.top(), rect.width(), rect.height()]);
                                 if resp.hovered() {
                                     hov_w = Some(i);
-                                    p.rect_filled(rect, 8.0_f32, argb(cfg::HOVER_ARGB));
+                                    p.rect_filled(rect, 8.0_f32, argb(cfg::cur().hover));
                                 }
                                 if resp.contains_pointer()
                                     && ui.input(|inp| inp.pointer.primary_pressed())
@@ -262,7 +270,7 @@ impl PillUi {
                                         egui::Align2::LEFT_CENTER,
                                         &item.text,
                                         txt_font.clone(),
-                                        argb(cfg::TEXT_ARGB),
+                                        argb(cfg::cur().text_body),
                                     );
                                 }
                             }
@@ -283,7 +291,7 @@ impl PillUi {
                                 rects_pts.push([rect.left(), rect.top(), rect.width(), rect.height()]);
                                 if resp.hovered() {
                                     hov_f = Some(i);
-                                    p.rect_filled(rect, 8.0_f32, argb(cfg::HOVER_ARGB));
+                                    p.rect_filled(rect, 8.0_f32, argb(cfg::cur().hover));
                                 }
                                 if resp.contains_pointer()
                                     && ui.input(|inp| inp.pointer.primary_pressed())

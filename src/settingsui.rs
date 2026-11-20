@@ -151,6 +151,13 @@ fn argb(argb: u32) -> egui::Color32 {
     )
 }
 
+/// 把颜色整体调亮/调暗：`k > 1` 提亮、`k < 1` 压暗（alpha 不变）。
+/// 用来从面板底色派生输入框底、非交互控件底这些"同一色系的邻近色"。
+fn shade(c: u32, k: f32) -> u32 {
+    let ch = |v: u32| ((v as f32 * k).round().clamp(0.0, 255.0)) as u32;
+    (c & 0xFF00_0000) | (ch((c >> 16) & 0xFF) << 16) | (ch((c >> 8) & 0xFF) << 8) | ch(c & 0xFF)
+}
+
 /// 系统 DPI 缩放（物理像素 / 逻辑点）：定位时要用它换算
 fn ppp(ctx: &egui::Context) -> f32 {
     ctx.input(|i| i.viewport().native_pixels_per_point)
@@ -175,22 +182,36 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// 深色主题，颜色对齐 Orbit 的胶囊/面板配色
+/// 按当前主题配色重建设置页的原生控件样式。
+///
+/// 深色主题用 egui 的 Dark 视觉打底，浅色主题（云母 / 纸质）用 Light 打底——
+/// 只覆盖与 Orbit 自己的胶囊/面板对齐的那几个颜色，其余交给 egui 默认值，
+/// 免得浅色下某些控件（滚动条、输入框底）还是黑的。
 fn apply_style(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-    ctx.style_mut_of(egui::Theme::Dark, |st| {
+    let t = cfg::cur();
+    let th = if t.dark { egui::Theme::Dark } else { egui::Theme::Light };
+    let panel = argb(t.panel_bg);
+    let text_body = argb(t.text_body);
+    let accent = argb(t.accent);
+    let hover = argb(t.hover);
+    let border = argb(t.panel_border);
+    ctx.set_theme(th);
+    ctx.style_mut_of(th, |st| {
         let v = &mut st.visuals;
-        v.panel_fill = argb(cfg::PANEL_BG_ARGB);
-        v.window_fill = argb(cfg::PANEL_BG_ARGB);
-        v.extreme_bg_color = egui::Color32::from_rgb(0x14, 0x14, 0x12);
-        v.override_text_color = Some(argb(cfg::TEXT_ARGB));
-        v.selection.bg_fill = argb(cfg::ACCENT_ARGB);
+        v.panel_fill = panel;
+        v.window_fill = panel;
+        v.override_text_color = Some(text_body);
+        v.selection.bg_fill = accent;
         v.selection.stroke = egui::Stroke::NONE;
-        v.widgets.hovered.bg_fill = argb(cfg::HOVER_ARGB);
-        v.widgets.active.bg_fill = argb(cfg::HOVER_ARGB);
-        v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(0x24, 0x24, 0x22);
+        v.widgets.hovered.bg_fill = hover;
+        v.widgets.active.bg_fill = hover;
         v.window_corner_radius = egui::CornerRadius::same(WIN_RADIUS as u8);
-        v.window_stroke = egui::Stroke::new(1.0, argb(cfg::PANEL_BORDER_ARGB));
+        v.window_stroke = egui::Stroke::new(1.0, border);
+        if t.dark {
+            // 深色下输入框/轨道要比面板再暗一档才有凹陷感；浅色交给 egui 默认
+            v.extreme_bg_color = argb(shade(t.panel_bg, 0.86));
+            v.widgets.noninteractive.bg_fill = argb(shade(t.panel_bg, 1.14));
+        }
     });
 }
 
@@ -250,6 +271,8 @@ const MAIL_PRESETS: [(&str, &str, u16); 4] = [
 struct SettingsApp {
     /// 上次见过的设置版本号（值被别处改了要刷新编辑框/开关）
     seen_version: u64,
+    /// 上次套用样式的版本号（主题变了要重刷 egui 原生控件配色）
+    seen_style_version: u64,
     /// 编辑框的本地缓冲（失焦且版本变化时才从 settings 重读，打字时不被写盘值顶掉）
     edits: Edits,
     /// 模块芯片拖动状态
@@ -312,11 +335,16 @@ impl eframe::App for SettingsApp {
         if self.seen_version == 0 {
             self.load_edits();
         }
+        // 主题（或任何设置）变了就重刷原生控件样式；只在变化时做，避免每帧 clone Style
+        if ver_changed || self.seen_style_version == 0 {
+            apply_style(&ctx);
+            self.seen_style_version = ver;
+        }
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
-                    .fill(argb(cfg::PANEL_BG_ARGB))
+                    .fill(argb(cfg::cur().panel_bg))
                     .inner_margin(14.0),
             )
             .show(ui, |ui| {
@@ -424,8 +452,59 @@ impl SettingsApp {
                 ui.label(
                     egui::RichText::new(clock::sample(&self.edits.clock))
                         .size(13.0)
-                        .color(argb(cfg::ACCENT_ARGB)),
+                        .color(argb(cfg::cur().accent)),
                 );
+                ui.end_row();
+
+                // 外观主题：一排小色块，直接用主题自己的底色画，所见即所得
+                ui.label(row_label("外观"));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    for (i, t) in crate::theme::ALL.iter().enumerate() {
+                        let sel = i == settings::theme_index();
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(36.0, 26.0), egui::Sense::click());
+                        let p = ui.painter();
+                        // 先垫一块"模拟壁纸"：胶囊底都是半透明的，直接画在设置页背景上
+                        // 会看不出差别（液态玻璃和深色玻璃会变成同一个灰），垫层中性色才真实
+                        p.rect_filled(
+                            rect,
+                            egui::CornerRadius::same(7),
+                            egui::Color32::from_rgb(0x6E, 0x7C, 0x8A),
+                        );
+                        p.rect_filled(rect, egui::CornerRadius::same(7), argb(t.pill_bg));
+                        // 画一条代表主文字的短横线：能直观看出该主题的对比度
+                        let bar = egui::Rect::from_center_size(
+                            rect.center() - egui::vec2(4.0, 0.0),
+                            egui::vec2(13.0, 2.0),
+                        );
+                        p.rect_filled(bar, 1.0, argb(t.text));
+                        p.rect_stroke(
+                            rect,
+                            egui::CornerRadius::same(7),
+                            egui::Stroke::new(1.0, argb(t.dock_edge.max(0x22_00_00_00))),
+                            egui::StrokeKind::Inside,
+                        );
+                        if sel {
+                            p.rect_stroke(
+                                rect.expand(1.5),
+                                egui::CornerRadius::same(9),
+                                egui::Stroke::new(1.5, argb(t.accent)),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                        if resp.clicked() {
+                            settings::set_theme_index(i);
+                        }
+                        resp.on_hover_text(t.name);
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(cfg::cur().name)
+                            .size(12.5)
+                            .color(argb(cfg::cur().text_dim)),
+                    );
+                });
                 ui.end_row();
 
                 // 透明度：滑条（拖动时只做即时预览，松手才落盘）
@@ -916,17 +995,14 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
     let hovered = resp.hovered();
     let p = ui.painter();
     if hovered {
-        p.rect_filled(rect, 6.0_f32, argb(0x2E_FF_FF_FF));
+        p.rect_filled(rect, 6.0_f32, argb(cfg::cur().hover));
     }
     let c = rect.center();
     let s = 4.5;
+    // 常态用次级文字色、悬停升到主文字色：浅色主题下白线会消失在白底里
     let stroke = egui::Stroke::new(
         1.5,
-        if hovered {
-            egui::Color32::WHITE
-        } else {
-            argb(0xCC_FF_FF_FF)
-        },
+        argb(if hovered { cfg::cur().text } else { cfg::cur().text_dim }),
     );
     p.line_segment([c + egui::vec2(-s, -s), c + egui::vec2(s, s)], stroke);
     p.line_segment([c + egui::vec2(s, -s), c + egui::vec2(-s, s)], stroke);

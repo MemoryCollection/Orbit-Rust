@@ -235,6 +235,36 @@ pub fn persist_pill_alpha() {
     bump();
 }
 
+// ---------- 外观主题 ----------
+
+/// 当前主题（直接转给 `theme::cur()`，设置页下拉用它的下标）
+pub fn theme_index() -> usize {
+    crate::theme::index()
+}
+
+/// 切换主题：改内存索引 + 落盘 + 通知重绘。
+///
+/// 主题只影响绘制，不需要重建窗口；`version()` 变化后各窗口下一次 timer
+/// 轮询就会用新颜色重画一遍。
+pub fn set_theme_index(i: usize) {
+    if i == crate::theme::index() {
+        return;
+    }
+    crate::theme::set_index(i);
+    save();
+    bump();
+}
+
+/// 取窗口该用哪套 egui 视觉（深色主题用 Dark，浅色主题用 Light）。
+/// 用于设置页里的原生控件（滑条、按钮、输入框）跟主题对齐。
+pub fn egui_theme() -> eframe::egui::Theme {
+    if crate::theme::cur().dark {
+        eframe::egui::Theme::Dark
+    } else {
+        eframe::egui::Theme::Light
+    }
+}
+
 /// 胶囊锚位/形状
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PillAnchor {
@@ -736,6 +766,7 @@ fn save() {
         ("mail_mode", mode("mail")),
         ("clipboard_mode", mode("clipboard")),
         ("pill_alpha", trim_num(pill_alpha())),
+        ("theme", crate::theme::cur().key.to_string()),
         ("pill_anchor", pill_anchor().as_str().to_string()),
         ("dock_anchor", dock_anchor().as_str().to_string()),
         ("weather_source", weather_source().as_str().to_string()),
@@ -1006,6 +1037,11 @@ fn append_missing() {
         ("module_order", "# 顶部胶囊模块排列（拖动排序写回）\nmodule_order=weather,mail,clipboard\n"),
         ("weather_mode", "# 模块摆哪：pill / left / right / off\nweather_mode=left\nmail_mode=right\nclipboard_mode=right\n"),
         ("pill_alpha", "# 胶囊透明度（0.2 ~ 1.0）\npill_alpha=1.0\n"),
+        (
+            "theme",
+            "# 外观主题：glass（深色玻璃）/ liquid（液态玻璃）/ mica（云母浅色）\n\
+             # paper（纸质极简）/ neon（霓虹赛博）/ terminal（硬边终端）\ntheme=glass\n",
+        ),
         ("pill_anchor", "# 胶囊位置形状：float / island（吸顶刘海）/ bottom（吸底）\npill_anchor=float\n"),
         ("dock_anchor", "# Dock 靠屏幕哪条边：bottom / top / left / right\ndock_anchor=bottom\n"),
         ("weather_source", "# 天气数据源：amap / open_meteo\nweather_source=amap\namap_key=\n"),
@@ -1050,6 +1086,7 @@ fn load() {
     let mut wsound = true;
     let mut hide_tray: Vec<String> = Vec::new();
     let mut alpha = 1.0f32;
+    let mut tkey: String = crate::theme::cur().key.to_string();
     let mut panchor = PillAnchor::Float;
     let mut danchor = DockAnchor::Bottom;
     let mut wsource = WeatherSource::Amap;
@@ -1095,6 +1132,11 @@ fn load() {
             "pill_alpha" => {
                 if let Some(n) = parse_num(v) {
                     alpha = n.clamp(ALPHA_MIN, ALPHA_MAX);
+                }
+            }
+            "theme" => {
+                if crate::theme::index_of(v).is_some() {
+                    tkey = v.to_string();
                 }
             }
             "pill_anchor" => {
@@ -1212,6 +1254,10 @@ fn load() {
         *v = order;
     }
     PILL_ALPHA.store(alpha.to_bits(), Ordering::Relaxed);
+    // 主题：所有绘制都走 theme::cur()，存一次索引即可，不必逐个窗口通知
+    if let Some(i) = crate::theme::index_of(&tkey) {
+        crate::theme::set_index(i);
+    }
     PILL_ANCHOR.store(panchor.code(), Ordering::Relaxed);
     DOCK_ANCHOR.store(danchor.code(), Ordering::Relaxed);
     WEATHER_SOURCE.store(wsource.code(), Ordering::Relaxed);
