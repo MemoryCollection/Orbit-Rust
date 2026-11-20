@@ -5,10 +5,8 @@
 pub const PILL_H: f32 = 44.0;
 /// 左右内边距
 pub const PAD_X: f32 = 18.0;
-/// 时间字号（粗体）
+/// 时钟字号（粗体）：日期与时间**合并成一段**，整段共用这个字号
 pub const TIME_SIZE: f32 = 20.0;
-/// 日期字号（粗体）
-pub const DATE_SIZE: f32 = 12.0;
 /// 元素间距
 pub const GAP: f32 = 10.0;
 /// 图标悬停背景边长
@@ -34,20 +32,61 @@ pub const SHOW_TRAY: bool = true;
 
 // ---------- 胶囊 widget ----------
 
+/// widget 摆在哪：胶囊里（`Pill`），还是分离出去贴胶囊左边 / 右边（`Left` / `Right`）
+///
+/// 分离出去的和音乐条一样是独立小窗（`widgetbar.rs`）。同一侧再按 `slot` 分组：
+/// 同 (侧, slot) 的多个 widget 合成一条胶囊，slot 不同的各自一条（1 号最贴近胶囊）。
+/// 位置与分组可在 `data/settings.txt` 里用 `weather_pos` / `mail_pos` /
+/// `clipboard_pos` 逐个改（`pill` / `left` / `left2` / `left3` / `right` / `right2` / `right3`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WidgetPos {
+    Pill,
+    Left,
+    Right,
+}
+
 /// 天气 widget 开关
 pub const SHOW_WEATHER: bool = true;
+/// 天气 widget 默认位置（分离到胶囊左侧）
+pub const WEATHER_POS: WidgetPos = WidgetPos::Left;
+/// 天气默认分组
+pub const WEATHER_SLOT: u8 = 1;
 /// 音乐条（封面 + 歌词，胶囊旁那条）开关；原胶囊里的音乐 widget 已合并到音乐条
 pub const SHOW_MUSIC: bool = true;
 /// 剪贴板 widget 开关
 pub const SHOW_CLIPBOARD: bool = true;
-/// widget 符号图标字号（Segoe UI Symbol）
+/// 剪贴板 widget 默认位置（分离到胶囊右侧，单独一条）
+pub const CLIPBOARD_POS: WidgetPos = WidgetPos::Right;
+/// 剪贴板默认分组：2 → 与邮箱分两条胶囊，各占一格（默认「一个模块一条」）
+pub const CLIPBOARD_SLOT: u8 = 2;
+/// 邮箱默认分组
+pub const MAIL_SLOT: u8 = 1;
+/// 分离出来的模块条与胶囊之间的间距（多条之间也用这个间距）
+pub const WIDGET_BAR_GAP: i32 = 6;
+/// 每侧最多分几条（= `slot` 取值上限，也决定 widgetbar 预建的窗口数）
+pub const WIDGET_BAR_MAX_SLOT: u8 = 3;
+/// 模块条的左右内边距
+pub const WIDGET_BAR_PAD_X: f32 = 10.0;
+/// 模块条内相邻 widget 的间距（比胶囊里松一点，单独一条时更透得过气）
+pub const WIDGET_BAR_ITEM_GAP: f32 = 4.0;
+/// widget 符号图标字号（Segoe UI Symbol，只作为字形蒙版的渲染基准）
 pub const WIDGET_ICON_SIZE: f32 = 15.0;
+/// 图标格子边长：所有 widget 图标都占同样大的格子，间距才均匀
+pub const WIDGET_ICON_CELL: f32 = 16.0;
+/// 图标墨迹的目标视觉尺寸（按墨迹面积开方算的等效边长）：
+/// 同一字号下 ☁ 比 ✉/▤ 胖一圈，靠这个把它们的观感拉到一样大
+pub const WIDGET_GLYPH_INK: f32 = 12.5;
 /// widget 文本字号
 pub const WIDGET_TEXT_SIZE: f32 = 13.0;
 /// 符号与文本之间的间距
 pub const WIDGET_ICON_GAP: f32 = 4.0;
 /// widget 悬停背景的左右内边距
 pub const WIDGET_PAD_X: f32 = 5.0;
+/// 胶囊右侧的托盘闪烁图标显示边长（位图，非字形）
+pub const FLASH_ICON: f32 = 22.0;
+/// 闪烁判定窗口：最后一次"灭帧"后多久内还算"正在闪烁"（毫秒）。
+/// 微信亮/灭各约 250ms，留 2.5s 宽限，闪烁一停图标就从胶囊里收走。
+pub const FLASH_WINDOW_MS: u64 = 2500;
 /// widget 文本（90% 白）
 pub const TEXT_ARGB: u32 = 0xE6_FF_FF_FF;
 /// widget 图标（70% 白）
@@ -72,6 +111,8 @@ pub const WEATHER_INTERVAL: u64 = 1800;
 
 /// 邮箱 widget 开关
 pub const SHOW_MAIL: bool = true;
+/// 邮箱 widget 默认位置（分离到胶囊右侧）
+pub const MAIL_POS: WidgetPos = WidgetPos::Right;
 /// IMAP 服务器（QQ 邮箱）
 pub const MAIL_HOST: &str = "imap.qq.com";
 pub const MAIL_PORT: u16 = 993;
@@ -171,6 +212,21 @@ pub const DOCK_TRAY_SLOT: f32 = DOCK_SLOT;
 pub const DOCK_TRAY_GAP: f32 = DOCK_GAP;
 /// Dock 托盘区与左侧应用图标之间的间距（分隔线两侧各留这么多）
 pub const DOCK_TRAY_SEP: f32 = 8.0;
+
+// ---------- Dock：返回桌面按钮（右端细长条）----------
+
+/// 返回桌面按钮开关（右端那条细长竖条，点一下显示/还原桌面）
+pub const SHOW_DESKTOP_BTN: bool = true;
+/// 细长条宽度
+pub const DOCK_DESKTOP_W: f32 = 7.0;
+/// 细长条与图标区之间的间距。左侧按同样的宽度留一块空白占位，
+/// 图标组才仍然是屏幕居中（右侧多宽、左侧就空多宽）
+pub const DOCK_DESKTOP_GAP: f32 = 9.0;
+/// 细长条高度（占 Dock 高度的比例）
+pub const DOCK_DESKTOP_H: f32 = 0.62;
+/// 细长条常态 / 悬停颜色
+pub const DOCK_DESKTOP_ARGB: u32 = 0x4D_FF_FF_FF;
+pub const DOCK_DESKTOP_HOVER_ARGB: u32 = 0xD9_FF_FF_FF;
 
 // ---------- 托盘镜像 ----------
 

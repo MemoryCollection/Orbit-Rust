@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config as cfg;
-use crate::render::{self, FontKind};
+use crate::render;
 use crate::settings::LyricPos;
 
 /// 点了封面中心的按钮（播放/暂停）
@@ -31,6 +31,8 @@ pub const WM_NEXT: u32 = WM_APP + 0x22;
 
 thread_local! {
     static WIN: Cell<isize> = const { Cell::new(0) };
+    /// egui 软件后端（懒初始化）
+    static VIEW: RefCell<Option<crate::egui_soft::SoftBackend>> = const { RefCell::new(None) };
     /// 胶囊窗口（点击事件回传给它）
     static OWNER: Cell<isize> = const { Cell::new(0) };
     /// 上一次上屏的内容与几何：一样就不再重画（音乐条每 200ms / 每帧被问一次）
@@ -119,55 +121,70 @@ pub fn show(v: &View) {
     let (px, py, pw, ph) = v.pill;
     let gap = (cfg::LYRIC_GAP as f32 * v.scale) as i32;
 
-    // 该侧可用宽度：左右贴边时给胶囊让出位置，下方按整屏居中
+    // 该侧可用宽度：左右贴边时给胶囊让出位置，下方按整屏居中（物理像素）
     let avail = match v.pos {
         LyricPos::Left => px - gap - m.left - 6,
         LyricPos::Right => m.right - (px + pw + gap) - 6,
         LyricPos::Bottom => m.right - m.left - 12,
     } as f32;
-    let max_w = (cfg::LYRIC_MAX_W * v.scale).min(avail);
-    let fixed = render::music_bar_fixed_w(v.scale);
-    if max_w < fixed + 40.0 * v.scale {
+    let max_w_px = (cfg::LYRIC_MAX_W * v.scale).min(avail);
+
+    // 字体度量与布局都在逻辑点空间做（egui 内部按 pixels_per_point 缩放）
+    let fixed = crate::musicbarview::fixed_w();
+    let max_w_l = max_w_px / v.scale;
+    if max_w_l < fixed + 40.0 {
         hide();
         return;
     }
-
-    let text = render::ellipsize(v.text, max_w - fixed, v.font, FontKind::Cjk, v.scale);
-    let w = render::music_bar_w(&text, v.scale, v.font) as i32;
-    let hh = (cfg::PILL_H * v.scale).ceil() as i32;
-    let (x, y) = match v.pos {
-        LyricPos::Right => (px + pw + gap, py),
-        LyricPos::Left => (px - gap - w, py),
-        LyricPos::Bottom => (px + (pw - w) / 2, py + ph + gap),
-    };
-    let x = x.clamp(m.left + 6, (m.right - w - 6).max(m.left + 6));
-
-    let angle = ((v.angle % 360.0) + 360.0) % 360.0;
-    let shown = Shown {
-        text,
-        angle: angle.round() as i32,
-        playing: v.playing,
-        hovered: hovered(),
-        cover_id: v.cover_id,
-        rect: (x, y, w, hh),
-    };
-
-    // 命中区 = 封面的圆（与 draw_music_bar 用同一套几何）
-    let (bx, by, d) = render::cover_box(v.scale, hh);
-    HIT.with(|c| c.set((bx + d / 2.0, by + d / 2.0, d / 2.0)));
-
-    unsafe {
-        if !SHOWN.with(|s| s.borrow().as_ref() == Some(&shown)) {
-            let rgba = render::draw_music_bar(
-                w, hh, v.scale, &shown.text, v.font, v.cover, angle, v.playing, shown.hovered,
-            );
-            let bgra = render::to_premultiplied_bgra(&rgba);
-            render::present(h, &bgra, w, hh);
-            SHOWN.with(|s| *s.borrow_mut() = Some(shown));
+    VIEW.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(crate::egui_soft::SoftBackend::new());
         }
-        let _ = SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE);
-        let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
-    }
+        let soft = slot.as_mut().unwrap();
+        soft.set_scale(v.scale);
+        let text = crate::musicbarview::ellipsize(soft, v.text, max_w_l - fixed, v.font);
+        let w_l = fixed + crate::musicbarview::text_w(soft, &text, v.font);
+        let w = w_l.ceil() as i32;
+        let hh = (cfg::PILL_H * v.scale).ceil() as i32;
+        let (x, y) = match v.pos {
+            LyricPos::Right => (px + pw + gap, py),
+            LyricPos::Left => (px - gap - w, py),
+            LyricPos::Bottom => (px + (pw - w) / 2, py + ph + gap),
+        };
+        let x = x.clamp(m.left + 6, (m.right - w - 6).max(m.left + 6));
+
+        let angle = ((v.angle % 360.0) + 360.0) % 360.0;
+        let shown = Shown {
+            text,
+            angle: angle.round() as i32,
+            playing: v.playing,
+            hovered: hovered(),
+            cover_id: v.cover_id,
+            rect: (x, y, w, hh),
+        };
+
+        // 命中区 = 封面的圆（物理像素；与 musicbarview::cover_box 同几何）
+        let (bx, by, d) = crate::musicbarview::cover_box(cfg::PILL_H);
+        let bx = bx * v.scale;
+        let by = by * v.scale;
+        let d = d * v.scale;
+        HIT.with(|c| c.set((bx + d / 2.0, by + d / 2.0, d / 2.0)));
+
+        unsafe {
+            if !SHOWN.with(|s| s.borrow().as_ref() == Some(&shown)) {
+                let rgba = crate::musicbarview::paint(
+                    soft, w, hh, v.scale, &shown.text, v.font, v.cover, angle, v.playing, shown.hovered,
+                );
+                // egui 软件后端输出已是预乘 RGBA，直接换 BGRA 上屏
+                let bgra = render::premultiplied_rgba_to_bgra(&rgba);
+                render::present(h, &bgra, w, hh);
+                SHOWN.with(|s| *s.borrow_mut() = Some(shown));
+            }
+            let _ = SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE);
+            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+    });
 }
 
 pub fn hide() {

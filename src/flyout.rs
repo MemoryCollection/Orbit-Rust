@@ -15,7 +15,7 @@
 //! - 全程不动光标。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,10 +55,20 @@ const MAX_H: i32 = 900;
 /// 每个图标（hwnd）各自的 generation。双开时两个微信图标各走一条线程，互不取消。
 static GENERATIONS: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 每次悬停的全局序号（只用来给线程发身份牌，不做"最新的才准动"的裁决）。
+static WATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 弹窗窗口的归属：一个 hwnd 同一时刻只允许一条守位线程摆它。
+///
+/// 微信双开时两个图标的卡片都由 weixin.exe 的进程创建，按 exe 名匹配（`belongs`）
+/// 会让两条线程都枚举到**同一张**卡片；没有归属时它们各按自己的锚点 SetWindowPos，
+/// 卡片就在两个 x 之间乱跳（实测 20ms 内来回一次）。改成"先认领先得"：一条线程
+/// 认领一个 hwnd 后，别的线程枚举时直接跳过它，各自去摆自己那张。
+static CLAIMS: LazyLock<Mutex<HashMap<usize, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// 是否有任意一条守位线程在活动（用于 stop 时收尾，保留给将来）
 static _ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// 这条悬停线程是否仍是该图标的最新一次。
+/// 这条悬停线程是否仍是该图标的最新一次（同一图标重新悬停会取消旧线程）。
 fn is_current(icon_hwnd: usize, generation: usize) -> bool {
     GENERATIONS
         .lock()
@@ -67,11 +77,55 @@ fn is_current(icon_hwnd: usize, generation: usize) -> bool {
         .is_some_and(|&g| g == generation)
 }
 
+/// 这个窗口是不是已经归别的线程了（已销毁的顺手清掉归属）
+fn claimed_by_other(h: HWND, me: u64) -> bool {
+    let Ok(mut m) = CLAIMS.lock() else { return false };
+    let key = h.0 as usize;
+    match m.get(&key).copied() {
+        Some(owner) if owner != me => {
+            if unsafe { IsWindow(h) }.as_bool() {
+                true
+            } else {
+                m.remove(&key);
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// 认领 / 放掉一个弹窗
+fn claim(h: HWND, watch_id: u64) {
+    if let Ok(mut m) = CLAIMS.lock() {
+        m.insert(h.0 as usize, watch_id);
+    }
+}
+
+fn release(h: HWND) {
+    if let Ok(mut m) = CLAIMS.lock() {
+        m.remove(&(h.0 as usize));
+    }
+}
+
+/// 线程退出时把它认领过的窗口全部放掉，别把卡片锁死
+struct ClaimGuard(u64);
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = CLAIMS.lock() {
+            m.retain(|_, owner| *owner != self.0);
+        }
+    }
+}
+
 /// 用户开始悬停某个托盘图标了：按需要启动一个后台线程去盯它的悬停弹窗。
 ///
 /// `pid` 是图标宿主窗口所属进程，`icon_hwnd` 是图标自己的窗口句柄（用来分组 generation），
-/// `capsule` 是 Dock 的屏幕矩形（弹窗要摆到它上方）。
-pub fn watch(pid: u32, icon_hwnd: HWND, capsule: RECT, label: &str) {
+/// `capsule` 是宿主条（Dock 或胶囊）的屏幕矩形，`anchor_x` 是悬停的托盘图标中心的
+/// 屏幕 x（弹窗水平居中于它，而不是屏幕正中间；用图标中心而不是实时光标，鼠标在图标里
+/// 微动时卡片不会左右跟着滑）。`below` = 弹窗摆到条的**下方**（顶部胶囊用：
+/// 它贴着屏幕顶，卡片放上方会出屏）；false = 条上方（Dock 默认）。
+pub fn watch(pid: u32, icon_hwnd: HWND, capsule: RECT, anchor_x: i32, label: &str, below: bool) {
     if pid == 0 {
         return;
     }
@@ -106,13 +160,29 @@ pub fn watch(pid: u32, icon_hwnd: HWND, capsule: RECT, label: &str) {
         *e = e.wrapping_add(1);
         *e
     };
+    let watch_id = WATCH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let label = label.to_string();
-    crate::tlog!("[flyout] watch pid={pid} icon={:#x} stem={stem} gen={generation}", key);
+    crate::tlog!(
+        "[flyout] watch#{watch_id} pid={pid} icon={:#x} stem={stem} gen={generation} anchor_x={anchor_x} below={below}",
+        key
+    );
     _ACTIVE.store(true, Ordering::Relaxed);
-    std::thread::spawn(move || run(pid, key, stem, capsule, generation, label));
+    std::thread::spawn(move || run(pid, key, stem, capsule, anchor_x, watch_id, generation, label, below));
 }
 
-fn run(pid: u32, key: usize, stem: String, capsule: RECT, generation: usize, label: String) {
+fn run(
+    pid: u32,
+    key: usize,
+    stem: String,
+    capsule: RECT,
+    anchor_x: i32,
+    watch_id: u64,
+    generation: usize,
+    label: String,
+    below: bool,
+) {
+    // 本线程认领的弹窗：线程一退出就全部放掉
+    let _claims = ClaimGuard(watch_id);
     let mut names: HashMap<u32, String> = HashMap::new();
 
     // ---- 找弹窗 ----
@@ -123,8 +193,9 @@ fn run(pid: u32, key: usize, stem: String, capsule: RECT, generation: usize, lab
             return;
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
-        if let Some(h) = try_find(pid, &stem, capsule, &mut names) {
+        if let Some(h) = try_find(pid, &stem, capsule, anchor_x, watch_id, &mut names, below) {
             found = h;
+            claim(h, watch_id);
             break;
         }
     }
@@ -150,8 +221,10 @@ fn run(pid: u32, key: usize, stem: String, capsule: RECT, generation: usize, lab
                 if Instant::now() > rebuild_until {
                     return;
                 }
-                if let Some(h) = try_find(pid, &stem, capsule, &mut names) {
+                release(found);
+                if let Some(h) = try_find(pid, &stem, capsule, anchor_x, watch_id, &mut names, below) {
                     found = h;
+                    claim(h, watch_id);
                     rebuild_until = Instant::now() + Duration::from_millis(REBUILD_GRACE_MS);
                     nudges = 0;
                     crate::vlog!("[flyout] {label} 弹窗重建 → 新 hwnd={:#x}", found.0 as usize);
@@ -172,7 +245,7 @@ fn run(pid: u32, key: usize, stem: String, capsule: RECT, generation: usize, lab
             if w <= 0 || h <= 0 {
                 return;
             }
-            let (x, y) = target_point(w, h, capsule);
+            let (x, y) = target_point(w, h, capsule, anchor_x, below);
             if (cur.left - x).abs() <= DRIFT && (cur.top - y).abs() <= DRIFT {
                 if !reported && nudges > 0 {
                     crate::vlog!("[flyout] {label} 的悬停弹窗已移到 Dock 上方 ({x},{y}) {w}x{h}");
@@ -214,12 +287,18 @@ fn try_find(
     pid: u32,
     stem: &str,
     capsule: RECT,
+    anchor_x: i32,
+    watch_id: u64,
     names: &mut HashMap<u32, String>,
+    below: bool,
 ) -> Option<HWND> {
     struct Ctx<'a> {
         pid: u32,
         stem: &'a str,
         capsule: RECT,
+        anchor_x: i32,
+        watch_id: u64,
+        below: bool,
         best: HWND,
         best_area: i64,
         names: &'a mut HashMap<u32, String>,
@@ -259,6 +338,11 @@ fn try_find(
             let mut cls = [0u16; 256];
             let n = GetClassNameW(h, &mut cls);
             let cls = String::from_utf16_lossy(&cls[..n as usize]).to_lowercase();
+            // 右键/左键的弹出菜单（系统菜单类 #32768）是"点出来的"，本来就该在光标旁边，
+            // 不参与悬停预览的重定位
+            if cls == "#32768" {
+                return BOOL(1);
+            }
             let is_tool = ex & WS_EX_TOOLWINDOW.0 != 0 || cls.contains("tool");
             if !is_tool {
                 return BOOL(1);
@@ -267,7 +351,12 @@ fn try_find(
             // （Qt51514QWindowToolSaveBits）**会抢前台**，按 C# 原版的这条过滤会把它
             // 漏掉，于是"一个正常、一个弹到左上角"。真正用户打开的界面是主窗口，
             // 它带 WS_EX_APPWINDOW（上面已排除）或不是这种小 tool 窗，不受影响。
-            let (x, y) = target_point(w, hh, ctx.capsule);
+            // 归别的守位线程管的卡片别碰：双开时两张卡片同属 weixin 进程，
+            // 不认领的话两条线程会互相把对方那张摆到自己锚点去
+            if claimed_by_other(h, ctx.watch_id) {
+                return BOOL(1);
+            }
+            let (x, y) = target_point(w, hh, ctx.capsule, ctx.anchor_x, ctx.below);
             if (r.left - x).abs() <= DRIFT && (r.top - y).abs() <= DRIFT {
                 return BOOL(1); // 已经摆好了
             }
@@ -301,6 +390,9 @@ fn try_find(
         pid,
         stem,
         capsule,
+        anchor_x,
+        watch_id,
+        below,
         best: HWND::default(),
         best_area: i64::MAX,
         names,
@@ -315,16 +407,22 @@ fn try_find(
     }
 }
 
-/// 弹窗该摆在哪：水平居中于 Dock，下沿距 Dock 上沿 `GAP` 像素，并夹在工作区内。
-fn target_point(w: i32, h: i32, capsule: RECT) -> (i32, i32) {
-    let center_x = (capsule.left + capsule.right) / 2;
-    let mut x = center_x - w / 2;
-    let mut y = capsule.top - h - GAP;
+/// 弹窗该摆在哪：水平居中于悬停时的鼠标 x（`anchor_x`），`below` = 上沿贴条下沿 + GAP
+/// （顶部胶囊），否则下沿贴条上沿 - GAP（Dock 默认）。均夹在工作区内。
+fn target_point(w: i32, h: i32, capsule: RECT, anchor_x: i32, below: bool) -> (i32, i32) {
+    // 鼠标可能停得太靠边：先按 anchor 居中，超出工作区再夹回来
+    let anchor_x = anchor_x.clamp(capsule.left, capsule.right);
+    let mut x = anchor_x - w / 2;
+    let mut y = if below {
+        capsule.bottom + GAP
+    } else {
+        capsule.top - h - GAP
+    };
     unsafe {
         let mon = MonitorFromPoint(
             windows::Win32::Foundation::POINT {
-                x: center_x,
-                y: capsule.top,
+                x: anchor_x,
+                y: if below { capsule.bottom } else { capsule.top },
             },
             MONITOR_DEFAULTTONEAREST,
         );
@@ -342,6 +440,9 @@ fn target_point(w: i32, h: i32, capsule: RECT) -> (i32, i32) {
             }
             if y < work.top + GAP {
                 y = work.top + GAP;
+            }
+            if below && y + h > work.bottom - GAP {
+                y = work.bottom - GAP - h;
             }
         }
     }

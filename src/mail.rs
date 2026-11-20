@@ -253,6 +253,20 @@ fn creds() -> Option<(String, u16, String, String)> {
             _ => {}
         }
     }
+    // 设置页的邮箱账号覆盖 mail.txt 里的对应字段（留空 = 不覆盖）
+    let (o_host, o_port, o_user, o_pass) = crate::settings::mail_overrides();
+    if let Some(h) = o_host {
+        host = h;
+    }
+    if let Some(p) = o_port {
+        port = p;
+    }
+    if let Some(u) = o_user {
+        user = u;
+    }
+    if let Some(p) = o_pass {
+        pass = p;
+    }
     if host.is_empty() || user.is_empty() || pass.is_empty() {
         return None;
     }
@@ -500,6 +514,24 @@ fn hash64(a: &str, b: &str) -> u64 {
         h = h.wrapping_mul(0x1000_0000_01b3);
     }
     h
+}
+
+/// 测试账号连通性：建连（TCP+TLS）→ LOGIN，成功即 Ok（不 SELECT，省流量）。
+/// 设置页的「测试连通」按钮用；在调用方线程跑，别在 UI 线程直接调。
+pub fn test_account(account: &(String, u16, String, String)) -> Result<(), String> {
+    let (host, port, user, pass) = account;
+    let mut c = Conn::open(host, *port)?;
+    let greet = c.line()?;
+    if !String::from_utf8_lossy(&greet).starts_with("* OK") {
+        return Err(format!("服务器拒绝连接: {}", String::from_utf8_lossy(&greet)));
+    }
+    c.send(&format!("A1 LOGIN \"{}\" \"{}\"", escape(user), escape(pass)))?;
+    let (_, done) = c.until("A1")?;
+    if !done.starts_with("A1 OK") {
+        return Err(clean_status(&done));
+    }
+    let _ = c.send("A2 LOGOUT");
+    Ok(())
 }
 
 fn escape(s: &str) -> String {

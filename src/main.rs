@@ -5,8 +5,11 @@
 
 mod app;
 mod appicon;
+mod clock;
 mod config;
 mod dock;
+mod dockview;
+mod egui_soft;
 mod traymsg;
 mod trayhost;
 mod flyout;
@@ -18,14 +21,22 @@ mod mail;
 mod mailview;
 mod music;
 mod musicbar;
+mod musicbarview;
 mod net;
+mod notify;
 mod panel;
+mod panelview;
+mod pillui;
 mod render;
 mod settings;
+mod settingsui;
 mod store;
+mod widgetbarview;
 mod trace;
 mod tray;
 mod weather;
+mod widgetbar;
+
 mod window;
 
 fn main() {

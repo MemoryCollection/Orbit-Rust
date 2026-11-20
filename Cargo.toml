@@ -26,6 +26,7 @@ windows = { version = "0.58", features = [
     "Win32_System_SystemInformation",
     "Win32_System_DataExchange",
     "Win32_System_Ole",
+    "Win32_Media_Multimedia",
     "Win32_Networking_WinHttp",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Xps",
@@ -36,6 +37,11 @@ windows = { version = "0.58", features = [
 ] }
 
 native-tls = "0.2"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "clipboard"] }
+winit = { version = "0.30.13", default-features = false }
+
+[build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = "s"

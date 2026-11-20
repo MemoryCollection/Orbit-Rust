@@ -9,23 +9,26 @@
 |---|---|
 | `src/main.rs` | 程序入口：`#![windows_subsystem = "windows"]`（不弹控制台）、初始化日志、解析 `--show-taskbar` / `--restore-taskbar`，调用 `app::run`（默认接管任务栏） |
 | `src/app.rs` | 启动流程：GDI+ / COM 初始化、注册四个窗口类（胶囊 / Dock / 提示条 / 邮件阅读窗）、创建胶囊与 Dock、消息循环、退出清理（恢复任务栏） |
-| `src/window.rs` | 顶部胶囊窗口：置顶分层窗口、widget 布局与命中、悬停、时钟定时器、展开面板的开关/点击分发、音乐条的显隐/角度驱动；`primary_monitor()` 也在这里 |
-| `src/dock.rs` | 底部 Dock 窗口：钉选 `.lnk` + 运行中应用（按 exe 去重）、大图标提取与缩放、点击启动/切换窗口；**右侧托盘区**（持有 `TrayMirror`、2s 轮询、左右键转发、悬停提示条、与 Dock 图标去重） |
+| `src/window.rs` | 顶部胶囊窗口：置顶分层窗口、widget 布局与命中、悬停、时钟定时器（带秒的格式下每秒重绘）、展开面板的开关/点击分发、音乐条的显隐/角度驱动、**按配置把 widget 分到胶囊 / 左右模块条**、**胶囊右侧的托盘闪烁图标**（`T_FLASH` 70ms 比 `dock::flash_version()`，悬停/点击转发给真实托盘）；水平居中只按胶囊自身宽度（分离出去的模块条不参与）；`primary_monitor()` 也在这里 |
+| `src/clock.rs` | **胶囊里的时钟模块**：把日期与时间**合并成一段**文本（20:15 11月20日 周五），排列（`Order`：时间在前/日期在前/只其一）、时间格式（`TimeStyle`：24h / 24h 带秒 / 12h 上午下午 / 12h 带秒 / 中文「20时15分」）、日期格式（`DateStyle`：月日周 / 月日 / 月日短 / 周X / 星期X / ymd / ymd 斜杠 / 中文年月日）各有编解码与 `parse`（settings.txt 用）；`text()` 拼给胶囊、`sample_*()` / `sample_order()` 给设置页单选块做实时预览（`all()` 给出候选顺序）。纯格式化，不绘制 |
+| `src/dock.rs` | 底部 Dock 窗口：钉选 `.lnk` + 运行中应用（按 exe 去重）、大图标提取与缩放、点击启动/切换窗口；**右侧托盘区**（持有 `TrayMirror`、2s 轮询、左右键/悬停按图标**真实协议版本**转发 v0/v3/v4、悬停提示条、与 Dock 图标去重）；**最右端返回桌面细长条**（悬停变亮 + 提示条，点击 `IShellDispatch4::ToggleDesktop`）；托盘显隐 = 与 Dock 图标去重 + 按 `settings::hide_tray` 名单单独隐藏；**把「正在闪烁的图标」发布成胶囊消费的快照**（`flash_icons()` / `flash_version()`，见 `FlashIcon`）；右键空白处打开设置页 |
 | `src/panel.rs` | 展开面板窗口（天气卡片 / 剪贴板 / 邮件）：独立分层窗口、命中表 → 动作号、点击回传 `WM_ROW_CLICK`，自身不做业务判断 |
 | `src/musicbar.rs` | 音乐条窗口：贴在胶囊左/右/下方的小窗 = 旋转的圆形专辑封面（中心播放/暂停按钮）+ 当前歌词；没有播放时整条隐藏；只有封面圆接鼠标（左键播放/暂停、右键下一首），其余穿透 |
-| `src/render.rs` | 全部绘制：胶囊/ Dock 圆角底板、文本（三种字体族）、widget、图标合成、面板与天气卡片、音乐条（封面解码/旋转/按钮/歌词）、`present()` 上屏、图标捕获、高质量缩放、BGRA 转换 |
+| `src/widgetbar.rs` | **分离模块条**窗口：每侧最多 `WIDGET_BAR_MAX_SLOT`(3) 条独立分层小窗，按 (侧, 编号) 一一对应、懒创建。`window.rs` 把同侧同编号的 widget 合成一组传进来（`sync(Frame)` 一帧统一定位/显隐，从胶囊往外按编号排，编号 1 贴得最近），条与胶囊同高同底色；整窗默认穿透，只有 widget 矩形接鼠标，点击 `PostMessage(胶囊, WM_WIDGET_CLICK, 类型号)` 由 `App::on_widget` 分发 |
+| `src/render.rs` | 全部绘制：胶囊/ Dock 圆角底板、文本（三种字体族）、widget、图标合成（字形蒙版 + 位图 `blit_bitmap`，胶囊右侧托盘闪烁图标用）、面板与天气卡片、音乐条（封面解码/旋转/按钮/歌词）、`present()` 上屏、图标捕获、高质量缩放、BGRA 转换（设置页绘制已迁往 `settingsui.rs` 的 egui 版） |
 | `src/weather.rs` | 天气数据：高德（实况 + 四天预报，失败回退 Open-Meteo）与出口 IP 定位，30 分钟刷新、失败指数退避；`describe()/glyph()` 码位映射 |
 | `src/lyric.rs` | 歌词数据：按曲目搜网易云 → 取 LRC → 解析时间轴 → 按播放进度取当前行；换歌才请求，结果（含"无歌词"）内存缓存 |
-| `src/mail.rs` | 邮箱数据：IMAP over TLS（最小 IMAP4rev1 子集）拉最近 N 封、MIME 解码、验证码抽取；已读双向同步（读服务端 `\Seen`，点开时后台 `UID STORE +FLAGS (\Seen)` 写回） |
+| `src/mail.rs` | 邮箱数据：IMAP over TLS（最小 IMAP4rev1 子集）拉最近 N 封、MIME 解码、验证码抽取；已读双向同步（读服务端 `\Seen`，点开时后台 `UID STORE +FLAGS (\Seen)` 写回）；`test_account()` 供设置页「测试连通」（建连 + LOGIN 实测） |
 | `src/mailview.rs` | 邮件阅读窗：点邮件标题弹出的普通 popup 窗（分层面板带不了子控件），只读多行 EDIT 呈正文（可选中/Ctrl+C/滚动），深色主题；「删除邮件」经 `WM_COPYDATA`(dwData=0x4D41494C) 把 UID 发回胶囊 → `Mail::delete`（本地移除 + 后台 `\Deleted`+EXPUNGE 真删） |
 | `src/music.rs` | 音乐数据：SMTC 读当前曲目 + 播放进度（锚点 + 本地推进）+ 专辑封面字节，播放/暂停/切歌；采样在独立 MTA 线程 |
 | `src/clipboard.rs` | 剪贴板历史：`AddClipboardFormatListener` 监听线程、只收文字（文件/图片过滤）、去重、固定置顶、敏感内容过滤、落盘 |
-| `src/settings.rs` | 可调设置：`<exe>/data/settings.txt`（key=value），运行时查 mtime 热更新；`weather_text_scale` / `lyric_position` / `lyric_size` |
+| `src/settings.rs` | 可调设置：`<exe>/data/settings.txt`（key=value），运行时查 mtime 热更新；键：`clock_order` / `time_format` / `date_format`（时钟模块，见 `clock.rs`）/ `hide_tray`（逐个托盘图标隐藏，配合 `tray_hidden()` / `set_tray_hidden()` / `clear_hidden_tray()`）/ `weather_text_scale` / `lyric_position` / `lyric_size` / `weather_pos` / `mail_pos` / `clipboard_pos`（`pill` / `left[2|3]` / `right[2|3]`，`Place{pos,slot}`：同侧同编号合并成一条、编号不同各自一条）/ `show_tray`（仅手改文件，设置页不再提供总开关）/ `show_desktop_btn`（设置页在「托盘图标」列表第一格开关）。`set_*` 供设置页调用（改内存 + 就地改文件 + `VERSION += 1`），配置页写盘只替换受管键、保留注释与用户自加的键 |
+| `src/settingsui.rs` | **设置页面（egui 版）**：`eframe`（glow 后端，含 clipboard feature）跑在独立后台线程（`event_loop_builder` 开 `with_any_thread`，首次 show 懒启动），无边框小窗（不置顶，`with_taskbar(false)` 不占任务栏），主线程经 `QUEUE` + `Context::request_repaint` 收发显示/隐藏命令，`App::logic` 消费命令并拦截 Alt+F4（当作收起，eframe 常驻）。**分组导航布局**：左栏 6 个分组按钮，右栏画所选分组详情（组内滚动；ScrollArea 内容须显式 top_down 防布局继承）。分组：顶部胶囊（时钟格式编辑框+实时预览/透明度/形状）、Dock 位置、音乐条（位置+歌词字号）、天气（字号倍率/数据源/高德 Key）、**邮箱账户**（QQ/163/Gmail/Outlook 服务器预设一键切换，「自定义」才展开 host/port，账号+授权码编辑框，**测试连通**按钮后台线程跑 `mail::test_account` 实测 IMAP LOGIN）、模块与托盘（模块芯片拖动排序+点击循环 + 托盘图标两列开关+恢复按钮）。改值直接调 `settings::set_*`，胶囊与 Dock 靠 `settings::version()` 重绘；编辑框本地缓冲、失焦才写盘；固定 940×560、打开时按 DPI 换算主屏居中；中文字体运行时从系统加载（msyh → simhei 兜底）。右键 Dock 空白、右键胶囊、`Ctrl+Alt+,` 打开 |
 | `src/store.rs` | 唯一持久化入口：所有数据文件都落在 `<exe 目录>/data/`，不碰注册表和安装目录以外的地方 |
 | `src/net.rs` | 极简 HTTP(S) GET（WinHTTP，走系统代理） |
 | `src/json.rs` | 极小 JSON 解析器（object/array/string/number） |
 | `src/trayhost.rs` | **完整托盘托管（默认开启，`config::TRAY_TAKEOVER`）**：注册假 `Shell_TrayWnd`/`TrayNotifyWnd` 窗口类 + 广播 `TaskbarCreated`，让应用把托盘图标重新注册到我们这里；`WM_COPYDATA(dwData=1)` 解析 packed `NOTIFYICONDATA` 建图标表（hWnd/uID/GUID/回调消息/版本/hIcon/tooltip 全拿到，不依赖 UIA）；`dwData=3` 回答 `Shell_NotifyIconGetRect` 位置查询；`set_tray_host_size()` 把假窗口移到 Dock 矩形（对齐 C# `SetTrayHostSizeData`）；100ms 守护把假窗口置 TOPMOST 并保持隐藏；消息转发带注册消息过滤 + 重入保护（防退出广播 TaskbarCreated 触发栈溢出）。移植自 C# Orbit / ManagedShell |
-| `src/tray.rs` | 托盘镜像数据层：**优先消费 `trayhost` 的托管图标表**（`attach_host`/`poll_hosted`，直接拿 `NIM_MODIFY(hIcon=0)` 的灭帧做闪烁同步，不再 PrintWindow 采样像素）；未托管时退回 UIA + PrintWindow（`NotifyItemIcon` 枚举、exe 大图标 + 相似度校验）。图标来源统一走 `appicon`；只提供数据与状态，不绘制、不持有窗口 |
+| `src/tray.rs` | 托盘镜像数据层：**优先消费 `trayhost` 的托管图标表**（`attach_host`/`poll_hosted`，直接拿 `NIM_MODIFY(hIcon=0)` 的灭帧做闪烁同步，不再 PrintWindow 采样像素）；未托管时退回 UIA + PrintWindow（`NotifyItemIcon` 枚举、exe 大图标 + 相似度校验）。图标来源统一走 `appicon`；`TrayItem::key` / `icon_key()` 给出跨会话稳定的图标键（GUID → exe+uID → 名字），设置页靠它记住哪个图标被隐藏；只提供数据与状态，不绘制、不持有窗口 |
 | `src/traymsg.rs` | 托盘**回调消息转发**：托管模式下目标（`hWnd/uID/uCallbackMessage/uVersion/GUID`）直接来自 `trayhost::Icon`；旧路径从 explorer 的 `TRAYDATA`（`TB_GETBUTTON`+`ReadProcessMemory`）或进程内存 `NOTIFYICONDATAW` 挖。按 v0/3/4 编码投 `WM_MOUSEHOVER`/`NIN_POPUPOPEN`/`WM_MOUSEMOVE`/`WM_MOUSELEAVE`/`NIN_POPUPCLOSE`/左键/右键（含 `AllowSetForegroundWindow` + `NIN_SELECT`）|
 | `src/flyout.rs` | **悬停弹窗重定位**：应用悬停时自弹的预览小窗（微信 tool window）会落在旧托盘角（实测左上角 (-24,-24)），后台线程按 exe 名找兄弟进程（双开时卡片进程 ≠ 图标宿主）、`SetWindowPos` 摆到 Dock 上方并守位。**不按"抢前台"排除**（微信卡片自身抢前台）、generation 按图标 hwnd 分组（两实例互不取消）、窗口销毁重建后重新锁定。移植自 C# `HoverFlyoutRelocator` 并针对微信双开加固 |
 | `src/appicon.rs` | 托盘图标的高分辨率来源：读 `HKCU\Control Panel\NotifyIconSettings\*` 的 `InitialTooltip`/`ExecutablePath` 建"名字 → exe"表（进程名兜底），再从 exe 取 256px 图标；表与图标都带缓存 |
@@ -41,6 +44,8 @@
 | `tools/trayhostprobe/` | 机制验证探针：注册假 `Shell_TrayWnd` + 广播 `TaskbarCreated`，打印收到的 `WM_COPYDATA` 原始字节（确认系统会把托盘注册发给假窗口）；`restore` 子命令重播 TaskbarCreated |
 | `tools/trayhostcheck/` | harness：用 `#[path]` 直接引入产品模块 `src/trayhost.rs`，不启动完整 Orbit 就能验证图标表捕获（GUID 图标、空名字图标、`NIM_ADD/MODIFY/DELETE`） |
 | `tools/hidecheck/` | 任务栏隐藏 A/B 工具：`hide`（autohide+SWP_HIDEWINDOW）/ `show`（还原）/ `back`（移回原位）/ `unlayer`（清分层残留），打印 state/visible/rect/workarea |
+| `tools/flyouttest/` | 悬停弹窗重定位的离线验证：`#[path]` 引入 `flyout.rs`，派生子进程造一个 `WS_POPUP\|WS_EX_TOOLWINDOW` 假弹窗（初始摆在旧托盘角 1500,900），调 `flyout::watch(..., anchor_x)` 后打印实际位置 vs 期望（鼠标 x 居中、下沿贴胶囊上沿）。`flyouttest [anchor_x]`，实测 1043→(883,595)、1900→(982,595) 夹取正确；不依赖微信/不碰任务栏 |
+| `tools/pillcheck/` | 渲染离线验证：`#[path]` 引入 `config.rs` + `render.rs`，按模式出图到 `tools/_shots/`：`split`（一个模块一条）/ `merge`（同侧合并）/ `pill`（`layout_<模式>_<缩放>.bmp`，核对分组布局与日期字体）、`dock` / `dock_notray`（Dock + 托盘 + 返回桌面细长条，打印命中矩形）、`settings`（设置卡片，核对排版：时钟三行的单选预览块、七段位置、托盘逐图标开关与「返回桌面」格、恢复按钮）；不开窗口、不碰任务栏 |
 
 ## 文档
 

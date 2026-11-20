@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WNDCLASSW,
 };
 
+use crate::egui_soft::SoftBackend;
 use crate::render::{self, PanelRow, WeatherView};
 
 /// 面板动作被点击时发给胶囊窗口的消息（wParam = 动作号）
@@ -47,8 +48,15 @@ impl Content {
     }
 }
 
+/// 面板内容的宽高（胶囊吸底时，调用方要先把高度算出来才能把面板弹到上方）
+pub fn content_size(content: &Content, scale: f32) -> (i32, i32) {
+    content.size(scale)
+}
+
 struct Panel {
     owner: HWND,
+    /// egui 软件后端（面板绘制）
+    view: SoftBackend,
     scale: f32,
     content: Content,
     /// 命中区域与动作号（后压入的优先，固定按钮压在行上面）
@@ -76,6 +84,7 @@ pub fn init(instance: windows::Win32::Foundation::HINSTANCE) {
 
         let p = Box::into_raw(Box::new(Panel {
             owner: HWND::default(),
+            view: SoftBackend::new(),
             scale: 1.0,
             content: Content::List {
                 title: String::new(),
@@ -190,15 +199,19 @@ impl Panel {
             return;
         }
         let out = match &self.content {
-            Content::List { title, subtitle, rows, empty, tabs, tab_active } => render::draw_panel(
-                w, h, self.scale, title, subtitle, rows, empty, tabs, *tab_active, self.hovered,
-            ),
-            Content::Weather(v) => {
-                render::draw_weather_panel(w, h, self.scale, v, self.hovered == Some(0))
-            }
+            Content::List { title, subtitle, rows, empty, tabs, tab_active } =>
+                crate::panelview::paint_list(
+                    &mut self.view, w, h, self.scale, title, subtitle, rows, empty, tabs,
+                    *tab_active, self.hovered,
+                ),
+            Content::Weather(v) =>
+                crate::panelview::paint_weather(
+                    &mut self.view, w, h, self.scale, v, self.hovered == Some(0),
+                ),
         };
         self.hits = out.hits;
-        let bgra = render::to_premultiplied_bgra(&out.rgba);
+        // egui 软件后端输出已是预乘 RGBA，直接换 BGRA 上屏
+        let bgra = render::premultiplied_rgba_to_bgra(&out.rgba);
         render::present(hwnd(), &bgra, w, h);
     }
 

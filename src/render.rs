@@ -13,7 +13,8 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS,
 };
 use windows::Win32::Graphics::GdiPlus::{
-    GdipAddPathArc, GdipAddPathPolygon, GdipBitmapLockBits, GdipBitmapUnlockBits, GdipClosePathFigure,
+    GdipAddPathArc, GdipAddPathLine, GdipAddPathPolygon, GdipBitmapLockBits, GdipBitmapUnlockBits,
+    GdipClosePathFigure,
     GdipCreateBitmapFromScan0, GdipCreateBitmapFromStream, GdipCreateFont, GdipCreateFontFamilyFromName,
     GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteFont,
     GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDeleteStringFormat,
@@ -135,11 +136,22 @@ pub fn measure_text(text: &[u16], size: f32, kind: FontKind, scale: f32) -> (f32
 pub struct PillRender {
     /// 整幅 straight-alpha RGBA 缓冲（w*h*4）
     pub rgba: Vec<u8>,
-    /// 每个 widget 的命中矩形（client 坐标 [x, y, w, h]）
+    /// 每个 widget 的命中矩形（client 坐标 [x, y, w, h]）。
+    /// **闪烁图标区的矩形接在后面**：调用方用"胶囊 widget 数"切分前后两段。
     pub widget_rects: Vec<[f32; 4]>,
 }
 
+/// 胶囊右侧的一个托盘闪烁图标（新消息提醒）：图标位图 + 这一帧是否在"灭"。
+/// 灭帧画全透明（格子仍占位），亮帧画真实图标——与 Dock 托盘区的闪烁同一节奏。
+pub struct FlashView<'a> {
+    pub rgba: &'a [u8],
+    /// 位图边长（rgba 是 px*px*4）
+    pub px: i32,
+    pub dim: bool,
+}
+
 /// 胶囊内的一个小 widget：一个符号图标 + 一段短文本
+#[derive(Clone)]
 pub struct WidgetItem {
     pub icon: String,
     pub icon_argb: u32,
@@ -150,11 +162,177 @@ fn to_u16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-/// widget 内容宽度（图标 + 间距 + 文本）
+// ---------- 符号图标：统一视觉尺寸 ----------
+//
+// 胶囊里的图标都是 Segoe UI Symbol 的字形，同一个字号下墨迹大小差得很明显
+// （☁ 胖，✉ / ▤ 瘦小）。这里把字形渲染成一张 alpha 蒙版，量出墨迹包围盒，
+// 再按"墨迹面积"统一缩放到目标尺寸、居中贴进固定大小的格子里——这样换什么
+// 字形看起来都一样大，格子的宽度也一致，间距才对得齐。
+
+/// 一张字形蒙版（只留 alpha，颜色在贴图时才给）
+struct Mask {
+    w: i32,
+    h: i32,
+    a: Vec<u8>,
+}
+
+thread_local! {
+    /// 字形 + 渲染字号 → 蒙版缓存（同一次绘制里每个字形只量一次）
+    static MASKS: std::cell::RefCell<std::collections::HashMap<(String, i32), Mask>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// 渲染字形蒙版：大画布上画白字，扫出 alpha 包围盒后裁出来。失败返回 None。
+fn build_mask(glyph: &str, px: f32) -> Option<Mask> {
+    unsafe {
+        if glyph.is_empty() || px <= 0.0 {
+            return None;
+        }
+        // 画布给足两倍字号，避免字形（含上下伸部）被裁
+        let n = (px * 2.0).ceil() as i32 + 8;
+        let mut bmp: *mut GpBitmap = null_mut();
+        GdipCreateBitmapFromScan0(n, n, n * 4, PX_32BPP_ARGB, None, &mut bmp);
+        if bmp.is_null() {
+            return None;
+        }
+        let mut g: *mut GpGraphics = null_mut();
+        GdipGetImageGraphicsContext(bmp as _, &mut g);
+        GdipSetTextRenderingHint(g, TextRenderingHintAntiAliasGridFit);
+        let t = to_u16(glyph);
+        draw_string(g, &t, 0xFF_FF_FF_FF, FontKind::Symbol, px, 0.0, 0.0, n as f32, n as f32);
+
+        let rect = GpRect { X: 0, Y: 0, Width: n, Height: n };
+        let mut data = BitmapData::default();
+        let locked = GdipBitmapLockBits(bmp, &rect, ImageLockModeRead.0 as u32, PX_32BPP_ARGB, &mut data).0 == 0
+            && !data.Scan0.is_null();
+        let mut out = None;
+        if locked {
+            let stride = data.Stride as usize;
+            let base = data.Scan0 as *const u8;
+            let alpha_at = |x: i32, y: i32| *base.add(y as usize * stride + x as usize * 4 + 3);
+            let (mut x0, mut y0, mut x1, mut y1) = (n, n, -1, -1);
+            for y in 0..n {
+                for x in 0..n {
+                    if alpha_at(x, y) > 16 {
+                        x0 = x0.min(x);
+                        y0 = y0.min(y);
+                        x1 = x1.max(x);
+                        y1 = y1.max(y);
+                    }
+                }
+            }
+            if x1 >= x0 && y1 >= y0 {
+                let (mw, mh) = (x1 - x0 + 1, y1 - y0 + 1);
+                let mut a = vec![0u8; (mw * mh) as usize];
+                for y in 0..mh {
+                    for x in 0..mw {
+                        a[(y * mw + x) as usize] = alpha_at(x0 + x, y0 + y);
+                    }
+                }
+                out = Some(Mask { w: mw, h: mh, a });
+            }
+            let _ = GdipBitmapUnlockBits(bmp, &mut data);
+        }
+        GdipDeleteGraphics(g);
+        GdipDisposeImage(bmp as _);
+        out
+    }
+}
+
+/// 取（必要时先渲染）某个字形的蒙版，命中缓存就不重复量
+fn with_mask<R>(glyph: &str, px: f32, f: impl FnOnce(&Mask) -> R) -> Option<R> {
+    let key = (glyph.to_string(), px.round() as i32);
+    let hit = MASKS.with(|c| c.borrow().contains_key(&key));
+    if !hit {
+        let m = build_mask(glyph, px)?;
+        MASKS.with(|c| c.borrow_mut().insert(key.clone(), m));
+    }
+    MASKS.with(|c| c.borrow().get(&key).map(f))
+}
+
+/// 蒙版双线性取样（straight alpha，0..1）
+fn mask_sample(m: &Mask, x: f32, y: f32) -> f32 {
+    let (max_x, max_y) = ((m.w - 1) as f32, (m.h - 1) as f32);
+    let (x, y) = (x.clamp(0.0, max_x), y.clamp(0.0, max_y));
+    let (x0, y0) = (x.floor() as i32, y.floor() as i32);
+    let (x1, y1) = ((x0 + 1).min(m.w - 1), (y0 + 1).min(m.h - 1));
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let at = |xx: i32, yy: i32| m.a[(yy * m.w + xx) as usize] as f32 / 255.0;
+    let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
+    let bot = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
+    top * (1.0 - fy) + bot * fy
+}
+
+/// 把字形蒙版缩放贴进 RGBA 缓冲（straight alpha 软合成，颜色取 argb 的 RGB）。
+/// 缩小超过 1.6 倍时做 2×2 超采样，避免细笔画出现锯齿。
+fn blit_mask(
+    dst: &mut [u8], bw: i32, bh: i32,
+    m: &Mask, x: f32, y: f32, tw: f32, th: f32, argb: u32,
+) {
+    if tw < 0.5 || th < 0.5 {
+        return;
+    }
+    let (cr, cg, cb) = (
+        ((argb >> 16) & 0xFF) as f32,
+        ((argb >> 8) & 0xFF) as f32,
+        (argb & 0xFF) as f32,
+    );
+    let a_mul = ((argb >> 24) & 0xFF) as f32 / 255.0;
+    let ratio = m.w as f32 / tw;
+    let taps: &[(f32, f32)] = if ratio > 1.6 {
+        &[(-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25)]
+    } else {
+        &[(0.0, 0.0)]
+    };
+    let dx0 = x.floor().max(0.0) as i32;
+    let dy0 = y.floor().max(0.0) as i32;
+    let dx1 = (x + tw).ceil().min(bw as f32) as i32;
+    let dy1 = (y + th).ceil().min(bh as f32) as i32;
+    for py in dy0..dy1 {
+        let sy = ((py as f32 + 0.5 - y) / th) * m.h as f32 - 0.5;
+        for px in dx0..dx1 {
+            let sx = ((px as f32 + 0.5 - x) / tw) * m.w as f32 - 0.5;
+            let mut cov = 0.0;
+            for (ox, oy) in taps {
+                cov += mask_sample(m, sx + ox * ratio, sy + oy * ratio);
+            }
+            let sa = (cov / taps.len() as f32) * a_mul;
+            if sa <= 0.004 {
+                continue;
+            }
+            let i = ((py * bw + px) * 4) as usize;
+            let da = dst[i + 3] as f32 / 255.0;
+            let out_a = sa + da * (1.0 - sa);
+            for (k, col) in [cr, cg, cb].into_iter().enumerate() {
+                let d = dst[i + k] as f32;
+                let v = (col * sa + d * da * (1.0 - sa)) / out_a.max(1e-4);
+                dst[i + k] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            dst[i + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// 把一个符号画进固定大小的图标格子：墨迹按面积归一到 `cfg::WIDGET_GLYPH_INK`，
+/// 居中收进格子。格子坐标是浮点物理像素。
+fn draw_glyph_cell(dst: &mut [u8], bw: i32, bh: i32, glyph: &str, argb: u32, cell: (f32, f32, f32), scale: f32) {
+    let (cx, cy, side) = cell;
+    // 蒙版按 2.5 倍基准字号渲染，缩小贴图才够锐（缓存，只做一次）
+    let px = (cfg::WIDGET_ICON_SIZE * scale * 2.5).max(32.0);
+    let ink = cfg::WIDGET_GLYPH_INK * scale;
+    with_mask(glyph, px, |m| {
+        let geo = ((m.w as f32) * (m.h as f32)).sqrt().max(1.0);
+        let k = (ink / geo).min(side / m.w as f32).min(side / m.h as f32);
+        let (tw, th) = (m.w as f32 * k, m.h as f32 * k);
+        blit_mask(dst, bw, bh, m, cx + (side - tw) / 2.0, cy + (side - th) / 2.0, tw, th, argb);
+    });
+}
+
+/// widget 内容宽度（图标格子 + 间距 + 文本）
 pub fn widget_width(item: &WidgetItem, scale: f32) -> f32 {
     let mut w = 0.0;
     if !item.icon.is_empty() {
-        w += measure_text(&to_u16(&item.icon), cfg::WIDGET_ICON_SIZE, FontKind::Symbol, scale).0;
+        w += cfg::WIDGET_ICON_CELL * scale;
         if !item.text.is_empty() {
             w += cfg::WIDGET_ICON_GAP * scale;
         }
@@ -165,13 +343,118 @@ pub fn widget_width(item: &WidgetItem, scale: f32) -> f32 {
     w
 }
 
-/// 绘制整幅胶囊。w/h 为物理像素。
-pub fn draw_pill(
-    w: i32, h: i32, scale: f32,
-    time: &[u16], date: &[u16],
+/// 一排 widget 的绘制结果
+struct StripOut {
+    /// 每个 widget 的命中矩形（client 坐标 [x, y, w, h]）
+    rects: Vec<[f32; 4]>,
+    /// 图标格子位置：字形（颜色、格子左上角）——像素取出后再贴
+    glyphs: Vec<(String, u32, f32, f32)>,
+    /// 这一排占用的总宽度（含内部间距，不含右侧尾部间距）
+    width: f32,
+}
+
+/// 从 x 开始横排一行 widget（胶囊里的 widget 区与分离出去的模块条共用）。
+/// 图标只记位置，等像素取出来再统一贴（`draw_glyph_cell`）。
+unsafe fn draw_widget_strip(
+    g: *mut GpGraphics,
+    start_x: f32, bw: f32, fh: f32,
+    _base: f32, scale: f32,
     widgets: &[WidgetItem],
-    hovered_widget: Option<usize>,
+    hovered: Option<usize>,
+    item_gap: f32,
+) -> StripOut {
+    let bg_px = cfg::ICON_BG * scale;
+    let cell = cfg::WIDGET_ICON_CELL * scale;
+    let gap = item_gap * scale;
+    let mut x = start_x;
+    let mut out = StripOut { rects: Vec::new(), glyphs: Vec::new(), width: 0.0 };
+
+    for (i, item) in widgets.iter().enumerate() {
+        let ww = widget_width(item, scale);
+        let ry = (fh - bg_px) / 2.0;
+        let hw = ww + 2.0 * cfg::WIDGET_PAD_X * scale;
+        if Some(i) == hovered {
+            round_rect(g, x, ry, hw, bg_px, 8.0 * scale, cfg::HOVER_ARGB);
+        }
+        out.rects.push([x, ry, hw, bg_px]);
+
+        let mut cx = x + cfg::WIDGET_PAD_X * scale;
+        if !item.icon.is_empty() {
+            out.glyphs.push((item.icon.clone(), item.icon_argb, cx, (fh - cell) / 2.0));
+            cx += cell;
+            if !item.text.is_empty() {
+                cx += cfg::WIDGET_ICON_GAP * scale;
+            }
+        }
+        if !item.text.is_empty() {
+            // 图标与文本**垂直中线对齐**：文本按自己的实测高度居中（不再走基线，
+            // "☀ 8°"这种图标+温度的组合才不会一个偏上一个偏下）
+            let text = to_u16(&item.text);
+            let (_, th) = measure_text(&text, cfg::WIDGET_TEXT_SIZE, FontKind::Cjk, scale);
+            draw_string(g, &text, cfg::TEXT_ARGB, FontKind::Cjk,
+                cfg::WIDGET_TEXT_SIZE * scale, cx,
+                (fh - th) / 2.0, bw, fh);
+        }
+        x += hw + gap;
+    }
+    out.width = (x - gap - start_x).max(0.0);
+    out
+}
+
+/// 取像素 → BGRA 换 RGBA → 贴统一尺寸的图标蒙版
+unsafe fn take_pixels(
+    bmp: *mut GpBitmap, w: i32, h: i32,
+    glyphs: &[(String, u32, f32, f32)], scale: f32,
+) -> Vec<u8> {
+    let rect = GpRect { X: 0, Y: 0, Width: w, Height: h };
+    let mut data = BitmapData::default();
+    GdipBitmapLockBits(bmp, &rect, ImageLockModeRead.0 as u32, PX_32BPP_ARGB, &mut data);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    if !data.Scan0.is_null() {
+        std::ptr::copy_nonoverlapping(data.Scan0 as *const u8, rgba.as_mut_ptr(), rgba.len());
+    }
+    GdipBitmapUnlockBits(bmp, &mut data);
+    // GDI+ 的 32bppARGB 在内存里是 BGRA，统一换成 RGBA
+    swap_rb(&mut rgba);
+
+    let cell = cfg::WIDGET_ICON_CELL * scale;
+    for (glyph, argb, gx, gy) in glyphs {
+        draw_glyph_cell(&mut rgba, w, h, glyph, *argb, (*gx, *gy, cell), scale);
+    }
+    rgba
+}
+
+/// 把一张 straight RGBA 位图缩放后软合成进缓冲（胶囊右侧的托盘闪烁图标用）。
+/// 缩放走 resize_rgba（缩小面积平均/放大 Catmull-Rom），合成与 blend_over 同一套。
+pub fn blit_bitmap(dst: &mut [u8], buf_w: i32, src: &[u8], src_px: i32, x: f32, y: f32, size: f32) {
+    let s = size.round().max(1.0) as i32;
+    if s <= 0 || src_px <= 0 || src.len() < (src_px * src_px * 4) as usize {
+        return;
+    }
+    let resized = resize_rgba(src, src_px, src_px, s, s);
+    blend_over(dst, &resized, x.round() as i32, y.round() as i32, s, buf_w);
+}
+
+/// 胶囊形状（决定四角圆角与命中测试，见 `settings::PillAnchor`）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PillShape {
+    /// 悬浮胶囊：四角全圆（半径 = 高/2）
+    Float,
+    /// 吸顶刘海：顶部两角方形，底部半圆
+    Island,
+    /// 吸底：底部两角方形，顶部半圆
+    Bottom,
+}
+/// 分离出去的模块条：一条独立的胶囊形小条 + 一排 widget（和胶囊同高、同底色）。
+/// 返回的 rgba 是 straight-alpha RGBA，widget_rects 是每个 widget 的命中矩形。
+pub fn draw_widget_bar(
+    w: i32, h: i32, scale: f32,
+    widgets: &[WidgetItem],
+    hovered: Option<usize>,
 ) -> PillRender {
+    if w <= 0 || h <= 0 || widgets.is_empty() {
+        return PillRender { rgba: Vec::new(), widget_rects: vec![] };
+    }
     unsafe {
         let mut bmp: *mut GpBitmap = null_mut();
         GdipCreateBitmapFromScan0(w, h, w * 4, PX_32BPP_ARGB, None, &mut bmp);
@@ -183,108 +466,37 @@ pub fn draw_pill(
         GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
         GdipSetTextRenderingHint(g, TextRenderingHintAntiAliasGridFit);
 
-        // 圆角底板（半径 = 高/2，完整胶囊形）
-        let r = h as f32 / 2.0;
         let (fw, fh) = (w as f32, h as f32);
-        let mut path: *mut GpPath = null_mut();
-        GdipCreatePath(FillModeWinding, &mut path);
-        GdipAddPathArc(path, 0.0, 0.0, 2.0 * r, 2.0 * r, 180.0, 90.0);
-        GdipAddPathArc(path, fw - 2.0 * r, 0.0, 2.0 * r, 2.0 * r, 270.0, 90.0);
-        GdipAddPathArc(path, fw - 2.0 * r, fh - 2.0 * r, 2.0 * r, 2.0 * r, 0.0, 90.0);
-        GdipAddPathArc(path, 0.0, fh - 2.0 * r, 2.0 * r, 2.0 * r, 90.0, 90.0);
-        GdipClosePathFigure(path);
-        let bg = solid_fill(cfg::BG_ARGB);
-        GdipFillPath(g, bg as *mut GpBrush, path);
-        GdipDeleteBrush(bg as *mut GpBrush);
-        GdipDeletePath(path);
+        round_rect(g, 0.0, 0.0, fw, fh, fh / 2.0, cfg::BG_ARGB);
 
-        // 文本布局（与 content_width 严格一致）。
-        // 垂直方向统一基线：以时间（最大字号）的居中位置定出基线，其余元素
-        // 全部对齐到同一基线，避免不同字体行盒留白不同造成的"有高有低"。
-        let pad = cfg::PAD_X * scale;
-        let gap = cfg::GAP * scale;
-        let (tw, th) = measure_text(time, cfg::TIME_SIZE, FontKind::Latin, scale);
-        let (dw, _dh) = measure_text(date, cfg::DATE_SIZE, FontKind::Cjk, scale);
-        let mut x = pad;
-        let base = (fh - th) / 2.0 + font_ascent(cfg::TIME_SIZE * scale, FontKind::Latin);
-        draw_string(g, time, cfg::TIME_ARGB, FontKind::Latin, cfg::TIME_SIZE * scale, x, (fh - th) / 2.0, fw, fh);
-        x += tw + gap;
-        draw_string(g, date, cfg::DATE_ARGB, FontKind::Cjk, cfg::DATE_SIZE * scale, x,
-            base - font_ascent(cfg::DATE_SIZE * scale, FontKind::Cjk), fw, fh);
-        x += dw;
+        // 条里没有时钟，基线就按 widget 自己的文本字号居中定
+        let (_, th) = measure_text(&to_u16("Ag"), cfg::WIDGET_TEXT_SIZE, FontKind::Cjk, scale);
+        let base = (fh - th) / 2.0 + font_ascent(cfg::WIDGET_TEXT_SIZE * scale, FontKind::Cjk);
+        let strip = draw_widget_strip(
+            g, cfg::WIDGET_BAR_PAD_X * scale, fw, fh, base, scale,
+            widgets, hovered, cfg::WIDGET_BAR_ITEM_GAP,
+        );
 
-        let bg_px = cfg::ICON_BG * scale;
-        let div_y = ((fh - cfg::DIVIDER_H * scale) / 2.0) as i32;
-        let div_h = (cfg::DIVIDER_H * scale) as i32;
-        let mut widget_rects = Vec::new();
-
-        // widget 区（天气 / 音乐 / 剪贴板）
-        if !widgets.is_empty() {
-            x += gap;
-            let div = solid_fill(cfg::DIVIDER_ARGB);
-            GdipFillRectangleI(g, div as *mut GpBrush, x as i32, div_y, 1, div_h);
-            GdipDeleteBrush(div as *mut GpBrush);
-            x += 1.0 + gap + cfg::WIDGET_PAD_X * scale;
-
-            for (i, item) in widgets.iter().enumerate() {
-                let ww = widget_width(item, scale);
-                let ry = (fh - bg_px) / 2.0;
-                let hw = ww + 2.0 * cfg::WIDGET_PAD_X * scale;
-                if Some(i) == hovered_widget {
-                    round_rect(g, x, ry, hw, bg_px, 8.0 * scale, cfg::HOVER_ARGB);
-                }
-                widget_rects.push([x, ry, hw, bg_px]);
-
-                let mut cx = x + cfg::WIDGET_PAD_X * scale;
-                if !item.icon.is_empty() {
-                    let icon = to_u16(&item.icon);
-                    let (iw, _) = measure_text(&icon, cfg::WIDGET_ICON_SIZE, FontKind::Symbol, scale);
-                    draw_string(g, &icon, item.icon_argb, FontKind::Symbol,
-                        cfg::WIDGET_ICON_SIZE * scale, cx,
-                        base - font_ascent(cfg::WIDGET_ICON_SIZE * scale, FontKind::Symbol), fw, fh);
-                    cx += iw + cfg::WIDGET_ICON_GAP * scale;
-                }
-                if !item.text.is_empty() {
-                    let text = to_u16(&item.text);
-                    draw_string(g, &text, cfg::TEXT_ARGB, FontKind::Cjk,
-                        cfg::WIDGET_TEXT_SIZE * scale, cx,
-                        base - font_ascent(cfg::WIDGET_TEXT_SIZE * scale, FontKind::Cjk), fw, fh);
-                }
-                x += hw + gap;
-            }
-        }
-
-        // 取出像素
-        let rect = GpRect { X: 0, Y: 0, Width: w, Height: h };
-        let mut data = BitmapData::default();
-        GdipBitmapLockBits(bmp, &rect, ImageLockModeRead.0 as u32, PX_32BPP_ARGB, &mut data);
-        let mut rgba = vec![0u8; (w * h * 4) as usize];
-        if !data.Scan0.is_null() {
-            std::ptr::copy_nonoverlapping(data.Scan0 as *const u8, rgba.as_mut_ptr(), rgba.len());
-        }
-        GdipBitmapUnlockBits(bmp, &mut data);
-        // GDI+ 的 32bppARGB 在内存里是 BGRA，统一换成 RGBA
-        swap_rb(&mut rgba);
-
+        let rgba = take_pixels(bmp, w, h, &strip.glyphs, scale);
         GdipDeleteGraphics(g);
         GdipDisposeImage(bmp as _);
-        PillRender { rgba, widget_rects }
+        PillRender { rgba, widget_rects: strip.rects }
     }
 }
 
-/// 胶囊总宽度（与 draw_pill 的布局严格一致，调用方据此先定窗口尺寸）。
-pub fn content_width(time_w: f32, date_w: f32, widgets: &[WidgetItem], scale: f32) -> f32 {
-    let pad = cfg::PAD_X * scale;
-    let gap = cfg::GAP * scale;
-    let mut x = pad + time_w + gap + date_w;
-    if !widgets.is_empty() {
-        x += gap + 1.0 + gap + cfg::WIDGET_PAD_X * scale;
-        for item in widgets {
-            x += widget_width(item, scale) + 2.0 * cfg::WIDGET_PAD_X * scale + gap;
-        }
-        x -= gap;
+/// 模块条总宽度（与 draw_widget_bar 的布局严格一致）
+pub fn widget_bar_w(widgets: &[WidgetItem], scale: f32) -> f32 {
+    if widgets.is_empty() {
+        return 0.0;
     }
-    x + pad
+    let mut w = 2.0 * cfg::WIDGET_BAR_PAD_X * scale;
+    for (i, item) in widgets.iter().enumerate() {
+        w += widget_width(item, scale) + 2.0 * cfg::WIDGET_PAD_X * scale;
+        if i + 1 < widgets.len() {
+            w += cfg::WIDGET_BAR_ITEM_GAP * scale;
+        }
+    }
+    w
 }
 
 // ---------- 音乐条（旋转封面 + 歌词） ----------
@@ -596,36 +808,61 @@ pub struct DockRender {
     pub rects: Vec<[f32; 3]>,
     /// 每个托盘图标的槽位矩形（client 坐标 [x, y, size]）
     pub tray_rects: Vec<[f32; 3]>,
+    /// "返回桌面"细长条的命中矩形 [x, y, w, h]（未显示时为 None）
+    pub desktop_rect: Option<[f32; 4]>,
 }
 
-/// Dock 总宽度（与 draw_dock 布局严格一致）。
-pub fn dock_width(n: usize, n_tray: usize, scale: f32) -> f32 {
+/// 右侧"返回桌面"细长条占掉的总宽度（含与图标区的间距）。
+/// 左侧按同样的宽度留一块空白占位，图标组才仍然是屏幕居中。
+fn dock_desktop_side(scale: f32, show_desktop: bool) -> f32 {
+    if show_desktop {
+        (cfg::DOCK_DESKTOP_W + cfg::DOCK_DESKTOP_GAP) * scale
+    } else {
+        0.0
+    }
+}
+
+/// Dock 总尺寸（与 draw_dock 布局严格一致）。水平时 (宽, 高)；竖直时 (宽, 高) 互换：
+/// 靠左/靠右时 Dock 是一条竖向排列的圆角条，宽度 = DOCK_H。
+pub fn dock_size(n: usize, n_tray: usize, scale: f32, show_tray: bool, show_desktop: bool, vertical: bool) -> (i32, i32) {
     let pad = cfg::DOCK_PAD_X * scale;
     let slot = cfg::DOCK_SLOT * scale;
     let gap = cfg::DOCK_GAP * scale;
-    let mut w = pad * 2.0 + n as f32 * slot + n.saturating_sub(1) as f32 * gap;
-    if cfg::SHOW_TRAY && n_tray > 0 {
+    // 末端细长条 + 首端等长占位
+    let side = dock_desktop_side(scale, show_desktop);
+    let mut len = pad * 2.0 + side * 2.0 + n as f32 * slot + n.saturating_sub(1) as f32 * gap;
+    if show_tray && n_tray > 0 {
         if n > 0 {
-            w += cfg::DOCK_TRAY_SEP * scale;
+            len += cfg::DOCK_TRAY_SEP * scale;
         }
-        w += 1.0 + cfg::DOCK_TRAY_SEP * scale
+        len += 1.0 + cfg::DOCK_TRAY_SEP * scale
             + n_tray as f32 * cfg::DOCK_TRAY_SLOT * scale
             + (n_tray as f32 - 1.0) * cfg::DOCK_TRAY_GAP * scale;
     }
-    w
+    let thick = (cfg::DOCK_H * scale).ceil() as i32;
+    let long = len.ceil() as i32;
+    if vertical { (thick, long) } else { (long, thick) }
 }
 
-/// 绘制底部 Dock：圆角底板 + 应用图标槽位 + 分隔线 + 托盘图标槽位。
+/// 绘制 Dock：圆角底板 + 应用图标槽位 + 分隔线 + 托盘图标槽位 + 末端返回桌面细长条。
+/// `vertical` = 靠左/靠右的竖排 Dock：图标竖着排，细长条横在底端。
 pub fn draw_dock(
     w: i32, h: i32, scale: f32,
     icons: &[&[u8]], hovered: Option<usize>,
     tray_icons: &[&[u8]], hovered_tray: Option<usize>,
+    show_tray: bool, show_desktop: bool, hovered_desktop: bool,
+    vertical: bool,
 ) -> DockRender {
     unsafe {
         let mut bmp: *mut GpBitmap = null_mut();
         GdipCreateBitmapFromScan0(w, h, w * 4, PX_32BPP_ARGB, None, &mut bmp);
         if bmp.is_null() {
-            return DockRender { rgba: vec![0; (w * h * 4) as usize], rects: vec![], tray_rects: vec![] };
+            return DockRender {
+                rgba: vec![0; (w * h * 4) as usize],
+                rects: vec![],
+                tray_rects: vec![],
+                desktop_rect: None,
+            };
         }
         let mut g: *mut GpGraphics = null_mut();
         GdipGetImageGraphicsContext(bmp as _, &mut g);
@@ -637,44 +874,83 @@ pub fn draw_dock(
         let slot = cfg::DOCK_SLOT * scale;
         let gap = cfg::DOCK_GAP * scale;
         let isz = cfg::DOCK_ICON * scale;
-        let mut x = pad;
+        // 沿主轴（水平 = x，竖直 = y）排布。首端留细长条的等长占位（末端多宽，首端就空多长）
+        let cross = if vertical { w as f32 } else { h as f32 };
+        let long = if vertical { h as f32 } else { w as f32 };
+        let mut p = pad + dock_desktop_side(scale, show_desktop);
         let mut rects = Vec::with_capacity(icons.len());
         for i in 0..icons.len() {
-            let ry = (h as f32 - slot) / 2.0;
+            let rc = (cross - slot) / 2.0;
+            let (rx, ry) = if vertical { (rc, p) } else { (p, rc) };
             if Some(i) == hovered {
-                round_rect(g, x, ry, slot, slot, 12.0 * scale, cfg::HOVER_ARGB);
+                round_rect(g, rx, ry, slot, slot, 12.0 * scale, cfg::HOVER_ARGB);
             }
-            rects.push([x, ry, slot]);
-            x += slot + gap;
+            rects.push([rx, ry, slot]);
+            p += slot + gap;
         }
         if !rects.is_empty() {
-            x -= gap;
+            p -= gap;
         }
 
-        // 分隔线 + 托盘图标（无图标时整块不画，避免右侧留白）
+        // 分隔线 + 托盘图标（无图标或关掉托盘时整块不画，避免末端留白）
         let mut tray_rects = Vec::new();
-        if cfg::SHOW_TRAY && !tray_icons.is_empty() {
+        if show_tray && !tray_icons.is_empty() {
             if !rects.is_empty() {
-                x += cfg::DOCK_TRAY_SEP * scale;
+                p += cfg::DOCK_TRAY_SEP * scale;
             }
-            let div_y = ((h as f32 - cfg::DIVIDER_H * scale) / 2.0) as i32;
-            let div_h = (cfg::DIVIDER_H * scale) as i32;
+            let dc = ((cross - cfg::DIVIDER_H * scale) / 2.0) as i32;
+            let dl = (cfg::DIVIDER_H * scale) as i32;
             let div = solid_fill(cfg::DIVIDER_ARGB);
-            GdipFillRectangleI(g, div as *mut GpBrush, x as i32, div_y, 1, div_h);
+            if vertical {
+                GdipFillRectangleI(g, div as *mut GpBrush, dc, p as i32, dl, 1);
+            } else {
+                GdipFillRectangleI(g, div as *mut GpBrush, p as i32, dc, 1, dl);
+            }
             GdipDeleteBrush(div as *mut GpBrush);
-            x += 1.0 + cfg::DOCK_TRAY_SEP * scale;
+            p += 1.0 + cfg::DOCK_TRAY_SEP * scale;
 
             let tslot = cfg::DOCK_TRAY_SLOT * scale;
             for i in 0..tray_icons.len() {
-                let ry = (h as f32 - tslot) / 2.0;
+                let rc = (cross - tslot) / 2.0;
+                let (rx, ry) = if vertical { (rc, p) } else { (p, rc) };
                 if Some(i) == hovered_tray {
                     let hb = solid_fill(cfg::HOVER_ARGB);
-                    GdipFillEllipseI(g, hb as *mut GpBrush, x as i32, ry as i32, tslot as i32, tslot as i32);
+                    GdipFillEllipseI(g, hb as *mut GpBrush, rx as i32, ry as i32, tslot as i32, tslot as i32);
                     GdipDeleteBrush(hb as *mut GpBrush);
                 }
-                tray_rects.push([x, ry, tslot]);
-                x += tslot + cfg::DOCK_TRAY_GAP * scale;
+                tray_rects.push([rx, ry, tslot]);
+                p += tslot + cfg::DOCK_TRAY_GAP * scale;
             }
+        }
+
+        // 末端"返回桌面"细长条：贴末端内边距。水平时是右端竖条，竖直时是底端横条
+        let mut desktop_rect = None;
+        if show_desktop {
+            let bw = cfg::DOCK_DESKTOP_W * scale;
+            let bl = long * cfg::DOCK_DESKTOP_H;
+            let (bx, by, bwid, bhei) = if vertical {
+                (0.0, long - pad - bl, bl, bw)
+            } else {
+                (long - pad - bw, 0.0, bw, bl)
+            };
+            // 细条在横向居中（水平 Dock 的竖条 / 竖直 Dock 的横条都沿横向居中）
+            let (rx, ry) = if vertical {
+                ((cross - bwid) / 2.0, by)
+            } else {
+                (bx, (cross - bhei) / 2.0)
+            };
+            let argb = if hovered_desktop {
+                cfg::DOCK_DESKTOP_HOVER_ARGB
+            } else {
+                cfg::DOCK_DESKTOP_ARGB
+            };
+            round_rect(g, rx, ry, bwid, bhei, bw / 2.0, argb);
+            // 命中区比细条宽一圈（细条本身太窄，不好点）
+            desktop_rect = Some(if vertical {
+                [0.0, ry - cfg::DOCK_DESKTOP_GAP * scale, cross, bhei + cfg::DOCK_DESKTOP_GAP * scale]
+            } else {
+                [rx - cfg::DOCK_DESKTOP_GAP * scale, 0.0, bwid + cfg::DOCK_DESKTOP_GAP * scale, cross]
+            });
         }
 
         let rect = GpRect { X: 0, Y: 0, Width: w, Height: h };
@@ -716,7 +992,7 @@ pub fn draw_dock(
 
         GdipDeleteGraphics(g);
         GdipDisposeImage(bmp as _);
-        DockRender { rgba, rects, tray_rects }
+        DockRender { rgba, rects, tray_rects, desktop_rect }
     }
 }
 
@@ -744,7 +1020,7 @@ pub struct PanelRender {
 pub const PIN_BASE: u32 = 1000;
 pub const TAB_BASE: u32 = 2000;
 
-fn row_width(row: &PanelRow, scale: f32) -> f32 {
+fn panel_row_width(row: &PanelRow, scale: f32) -> f32 {
     let mut w = 0.0;
     if !row.icon.is_empty() {
         w += measure_text(&to_u16(&row.icon), cfg::WIDGET_ICON_SIZE, FontKind::Symbol, scale).0
@@ -795,7 +1071,7 @@ pub fn panel_size(
         + tabs_width(tabs, scale);
     let mut inner = head;
     for r in rows {
-        inner = inner.max(row_width(r, scale));
+        inner = inner.max(panel_row_width(r, scale));
     }
     if rows.is_empty() {
         inner = inner.max(measure_text(&to_u16(empty), cfg::PANEL_ROW_SUB, FontKind::Cjk, scale).0);
@@ -1360,6 +1636,19 @@ pub fn to_premultiplied_bgra(rgba: &[u8]) -> Vec<u8> {
         out[j1] = ((chunk[1] as u32 * a + 127) / 255) as u8; // G
         out[j2] = ((chunk[0] as u32 * a + 127) / 255) as u8; // R
         out[j3] = chunk[3];
+    }
+    out
+}
+
+/// 预乘 RGBA → BGRA（只换通道序，不再预乘）。
+/// pillui 的 egui 光栅化输出已经是预乘 alpha，整体透明度由调用方连 RGB 一起乘。
+pub fn premultiplied_rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for (i, chunk) in rgba.chunks_exact(4).enumerate() {
+        out[i * 4] = chunk[2];
+        out[i * 4 + 1] = chunk[1];
+        out[i * 4 + 2] = chunk[0];
+        out[i * 4 + 3] = chunk[3];
     }
     out
 }

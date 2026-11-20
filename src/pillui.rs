@@ -1,0 +1,392 @@
+//! 顶部胶囊的 egui 软件后端（方案 C）：
+//! 窗口 / 消息 / 状态仍归 `window.rs` 的主线程 wndproc，这里只负责"画"——
+//! egui 立即模式布局（时钟 + widget + 闪烁图标格）→ epaint 网格 → 公共软件光栅化
+//! （`egui_soft`）→ 预乘 RGBA → 交回 `render::present()`（UpdateLayeredWindow）。
+//!
+//! 为什么不直接用 eframe 窗口：胶囊依赖 NOACTIVATE、逐像素透明、圆角命中，
+//! 且面板锚定/模块条/音乐条都挂在主线程的窗口几何上；软件后端把这些全保住。
+//!
+//! 交互：wndproc 把鼠标事件喂给 `push_input`（egui Pointer 事件，点坐标为
+//! 逻辑点），`paint` 返回点击 / 悬停进出事件，wndproc 按旧语义分发
+//! （widget 点击在按下时触发，对齐旧版手感）。
+
+use std::time::Instant;
+
+use eframe::egui;
+
+use crate::config as cfg;
+use crate::egui_soft::{argb, divider, SoftBackend};
+use crate::render::{FlashView, PillShape, WidgetItem};
+
+// ---------- 对外接口 ----------
+
+/// 单帧输入（wndproc 喂进来的鼠标事件；坐标一律**逻辑点** = 物理像素 / scale）
+#[derive(Default)]
+pub struct InputAcc {
+    events: Vec<egui::Event>,
+}
+
+impl InputAcc {
+    pub fn pointer_moved(&mut self, x: f32, y: f32) {
+        self.events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+    }
+    pub fn pointer_button(&mut self, x: f32, y: f32, pressed: bool) {
+        self.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(x, y),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+    pub fn pointer_left(&mut self) {
+        self.events.push(egui::Event::PointerGone);
+    }
+}
+
+/// 一次 paint 产出的交互事件（wndproc / App 按旧语义处理）
+#[derive(Debug)]
+pub enum PillEvent {
+    /// 按下了第 i 个 widget（按下即触发，对齐旧版）
+    WidgetClick(usize),
+    /// 按下了第 i 个托盘闪烁图标
+    FlashClick(usize),
+    /// 悬停进入 / 离开第 i 个闪烁图标
+    FlashEnter(usize),
+    FlashLeave,
+}
+
+/// 每帧传给 paint 的快照（数据仍由主线程 App 持有）
+pub struct View<'a> {
+    pub scale: f32,
+    /// 合并好的时钟文本（时间 + 日期一段，`clock::text()`）
+    pub clock: &'a str,
+    /// 留在胶囊里的 widget（已按 module_order 排好）
+    pub items: &'a [WidgetItem],
+    /// 托盘闪烁图标（排在最右）
+    pub flash: &'a [FlashView<'a>],
+    pub hovered_widget: Option<usize>,
+    pub hovered_flash: Option<usize>,
+    pub shape: PillShape,
+    /// 整体透明度 0..1（烘焙由 window.rs 做，这里只参与变化检测）
+    pub alpha: f32,
+}
+
+pub struct Painted {
+    /// false = 内容与上一帧完全一致，可跳过合成与上屏（纯鼠标路过的帧）
+    pub changed: bool,
+    pub w: i32,
+    pub h: i32,
+    /// 预乘 RGBA（w*h*4）
+    pub rgba: Vec<u8>,
+    /// 命中矩形（物理像素）：前 widget_kinds.len() 个是 widget，其余是闪烁图标
+    pub widget_rects: Vec<[f32; 4]>,
+    pub hovered_widget: Option<usize>,
+    pub hovered_flash: Option<usize>,
+    pub events: Vec<PillEvent>,
+}
+
+// ---------- PillUi ----------
+
+pub struct PillUi {
+    soft: SoftBackend,
+    input: InputAcc,
+    prev_flash_hover: Option<usize>,
+    last_hash: u64,
+    t0: Instant,
+}
+
+impl Default for PillUi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PillUi {
+    pub fn new() -> Self {
+        Self {
+            soft: SoftBackend::new(),
+            input: InputAcc::default(),
+            prev_flash_hover: None,
+            last_hash: 0,
+            t0: Instant::now(),
+        }
+    }
+
+    pub fn input(&mut self) -> &mut InputAcc {
+        &mut self.input
+    }
+
+    /// 画一帧。返回 `changed=false` 时 rgba/rects 无效（内容与上帧一致）。
+    pub fn paint(&mut self, v: &View) -> Painted {
+        let scale = v.scale.max(0.5);
+        self.soft.set_scale(scale);
+
+        // ---- 布局预量宽（egui 自己的字体度量，画和量用同一套 Galley） ----
+        let time_font = egui::FontId::proportional(cfg::TIME_SIZE);
+        let txt_font = egui::FontId::proportional(cfg::WIDGET_TEXT_SIZE);
+        let icon_font = egui::FontId::proportional(cfg::WIDGET_ICON_CELL * 0.85);
+        let clock_gal = self.soft.ctx().fonts_mut(|f| {
+            f.layout_no_wrap(v.clock.to_string(), time_font.clone(), egui::Color32::WHITE)
+        });
+        let cw = clock_gal.size().x;
+        let item_text: Vec<Option<std::sync::Arc<egui::Galley>>> = v
+            .items
+            .iter()
+            .map(|it| {
+                if it.text.is_empty() {
+                    None
+                } else {
+                    Some(self.soft.ctx().fonts_mut(|f| {
+                        f.layout_no_wrap(it.text.clone(), txt_font.clone(), egui::Color32::WHITE)
+                    }))
+                }
+            })
+            .collect();
+        let item_w: Vec<f32> = v
+            .items
+            .iter()
+            .zip(&item_text)
+            .map(|(it, t)| {
+                let mut w = 0.0;
+                if !it.icon.is_empty() {
+                    w += cfg::WIDGET_ICON_CELL;
+                    if !it.text.is_empty() {
+                        w += cfg::WIDGET_ICON_GAP;
+                    }
+                }
+                if let Some(g) = t {
+                    w += g.size().x;
+                }
+                w
+            })
+            .collect();
+
+        // ---- 总宽（与 content_width 的布局严格一致） ----
+        let padx = cfg::WIDGET_PAD_X;
+        let mut total = cfg::PAD_X + cw;
+        if !v.items.is_empty() {
+            total += cfg::GAP + 1.0 + cfg::GAP + padx;
+            for (i, _) in v.items.iter().enumerate() {
+                total += item_w[i] + 2.0 * padx + cfg::GAP;
+            }
+            total -= cfg::GAP;
+        }
+        if !v.flash.is_empty() {
+            total += cfg::GAP + 1.0 + cfg::GAP + padx;
+            let cell = cfg::FLASH_ICON + 2.0 * padx;
+            for _ in 0..v.flash.len() {
+                total += cell + cfg::GAP;
+            }
+            total -= cfg::GAP;
+        }
+        total += cfg::PAD_X;
+
+        let w = (total * scale).ceil() as i32;
+        let h = (cfg::PILL_H * scale).ceil() as i32;
+        let (fw, fh) = (w as f32 / scale, h as f32 / scale);
+
+        // ---- egui 一帧 ----
+        let input = egui::RawInput {
+            time: Some(self.t0.elapsed().as_secs_f64()),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(fw, fh),
+            )),
+            events: std::mem::take(&mut self.input.events),
+            ..Default::default()
+        };
+
+        let mut rects_pts: Vec<[f32; 4]> = Vec::new();
+        let mut events: Vec<PillEvent> = Vec::new();
+        let (mut hov_w, mut hov_f) = (None, None);
+        // 克隆 Context：闭包里要用 &mut soft（上传闪烁图标纹理），
+        // 而 Context 内部是 Arc，clone 共享同一上下文
+        let ctx = self.soft.ctx().clone();
+        let soft = &mut self.soft;
+
+        let out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    let p = ui.painter().clone();
+                    let r = (fh / 2.0).min(255.0);
+                    let (nw, ne, sw, se) = match v.shape {
+                        PillShape::Float => (r, r, r, r),
+                        PillShape::Island => (0.0, 0.0, r, r),
+                        PillShape::Bottom => (r, r, 0.0, 0.0),
+                    };
+                    p.rect_filled(
+                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
+                        egui::CornerRadius { nw: nw as u8, ne: ne as u8, sw: sw as u8, se: se as u8 },
+                        argb(cfg::BG_ARGB),
+                    );
+
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_space(cfg::PAD_X);
+                        let cx = ui.cursor().left();
+                        p.text(
+                            egui::pos2(cx, fh / 2.0),
+                            egui::Align2::LEFT_CENTER,
+                            v.clock,
+                            time_font.clone(),
+                            argb(cfg::TIME_ARGB),
+                        );
+                        ui.add_space(cw);
+
+                        // ---- widget 区 ----
+                        if !v.items.is_empty() {
+                            ui.add_space(cfg::GAP);
+                            divider(&p, ui.cursor().left(), fh);
+                            ui.add_space(1.0 + cfg::GAP + padx);
+                            for (i, item) in v.items.iter().enumerate() {
+                                if i > 0 {
+                                    ui.add_space(cfg::GAP);
+                                }
+                                let hw = item_w[i] + 2.0 * padx;
+                                let (rect, resp) =
+                                    ui.allocate_exact_size(egui::vec2(hw, cfg::ICON_BG), egui::Sense::click());
+                                rects_pts.push([rect.left(), rect.top(), rect.width(), rect.height()]);
+                                if resp.hovered() {
+                                    hov_w = Some(i);
+                                    p.rect_filled(rect, 8.0_f32, argb(cfg::HOVER_ARGB));
+                                }
+                                if resp.contains_pointer()
+                                    && ui.input(|inp| inp.pointer.primary_pressed())
+                                {
+                                    events.push(PillEvent::WidgetClick(i));
+                                }
+                                let mut cx = rect.left() + padx;
+                                if !item.icon.is_empty() {
+                                    p.text(
+                                        egui::pos2(cx + cfg::WIDGET_ICON_CELL / 2.0, rect.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        &item.icon,
+                                        icon_font.clone(),
+                                        argb(item.icon_argb),
+                                    );
+                                    cx += cfg::WIDGET_ICON_CELL;
+                                    if !item.text.is_empty() {
+                                        cx += cfg::WIDGET_ICON_GAP;
+                                    }
+                                }
+                                if !item.text.is_empty() {
+                                    p.text(
+                                        egui::pos2(cx, rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        &item.text,
+                                        txt_font.clone(),
+                                        argb(cfg::TEXT_ARGB),
+                                    );
+                                }
+                            }
+                        }
+
+                        // ---- 托盘闪烁图标区 ----
+                        if !v.flash.is_empty() {
+                            ui.add_space(cfg::GAP);
+                            divider(&p, ui.cursor().left(), fh);
+                            ui.add_space(1.0 + cfg::GAP + padx);
+                            let cell = cfg::FLASH_ICON + 2.0 * padx;
+                            for (i, f) in v.flash.iter().enumerate() {
+                                if i > 0 {
+                                    ui.add_space(cfg::GAP);
+                                }
+                                let (rect, resp) =
+                                    ui.allocate_exact_size(egui::vec2(cell, cfg::ICON_BG), egui::Sense::click());
+                                rects_pts.push([rect.left(), rect.top(), rect.width(), rect.height()]);
+                                if resp.hovered() {
+                                    hov_f = Some(i);
+                                    p.rect_filled(rect, 8.0_f32, argb(cfg::HOVER_ARGB));
+                                }
+                                if resp.contains_pointer()
+                                    && ui.input(|inp| inp.pointer.primary_pressed())
+                                {
+                                    events.push(PillEvent::FlashClick(i));
+                                }
+                                if !f.dim {
+                                    // 灭帧留空位（格子保留，胶囊宽度不抖）
+                                    let tex = soft.soft_image(f.rgba, f.px as usize, f.px as usize);
+                                    let side = cfg::FLASH_ICON;
+                                    let ir = egui::Rect::from_min_size(
+                                        egui::pos2(rect.left() + padx, (fh - side) / 2.0),
+                                        egui::vec2(side, side),
+                                    );
+                                    p.image(
+                                        tex.id(),
+                                        ir,
+                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                });
+        });
+
+        // 悬停进出事件（进入发 hover、离开发 leave，wndproc 转发真实托盘）
+        match (hov_f, self.prev_flash_hover) {
+            (Some(i), None) => events.push(PillEvent::FlashEnter(i)),
+            (None, Some(_)) => events.push(PillEvent::FlashLeave),
+            (Some(i), Some(_)) if Some(i) != self.prev_flash_hover => {
+                events.push(PillEvent::FlashLeave);
+                events.push(PillEvent::FlashEnter(i));
+            }
+            _ => {}
+        }
+        self.prev_flash_hover = hov_f;
+
+        // ---- 纹理增量 ----
+        self.soft.update_textures(&out.textures_delta);
+
+        // ---- 变化检测：内容 / 尺寸 / 悬停 / 事件，任一变了才算真要上屏 ----
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |h: &mut u64, b: &[u8]| {
+            for &x in b {
+                *h = (*h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        mix(&mut hash, v.clock.as_bytes());
+        for (it, t) in v.items.iter().zip(&item_text) {
+            mix(&mut hash, it.icon.as_bytes());
+            mix(&mut hash, &it.icon_argb.to_le_bytes());
+            mix(&mut hash, it.text.as_bytes());
+            mix(&mut hash, &t.as_ref().map_or(0, |g| g.size().x.to_bits()).to_le_bytes());
+        }
+        for f in v.flash {
+            mix(&mut hash, f.rgba);
+            mix(&mut hash, &[f.dim as u8]);
+        }
+        mix(&mut hash, &v.alpha.to_bits().to_le_bytes());
+        mix(&mut hash, &[matches!(v.shape, PillShape::Float) as u8, matches!(v.shape, PillShape::Island) as u8]);
+        mix(&mut hash, &hov_w.map_or(0xffu8, |i| i as u8).to_le_bytes());
+        mix(&mut hash, &hov_f.map_or(0xffu8, |i| i as u8).to_le_bytes());
+        mix(&mut hash, &w.to_le_bytes());
+        mix(&mut hash, &h.to_le_bytes());
+        let changed = hash != self.last_hash || !events.is_empty();
+        self.last_hash = hash;
+
+        if !changed {
+            return Painted {
+                changed: false,
+                w,
+                h,
+                rgba: Vec::new(),
+                widget_rects: Vec::new(),
+                hovered_widget: hov_w,
+                hovered_flash: hov_f,
+                events,
+            };
+        }
+
+        // ---- 光栅化 ----
+        let rgba = self.soft.rasterize(out.shapes, out.pixels_per_point, w, h);
+
+        let widget_rects = rects_pts
+            .iter()
+            .map(|r| [r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale])
+            .collect();
+
+        Painted { changed: true, w, h, rgba, widget_rects, hovered_widget: hov_w, hovered_flash: hov_f, events }
+    }
+}

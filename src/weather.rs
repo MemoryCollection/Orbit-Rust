@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config as cfg;
 use crate::json::Json;
 use crate::net;
+use crate::settings;
 
 pub struct Day {
     pub label: String,
@@ -233,11 +234,16 @@ fn amap_code(text: &str) -> u8 {
 // ---------- 网络 ----------
 
 fn fetch(adcode: Option<String>, pos: Option<(f64, f64, String)>) -> Result<Snapshot, String> {
+    // 数据源由设置页决定（weather_source）；高德失败仍回落 Open-Meteo，
+    // 但指定 Open-Meteo 时不走高德
     let mut amap_err = String::new();
-    if !cfg::AMAP_KEY.is_empty() {
-        match fetch_amap(cfg::AMAP_KEY, adcode.as_deref()) {
-            Ok(s) => return Ok(s),
-            Err(e) => amap_err = e,
+    if settings::weather_source() == settings::WeatherSource::Amap {
+        let key = settings::amap_key();
+        if !key.is_empty() {
+            match fetch_amap(&key, adcode.as_deref()) {
+                Ok(s) => return Ok(s),
+                Err(e) => amap_err = e,
+            }
         }
     }
     match fetch_open_meteo(pos) {

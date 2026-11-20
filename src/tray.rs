@@ -51,6 +51,9 @@ pub struct TrayItem {
     pub src: &'static str,
     /// 这一刻真实托盘上的图标是否正在"灭"（应用用闪烁提示新消息）
     pub dim: bool,
+    /// 最近一次看到"灭帧"的时刻：胶囊用它判断"这个图标正在闪烁"（新消息提醒）。
+    /// 一直亮着的图标是 None；灭帧之后如果一直没再闪，靠 `cfg::FLASH_WINDOW_MS` 过期。
+    pub flash_at: Option<Instant>,
     /// 图标"亮"的时候的不透明像素占比，闪烁判定拿它当参考，缓慢向当前值衰减
     ink_hi: f32,
     /// 托盘按钮元素，点击时用它的 LegacyIAccessible（UIA 模式）
@@ -59,6 +62,29 @@ pub struct TrayItem {
     pub host: Option<trayhost::Icon>,
     /// 图标本身的屏幕矩形（不是按钮矩形：按钮是 32×48 的整条）
     pub(crate) icon_rect: RECT,
+}
+
+impl TrayItem {
+    /// 跨会话稳定的标识，设置页用它记住"这个图标被单独隐藏了"：
+    /// 有 GUID 用 GUID；否则 exe + 应用自己的 uID；再不行退回名字。
+    /// 不用 hWnd（每次启动都变），也不用 tooltip（会随状态变）。
+    pub fn key(&self) -> String {
+        icon_key(self.host.as_ref(), &self.exe, &self.name)
+    }
+}
+
+/// 托盘图标的稳定键（详见 `TrayItem::key`）
+pub fn icon_key(host: Option<&trayhost::Icon>, exe: &str, name: &str) -> String {
+    if let Some(h) = host {
+        if h.guid != windows::core::GUID::default() {
+            return format!("g:{:?}", h.guid);
+        }
+        if !exe.is_empty() {
+            return format!("e:{}#{}", exe.to_lowercase(), h.uid);
+        }
+        return format!("n:{}#{}", name.trim(), h.uid);
+    }
+    format!("n:{}|{}", exe.to_lowercase(), name.trim())
 }
 
 pub struct TrayMirror {
@@ -204,6 +230,7 @@ impl TrayMirror {
                 rgba,
                 src,
                 dim: false,
+                flash_at: None,
                 ink_hi: 0.0,
                 element: Some(element),
                 host: None,
@@ -249,6 +276,14 @@ impl TrayMirror {
             return false;
         }
         self.host_gen = gen;
+
+        // 整表重建会把上一批的闪烁时刻冲掉：按稳定键把仍在窗口内的带过来
+        // （灭帧之后一直亮着的图标，2.5s 后自然过期，不会永远"闪烁"）
+        let prev_flash: std::collections::HashMap<String, Option<Instant>> = self
+            .items
+            .iter()
+            .map(|it| (it.key(), it.flash_at))
+            .collect();
 
         let mut items = Vec::with_capacity(icons.len());
         for ic in &icons {
@@ -303,6 +338,12 @@ impl TrayMirror {
                 rgba,
                 src,
                 dim: ic.dim,
+                // 这帧是"灭"= 正在闪烁；亮帧沿用上一批的闪烁时刻（窗口内仍算闪烁）
+                flash_at: if ic.dim {
+                    Some(Instant::now())
+                } else {
+                    prev_flash.get(&icon_key(Some(ic), &ic.exe, &ic.tip)).copied().flatten()
+                },
                 ink_hi: 0.0,
                 element: None,
                 host: Some(ic.clone()),
@@ -349,6 +390,9 @@ impl TrayMirror {
             let dim = it.ink_hi > 0.12 && ink < it.ink_hi * 0.5;
             if dim != it.dim {
                 it.dim = dim;
+                if dim {
+                    it.flash_at = Some(Instant::now());
+                }
                 changed = true;
                 trace(&format!("{} {}（墨量 {:.2}/{:.2}）", it.name, if dim { "灭" } else { "亮" }, ink, it.ink_hi));
             }

@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging as wm;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetWindowLongPtrW, IsWindowVisible, LoadCursorW,
+    CreateWindowExW, DefWindowProcW, GetWindowLongPtrW, LoadCursorW,
     RegisterClassW, SendMessageW, SetWindowLongPtrW, SetWindowPos, ShowWindow, BS_PUSHBUTTON,
     CREATESTRUCTW, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
     GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE,

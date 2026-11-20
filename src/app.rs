@@ -18,6 +18,8 @@ use crate::mailview;
 use crate::musicbar;
 use crate::panel;
 use crate::render;
+use crate::settingsui;
+use crate::widgetbar;
 use crate::window::{wndproc, App};
 
 /// 提示条窗口过程：什么都不做，全部交给默认处理（窗口只是画布）
@@ -115,6 +117,10 @@ pub fn run(hide_taskbar: bool) {
         (*app_ptr).init(hwnd);
         // 音乐条要往胶囊窗口回传点击，所以等 hwnd 有了再建
         musicbar::init(hinstance.into(), hwnd);
+        // 分离出去的模块条（胶囊左右各一条）同理
+        widgetbar::init(hinstance.into(), hwnd);
+        // 设置页面（独立小窗，启动时建好、平时隐藏）
+        settingsui::init(hinstance.into());
         (*app_ptr).render();
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
@@ -136,6 +142,8 @@ pub fn run(hide_taskbar: bool) {
                 SetTimer(dock_hwnd, 3, cfg::DOCK_POLL_MS, None);
                 // 托盘闪烁（新消息提示）采样：周期短，独立于 2s 的整表重扫
                 SetTimer(dock_hwnd, 5, cfg::TRAY_FLASH_MS, None);
+                // 设置变化（托盘/返回桌面按钮开关会改 Dock 宽度）500ms 检查一次
+                SetTimer(dock_hwnd, 6, 500, None);
             }
         }
 
@@ -144,6 +152,8 @@ pub fn run(hide_taskbar: bool) {
         SetTimer(hwnd, 1, 500, None);
         SetTimer(hwnd, 2, 2000, None);
         SetTimer(hwnd, 4, 200, None);
+        // 托盘闪烁跟随：Dock 每 70ms 采样真实托盘并发布快照，胶囊按版本号重绘
+        SetTimer(hwnd, 6, cfg::TRAY_FLASH_MS, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {

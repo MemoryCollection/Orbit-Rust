@@ -4,13 +4,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_ALL, CLSCTX_INPROC_SERVER, STGM_READ};
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
@@ -22,8 +23,8 @@ use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Shell::{
-    IShellLinkW, SHGetFileInfoW, SHGetImageList, ShellExecuteW, ShellLink, SHFILEINFOW, SHGFI_ICON,
-    SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHIL_JUMBO, SLGP_RAWPATH,
+    IShellDispatch4, IShellLinkW, SHGetFileInfoW, SHGetImageList, Shell, ShellExecuteW, ShellLink,
+    SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHIL_JUMBO, SLGP_RAWPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, EnumWindows, GetClassNameW, GetForegroundWindow,
@@ -37,7 +38,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config as cfg;
+use crate::dockview::DockView;
+use crate::notify;
 use crate::render;
+use crate::settings;
 use crate::tray::TrayMirror;
 use crate::flyout;
 use crate::trayhost;
@@ -47,8 +51,48 @@ use crate::traymsg;
 const T_RESCAN: usize = 3;
 /// 托盘闪烁采样（应用用一闪一闪提示新消息，跟随真实状态就得采得够快）
 const T_FLASH: usize = 5;
+/// 设置变化轮询（设置页面改值后宽度/托盘开关要立刻跟上）
+const T_SETTINGS: usize = 6;
 /// 后台扫完"图标回调消息"后叫醒窗口线程（lParam 不用，下标在 wParam）
 const WM_TRAY_SCAN: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x71;
+
+// ---------- 胶囊右侧的"托盘闪烁"快照 ----------
+//
+// 应用用托盘图标一闪一闪提示新消息（微信就是这样）。Dock 的 70ms 采样定时器
+// 已经跟着真实闪烁走，这里把"正在闪烁的图标"发布成一份快照（图标像素 + 亮/灭帧
+// + 回调目标 + 版本号），顶部胶囊按版本号跟随——胶囊右侧就会显示同一个图标、
+// 以同样的节奏闪，点它等于点托盘图标。
+
+/// 快照里的一条闪烁图标
+#[derive(Clone)]
+pub struct FlashIcon {
+    /// 托盘图标的稳定键（`tray::TrayItem::key`）
+    pub key: String,
+    /// 显示名（tooltip 首行）
+    pub name: String,
+    /// 图标像素（straight RGBA，px*px*4）
+    pub rgba: Vec<u8>,
+    /// 位图边长
+    pub px: i32,
+    /// 这一帧是否"灭"（灭 = 图标消失帧，胶囊留空位不画）
+    pub dim: bool,
+    /// 回调目标（悬停/点击转发用；UIA 兜底模式可能还没有）。
+    /// 存 `Raw` 而不是 `Target`：HWND 里是裸指针，静态快照要求 Send/Sync。
+    pub target: Option<traymsg::Raw>,
+}
+
+static FLASH_SET: Mutex<Vec<FlashIcon>> = Mutex::new(Vec::new());
+static FLASH_VER: AtomicU64 = AtomicU64::new(0);
+
+/// 快照版本号：正在闪烁的图标集合（或亮/灭帧）变化时 +1
+pub fn flash_version() -> u64 {
+    FLASH_VER.load(Ordering::Relaxed)
+}
+
+/// 当前正在闪烁的图标（胶囊每帧取一次；量很小，直接克隆）
+pub fn flash_icons() -> Vec<FlashIcon> {
+    FLASH_SET.lock().map(|v| v.clone()).unwrap_or_default()
+}
 
 /// 点击目标
 enum Target {
@@ -76,6 +120,8 @@ pub struct Dock {
     hwnd: HWND,
     /// 悬停提示条窗口（独立的点击穿透分层窗，画在 Dock 上方）
     tip: HWND,
+    /// egui 软件后端（Dock + 提示条绘制）
+    view: DockView,
     scale: f32,
     items: Vec<DockItem>,
     hovered: Option<usize>,
@@ -84,6 +130,9 @@ pub struct Dock {
     rects: Vec<[f32; 3]>,
     /// 每个托盘图标槽位 [x, y, size]（client 坐标）
     tray_rects: Vec<[f32; 3]>,
+    /// 右端"返回桌面"细长条的命中矩形
+    desktop_rect: Option<[f32; 4]>,
+    hovered_desktop: bool,
     /// 托盘镜像（UIA 枚举 + PrintWindow 抠图）
     tray: TrayMirror,
     /// 隐藏掉"和 Dock 图标重复"的之后，实际显示的托盘下标（按显示顺序）
@@ -111,6 +160,8 @@ pub struct Dock {
     last_hover_move: Option<Instant>,
     /// 上次左键按下的时刻（判双击）
     last_lclick: Option<Instant>,
+    /// 上次见过的设置版本号（变了就重绘：托盘开关、返回桌面按钮都会改宽度）
+    seen_settings: u64,
 }
 
 pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -138,6 +189,15 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 if dock.poll_flash() {
                     dock.render();
                 }
+                // 就算没有新帧，也要把"闪烁停了"的图标从快照里过期掉
+                dock.publish_flash();
+                LRESULT(0)
+            }
+            WM_TIMER if w.0 == T_SETTINGS => {
+                // 设置页面改了托盘开关 / 返回桌面按钮，宽度和内容都要重排
+                if dock.seen_settings != settings::version() {
+                    dock.render();
+                }
                 LRESULT(0)
             }
             WM_NCHITTEST => {
@@ -159,11 +219,13 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             WM_MOUSEMOVE => {
                 let x = (l.0 & 0xFFFF) as u16 as i16 as i32;
                 let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-                let idx = dock.index_at(x as f32, y as f32);
-                let tidx = dock.tray_index_at(x as f32, y as f32);
-                if idx != dock.hovered || tidx != dock.hovered_tray {
+                let desk = dock.desktop_at(x as f32, y as f32);
+                let idx = if desk { None } else { dock.index_at(x as f32, y as f32) };
+                let tidx = if desk { None } else { dock.tray_index_at(x as f32, y as f32) };
+                if idx != dock.hovered || tidx != dock.hovered_tray || desk != dock.hovered_desktop {
                     dock.hovered = idx;
                     dock.hovered_tray = tidx;
+                    dock.hovered_desktop = desk;
                     dock.render();
                     // 悬停即显示提示条（托盘名字来自 UIA，任务图标用程序名）
                     dock.update_tip();
@@ -204,9 +266,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 // 短路后第二个 take 不会执行，托盘悬停状态会卡住
                 let had_app = dock.hovered.take().is_some();
                 let had_tray = dock.hovered_tray.take().is_some();
+                let had_desk = std::mem::replace(&mut dock.hovered_desktop, false);
                 // 先清悬停态再转发：否则 forward_hover 会以为还停着，不发 leave
                 dock.forward_hover();
-                if had_app || had_tray {
+                if had_app || had_tray || had_desk {
                     dock.render();
                 }
                 LRESULT(0)
@@ -214,6 +277,13 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             WM_LBUTTONDOWN => {
                 let x = (l.0 & 0xFFFF) as u16 as i16 as i32;
                 let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                if dock.desktop_at(x as f32, y as f32) {
+                    // 右端细长条：显示桌面 / 再点还原
+                    crate::settingsui::hide();
+                    dock.hide_tip();
+                    dock.toggle_desktop();
+                    return LRESULT(0);
+                }
                 if let Some(idx) = dock.tray_index_at(x as f32, y as f32) {
                     // 有回调目标就直接投消息（不移动光标）；没有才退回 UIA 默认动作
                     let now = Instant::now();
@@ -244,6 +314,11 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 // 只记下来，等 WM_RBUTTONUP 再注入：按下瞬间注入的右键会和这次物理按键
                 // 合成一次"按下-抬起"，真实托盘图标收不到点击
                 dock.pending_right = dock.tray_index_at(x as f32, y as f32);
+                // 托盘图标之外（Dock 空白处 / 返回桌面细长条）右键 = 打开设置页面
+                if dock.pending_right.is_none() {
+                    dock.hide_tip();
+                    crate::settingsui::toggle();
+                }
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
@@ -313,12 +388,15 @@ impl Dock {
         Self {
             hwnd: HWND::default(),
             tip: HWND::default(),
+            view: DockView::new(),
             scale: 1.0,
             items: Vec::new(),
             hovered: None,
             mouse_tracked: false,
             rects: Vec::new(),
             tray_rects: Vec::new(),
+            desktop_rect: None,
+            hovered_desktop: false,
             tray: TrayMirror::default(),
             tray_shown: Vec::new(),
             hovered_tray: None,
@@ -333,6 +411,7 @@ impl Dock {
             hover_sent: None,
             last_hover_move: None,
             last_lclick: None,
+            seen_settings: 0,
         }
     }
 
@@ -340,6 +419,7 @@ impl Dock {
         self.hwnd = hwnd;
         self.scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
         self.taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+        self.seen_settings = settings::version();
         self.tip = unsafe { create_tip_window() };
         self.tray.attach_host();
         self.scan();
@@ -349,7 +429,7 @@ impl Dock {
 
     /// 轮询托盘镜像；返回是否有变化（需要重绘）
     fn poll_tray(&mut self) -> bool {
-        if !cfg::SHOW_TRAY {
+        if !settings::show_tray() {
             return false;
         }
         let px = (cfg::DOCK_TRAY_ICON * self.scale).round() as i32;
@@ -366,7 +446,7 @@ impl Dock {
 
     /// 快速采样托盘图标的"亮/灭"（应用用闪烁提示新消息）；返回是否需要重绘
     fn poll_flash(&mut self) -> bool {
-        if !cfg::SHOW_TRAY {
+        if !settings::show_tray() {
             return false;
         }
         let px = (cfg::DOCK_TRAY_ICON * self.scale).round() as i32;
@@ -388,7 +468,16 @@ impl Dock {
         let mut v = Vec::with_capacity(self.tray.items.len());
         for it in &self.tray.items {
             let t = it.host.as_ref().map(|h| {
-                let ver = if h.ver == 3 { 3 } else { 4 };
+                // 按图标**真实注册的协议版本**发消息：
+                //   v4 → wParam = 屏幕坐标、lParam = (uid<<16)|事件
+                //   v0/v3 → wParam = uid、lParam = 事件
+                // 以前这里一律当成 v4，v0 的应用（火绒这类没调 NIM_SETVERSION 的）
+                // 会把坐标当 uid，左右键和悬停全部没反应；微信注册的就是 v4，走的还是同一条路。
+                let ver = match h.ver {
+                    3 => 3,
+                    4 => 4,
+                    _ => 0,
+                };
                 traymsg::Target {
                     pid: h.pid,
                     hwnd: windows::Win32::Foundation::HWND(h.hwnd as *mut core::ffi::c_void),
@@ -399,6 +488,17 @@ impl Dock {
             });
             v.push(t);
         }
+        crate::vlog!(
+            "[dock] 回调目标重建：{}",
+            v.iter()
+                .zip(self.tray.items.iter())
+                .map(|(t, it)| match t {
+                    Some(t) => format!("{}v{}(msg={:#x})", short_exe(&it.exe), t.ver, t.msg),
+                    None => format!("{}无", short_exe(&it.exe)),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         self.host_targets = v;
     }
 
@@ -456,7 +556,13 @@ impl Dock {
         if unsafe { GetWindowRect(self.hwnd, &mut cap) }.is_err() {
             return;
         }
-        flyout::watch(t.pid, t.hwnd, cap, &label);
+        // 弹窗要"顶在鼠标所在的那个图标上方"，不是屏幕正中间。
+        // 锚点用图标中心（鼠标正停在这个图标上），不用实时光标：悬停会被反复重发，
+        // 用光标的话鼠标在图标里微动一下卡片就跟着左右滑。
+        // Dock 靠上时卡片改摆到 Dock **下方**（上面出屏）。
+        let anchor_x = self.tray_center(idx).0;
+        let below = settings::dock_anchor() == crate::settings::DockAnchor::Top;
+        flyout::watch(t.pid, t.hwnd, cap, anchor_x, &label, below);
     }
 
     /// 当前悬停的托盘图标中心（屏幕坐标）
@@ -601,12 +707,21 @@ impl Dock {
     }
 
     pub fn render(&mut self) {
-        // 先定"哪些托盘图标要显示"：和 Dock 图标重复的藏掉
+        // 先定"哪些托盘图标要显示"（只滤设置里单独隐藏的），
+        // 再把和托盘同程序的运行项从 Dock 应用位藏掉：任务栏图标隐藏、托盘图标保留
         self.refresh_tray_shown();
+        self.hide_dock_duplicates();
+        self.seen_settings = settings::version();
+        let show_tray = settings::show_tray();
+        let show_desktop = settings::show_desktop_btn();
         let n = self.items.len();
-        let n_tray = if cfg::SHOW_TRAY { self.tray_shown.len() } else { 0 };
-        let w = render::dock_width(n, n_tray, self.scale).ceil() as i32;
-        let h = (cfg::DOCK_H * self.scale).ceil() as i32;
+        let n_tray = if show_tray { self.tray_shown.len() } else { 0 };
+        // 靠哪条边：下/上是水平条，左/右是竖排条
+        let anchor = settings::dock_anchor();
+        let vertical = anchor.is_vertical();
+        let (lw, lh) = crate::dockview::dock_size(n, n_tray, show_tray, show_desktop, vertical);
+        let w = (lw * self.scale).ceil() as i32;
+        let h = (lh * self.scale).ceil() as i32;
         self.size = (w, h);
 
         if self.hovered.map(|i| i >= n).unwrap_or(false) {
@@ -630,25 +745,36 @@ impl Dock {
             .iter()
             .map(|it| if it.dim { blank.as_slice() } else { it.rgba.as_slice() })
             .collect();
-        let out = render::draw_dock(
+        let out = self.view.paint(
             w, h, self.scale, &icons, self.hovered, &tray_icons, self.hovered_tray,
+            show_tray, show_desktop, self.hovered_desktop, vertical,
         );
         self.rects = out.rects.clone();
         self.tray_rects = out.tray_rects.clone();
-        let bgra = render::to_premultiplied_bgra(&out.rgba);
+        self.desktop_rect = out.desktop_rect;
+        // egui 软件后端输出已是预乘 RGBA，直接换 BGRA 上屏
+        let bgra = render::premultiplied_rgba_to_bgra(&out.rgba);
         render::present(self.hwnd, &bgra, w, h);
         crate::vlog!(
-            "[dock] w={w} apps={} tray={}/{} rects={:?} tray_rects={:?} hovered_tray={:?}",
-            self.items.len(), n_tray, self.tray.items.len(), self.rects, self.tray_rects, self.hovered_tray
+            "[dock] anchor={:?} w={w} h={h} apps={} tray={}/{} desktop={:?} rects={:?} tray_rects={:?} hovered_tray={:?}",
+            anchor, self.items.len(), n_tray, self.tray.items.len(), self.desktop_rect, self.rects,
+            self.tray_rects, self.hovered_tray
         );
 
-        // 定位：水平按"屏幕矩形"居中（与顶部胶囊同一基准，任务栏在侧边时也不会偏），
-        // 垂直贴屏幕底（原生任务栏还占着工作区时，落在它上方）
+        // 定位：沿 dock_anchor 贴对应的屏幕边。
+        // 水平（下/上）按"屏幕矩形"居中；垂直（左/右）竖向居中。
         let mi = crate::window::primary_monitor();
         let bottom = if crate::hide::is_active() { mi.rcMonitor.bottom } else { mi.rcWork.bottom };
         let mon = mi.rcMonitor;
-        let x = mon.left + (mon.right - mon.left - w) / 2;
-        let y = bottom - h - (cfg::DOCK_BOTTOM_MARGIN as f32 * self.scale) as i32;
+        let (x, y) = match anchor {
+            crate::settings::DockAnchor::Bottom => (
+                mon.left + (mon.right - mon.left - w) / 2,
+                bottom - h - (cfg::DOCK_BOTTOM_MARGIN as f32 * self.scale) as i32,
+            ),
+            crate::settings::DockAnchor::Top => (mon.left + (mon.right - mon.left - w) / 2, mon.top),
+            crate::settings::DockAnchor::Left => (mon.left, mon.top + (mon.bottom - mon.top - h) / 2),
+            crate::settings::DockAnchor::Right => (mon.right - w, mon.top + (mon.bottom - mon.top - h) / 2),
+        };
         unsafe {
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
         }
@@ -659,6 +785,63 @@ impl Dock {
         if self.tray.hosted() {
             crate::trayhost::set_tray_host_size(x, y, w, h);
             self.sync_host_layout(x, y);
+        }
+
+        // 托盘成员/目标变了，闪烁快照跟着刷新（70ms 定时器里也会再发一次）
+        self.publish_flash();
+    }
+
+    /// 把"正在闪烁的托盘图标"发布成胶囊消费的快照（见 `FlashIcon`）。
+    /// 集合或亮/灭帧没变就不动版本号，胶囊那边靠版本号判断要不要重绘。
+    fn publish_flash(&mut self) {
+        let now = Instant::now();
+        // 微信提示音：拿"上一轮快照里在闪的键"对比，图标从"没在闪"变"在闪"
+        // 的那一下响一声（一轮提醒只响一次；亮灭交替不会反复触发）
+        let was_flashing: HashSet<String> = FLASH_SET
+            .lock()
+            .map(|v| v.iter().map(|f| f.key.clone()).collect())
+            .unwrap_or_default();
+        let mut wx_new = false;
+        let mut snap: Vec<FlashIcon> = Vec::new();
+        if settings::show_tray() {
+            for &i in &self.tray_shown {
+                let Some(it) = self.tray.items.get(i) else { continue };
+                let Some(t) = it.flash_at else { continue };
+                if now.duration_since(t).as_millis() as u64 > cfg::FLASH_WINDOW_MS {
+                    continue;
+                }
+                let key = it.key();
+                if settings::wechat_sound()
+                    && !was_flashing.contains(&key)
+                    && !wx_new
+                    && notify::is_wechat(&it.name, &it.exe)
+                {
+                    wx_new = true;
+                }
+                let px = ((it.rgba.len() / 4) as f32).sqrt().round() as i32;
+                snap.push(FlashIcon {
+                    key,
+                    name: it.name.clone(),
+                    rgba: it.rgba.clone(),
+                    px: if px > 0 { px } else { 0 },
+                    dim: it.dim,
+                    target: self.host_targets.get(i).cloned().flatten().map(|t| t.raw()),
+                });
+            }
+        }
+        if wx_new {
+            notify::play_wechat();
+        }
+        let sig: Vec<(String, bool)> = snap.iter().map(|f| (f.key.clone(), f.dim)).collect();
+        let mut changed = true;
+        if let Ok(cur) = FLASH_SET.lock() {
+            changed = cur.iter().map(|f| (f.key.clone(), f.dim)).collect::<Vec<_>>() != sig;
+        }
+        if changed {
+            if let Ok(mut cur) = FLASH_SET.lock() {
+                *cur = snap;
+            }
+            FLASH_VER.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -690,76 +873,96 @@ impl Dock {
         crate::trayhost::set_placements(placements);
     }
 
-    /// 托盘图标去重：Dock 上已有的程序不再重复显示托盘图标。
-    /// 多开（同一个 exe 的托盘图标数和 Dock 图标数对不上）时全部保留——
-    /// 分不清该藏哪一个，藏错了会让某个实例彻底没有入口（微信多开就是这样）。
+    /// 托盘显示集合：只滤掉设置页里单独关掉的图标（`hide_tray`），
+    /// 其余全部显示。托盘图标**一律不因与 Dock 重复而隐藏**——重复的程序
+    /// 反过来从 Dock 应用位藏掉（见 `hide_dock_duplicates`）。
     fn refresh_tray_shown(&mut self) {
         let n = self.tray.items.len();
-        if !cfg::SHOW_TRAY {
+        if !settings::show_tray() {
             self.tray_shown.clear();
             return;
         }
-        // Dock 里"代表可见窗口"的程序 → 图标数
-        let mut on_dock: BTreeMap<String, usize> = BTreeMap::new();
-        for it in &self.items {
-            if it.running && !it.exe.is_empty() {
-                *on_dock.entry(it.exe.clone()).or_insert(0) += 1;
-            }
-        }
-        if n == 0 || on_dock.is_empty() {
-            self.tray_shown = (0..n).collect();
-            return;
-        }
-
-        // 每个托盘图标归属到哪个程序：进程 exe 优先；explorer 托管的（XAML 树在导出器
-        // 进程里）拿名字到 Dock 项里找
-        let keys: Vec<Option<String>> = self
-            .tray
-            .items
-            .iter()
-            .map(|t| {
-                if !t.exe.is_empty() && !t.exe.ends_with("explorer.exe") {
-                    return Some(t.exe.clone());
-                }
-                let norm = normalize_name(&t.name);
-                if norm.len() < 3 {
-                    return None;
-                }
-                self.items
-                    .iter()
-                    .filter(|d| d.running && !d.exe.is_empty() && !d.norm.is_empty())
-                    .find(|d| d.norm.contains(&norm) || norm.contains(&d.norm))
-                    .map(|d| d.exe.clone())
+        let hidden = settings::hidden_tray();
+        self.tray_shown = (0..n)
+            .filter(|&i| {
+                self.tray
+                    .items
+                    .get(i)
+                    .map_or(false, |it| !hidden.iter().any(|k| *k == it.key()))
             })
             .collect();
+    }
 
-        let mut tray_count: BTreeMap<String, usize> = BTreeMap::new();
-        for k in keys.iter().flatten() {
-            *tray_count.entry(k.clone()).or_insert(0) += 1;
+    /// 同一个进程的图标同时出现在托盘和 Dock 应用位时：隐藏"任务栏图标"，
+    /// 托盘图标保留。托盘图标被设置页单独隐藏的（不在 tray_shown 里）不算，
+    /// Dock 图标照常显示。explorer 托管的图标（exe 是 explorer.exe）拿
+    /// tooltip 名字到 Dock 项里兜底匹配。
+    fn hide_dock_duplicates(&mut self) {
+        let tray_exes: HashSet<String> = self
+            .tray_shown
+            .iter()
+            .filter_map(|&i| self.tray.items.get(i))
+            .filter(|it| !it.exe.is_empty() && !it.exe.ends_with("explorer.exe"))
+            .map(|it| it.exe.to_lowercase())
+            .collect();
+        let tray_names: Vec<String> = self
+            .tray_shown
+            .iter()
+            .filter_map(|&i| self.tray.items.get(i))
+            .filter(|it| it.exe.is_empty() || it.exe.ends_with("explorer.exe"))
+            .map(|it| normalize_name(&it.name))
+            .filter(|n| n.len() >= 3)
+            .collect();
+        if tray_exes.is_empty() && tray_names.is_empty() {
+            return;
         }
-
-        let mut shown = Vec::with_capacity(n);
-        for (i, key) in keys.iter().enumerate() {
-            let dup = key.as_ref().map_or(false, |k| {
-                let dock = on_dock.get(k).copied().unwrap_or(0);
-                let tray = tray_count.get(k).copied().unwrap_or(0);
-                dock > 0 && dock == tray
-            });
-            if !dup {
-                shown.push(i);
+        let before = self.items.len();
+        self.items.retain(|it| {
+            if !it.running {
+                return true;
             }
-        }
-        if shown.len() != n {
+            if !it.exe.is_empty() && tray_exes.contains(&it.exe) {
+                return false;
+            }
+            if !it.norm.is_empty()
+                && tray_names.iter().any(|n| it.norm.contains(n) || n.contains(&it.norm))
+            {
+                return false;
+            }
+            true
+        });
+        if self.items.len() != before {
             crate::vlog!(
-                "[dock] 托盘去重：{}/{} 个保留（Dock 同程序：{:?}）",
-                shown.len(), n, on_dock
+                "[dock] 托盘同程序：隐藏 {} 个 Dock 应用图标（{} → {}）",
+                before - self.items.len(),
+                before,
+                self.items.len()
             );
         }
-        self.tray_shown = shown;
+        if self.hovered.map(|i| i >= self.items.len()).unwrap_or(false) {
+            self.hovered = None;
+        }
     }
 
     /// 根据当前悬停项显示提示条（托盘用 tooltip 名字，任务图标用程序名）
     fn update_tip(&mut self) {
+        // 末端细长条：按钮本身没有文字，靠提示条说清楚它是干什么的
+        if self.hovered_desktop {
+            match self.desktop_rect {
+                Some(r) => {
+                    let mut wr = RECT::default();
+                    unsafe {
+                        let _ = GetWindowRect(self.hwnd, &mut wr);
+                    }
+                    let cx = wr.left + (r[0] + r[2] / 2.0) as i32;
+                    let cy = wr.top + (r[1] + r[3] / 2.0) as i32;
+                    let ty = wr.top + r[1] as i32;
+                    self.show_tip("返回桌面", cx, cy, ty);
+                }
+                None => self.hide_tip(),
+            }
+            return;
+        }
         let (text, rect) = if let Some(i) = self.hovered_tray {
             let rect = self.tray_rects.get(i).copied();
             let item = self
@@ -788,26 +991,39 @@ impl Dock {
             let _ = GetWindowRect(self.hwnd, &mut wr);
         }
         let cx = wr.left + (rect[0] + rect[2] / 2.0) as i32;
-        let top = wr.top + rect[1] as i32;
-        self.show_tip(&text, cx, top);
+        let cy = wr.top + (rect[1] + rect[2] / 2.0) as i32;
+        let ty = wr.top + rect[1] as i32;
+        self.show_tip(&text, cx, cy, ty);
     }
 
-    fn show_tip(&mut self, text: &str, cx: i32, top: i32) {
+    /// 提示条位置随 Dock 锚位走：下 = 图标上方；上 = Dock 下方；
+    /// 左 = Dock 右侧；右 = Dock 左侧。文本在锚点方向上居中。
+    fn show_tip(&mut self, text: &str, cx: i32, cy: i32, ty: i32) {
         if self.tip.is_invalid() {
             crate::vlog!("[dock] 提示条窗口无效，跳过");
             return;
         }
-        let (w, h, rgba) = render::draw_tooltip(text, self.scale);
+        let (w, h, rgba) = self.view.paint_tooltip(text, self.scale);
         if w <= 0 || h <= 0 {
             crate::vlog!("[dock] 提示条绘制失败：{text}");
             return;
         }
-        let bgra = render::to_premultiplied_bgra(&rgba);
+        let bgra = render::premultiplied_rgba_to_bgra(&rgba);
         render::present(self.tip, &bgra, w, h);
         let mon = crate::window::primary_monitor().rcMonitor;
-        let x = (cx - w / 2)
-            .clamp(mon.left + 4, (mon.right - w - 4).max(mon.left + 4));
-        let y = top - h - (cfg::TIP_GAP as f32 * self.scale) as i32;
+        let gap = (cfg::TIP_GAP as f32 * self.scale) as i32;
+        let clamp_x = |x: i32| x.clamp(mon.left + 4, (mon.right - w - 4).max(mon.left + 4));
+        let clamp_y = |y: i32| y.clamp(mon.top + 4, (mon.bottom - h - 4).max(mon.top + 4));
+        let mut wr = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut wr);
+        }
+        let (x, y) = match settings::dock_anchor() {
+            crate::settings::DockAnchor::Bottom => (clamp_x(cx - w / 2), ty - h - gap),
+            crate::settings::DockAnchor::Top => (clamp_x(cx - w / 2), wr.bottom + gap),
+            crate::settings::DockAnchor::Left => (wr.right + gap, clamp_y(cy - h / 2)),
+            crate::settings::DockAnchor::Right => (wr.left - w - gap, clamp_y(cy - h / 2)),
+        };
         unsafe {
             let _ = SetWindowPos(self.tip, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
             let _ = ShowWindow(self.tip, SW_SHOWNOACTIVATE);
@@ -835,6 +1051,29 @@ impl Dock {
             let s = r[2];
             x >= r[0] && x <= r[0] + s && y >= r[1] && y <= r[1] + s
         })
+    }
+
+    /// 是否点在右端"返回桌面"细长条上（命中区比细条宽一圈）
+    fn desktop_at(&self, x: f32, y: f32) -> bool {
+        self.desktop_rect
+            .map_or(false, |r| x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3])
+    }
+
+    /// 显示桌面 / 还原（等价 Win+D）。用 Shell 的 ToggleDesktop，
+    /// 桌面图标也会跟着收起/展开，和系统行为一致；自身窗口不受影响。
+    fn toggle_desktop(&self) {
+        unsafe {
+            match CoCreateInstance::<_, IShellDispatch4>(&Shell, None, CLSCTX_ALL) {
+                Ok(d) => {
+                    if let Err(e) = d.ToggleDesktop() {
+                        crate::tlog!("[dock] ToggleDesktop 失败：{e}");
+                    } else {
+                        crate::vlog!("[dock] 返回桌面（ToggleDesktop）");
+                    }
+                }
+                Err(e) => crate::tlog!("[dock] Shell.Application 创建失败：{e}"),
+            }
+        }
     }
 
     fn activate(&self, idx: usize) {
@@ -1126,4 +1365,9 @@ fn inside_round(x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
     };
     let (dx, dy) = (x - cx, y - cy);
     dx * dx + dy * dy <= r * r
+}
+
+/// exe 全路径取文件名（日志用）
+fn short_exe(exe: &str) -> &str {
+    exe.rsplit(['\\', '/']).next().unwrap_or(exe)
 }

@@ -61,7 +61,7 @@ fn main() {
                 right: a[5].parse().unwrap(),
                 bottom: a[6].parse().unwrap(),
             };
-            flyout::watch(pid, cap, "测试图标");
+            flyout::watch(pid, HWND::default(), cap, (cap.left + cap.right) / 2, "测试图标", false);
             std::thread::sleep(std::time::Duration::from_millis(7000));
         }
         Some("realmove") => {
@@ -213,7 +213,7 @@ fn main() {
                 right: a[5].parse().unwrap(),
                 bottom: a[6].parse().unwrap(),
             };
-            flyout::watch(pid, cap, "测试图标");
+            flyout::watch(pid, HWND::default(), cap, (cap.left + cap.right) / 2, "测试图标", false);
             std::thread::sleep(std::time::Duration::from_millis(1200));
             for (h, r) in windows(pid) {
                 println!("  pid={pid} hwnd={:#x} ({},{},{},{})", h.0 as usize, r.left, r.top, r.right, r.bottom);
