@@ -81,12 +81,11 @@ pub fn dock_size(
     let side = desktop_side(show_desktop);
     let mut len = pad * 2.0 + side * 2.0 + n as f32 * slot + n.saturating_sub(1) as f32 * gap;
     if show_tray && n_tray > 0 {
+        // 任务组与托盘组之间也只隔一个普通间距（分隔线画在间隙里，不额外占宽）
         if n > 0 {
-            len += cfg::DOCK_TRAY_SEP;
+            len += gap;
         }
-        len += 1.0 + cfg::DOCK_TRAY_SEP
-            + n_tray as f32 * cfg::DOCK_TRAY_SLOT
-            + (n_tray as f32 - 1.0) * cfg::DOCK_TRAY_GAP;
+        len += n_tray as f32 * cfg::DOCK_TRAY_SLOT + (n_tray as f32 - 1.0) * cfg::DOCK_TRAY_GAP;
     }
     // 整套尺寸按"图标大小"设置等比放大/缩小（paint 里用同一个系数光栅化）
     let k = icon_k();
@@ -114,7 +113,7 @@ impl DockView {
     pub fn paint(
         &mut self,
         w: i32, h: i32, scale: f32,
-        icons: &[&[u8]], hovered: Option<usize>,
+        icons: &[&[u8]], hovered: Option<usize>, active: Option<usize>,
         tray_icons: &[&[u8]], hovered_tray: Option<usize>,
         show_tray: bool, show_desktop: bool, hovered_desktop: bool,
         vertical: bool,
@@ -228,6 +227,25 @@ impl DockView {
                             );
                         }
                     }
+                    // 前台应用：图标下沿一条短横条（任务栏那套视觉语言）。
+                    // 竖排时整条转向，贴在"远离屏幕中心"的那一侧
+                    if Some(i) == active {
+                        let th = cfg::DOCK_ACTIVE_H;
+                        let tw = (slot * 0.34).max(9.0);
+                        let bar = if vertical {
+                            egui::Rect::from_min_size(
+                                egui::pos2(cross - th - 1.6, rect.center().y - tw / 2.0),
+                                egui::vec2(th, tw),
+                            )
+                        } else {
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.center().x - tw / 2.0, cross - th - 1.6),
+                                egui::vec2(tw, th),
+                            )
+                        };
+                        p.rect_filled(bar, th / 2.0, argb(cfg::cur().accent));
+                    }
+
                     pos += slot + gap;
                 }
                 if !icons.is_empty() {
@@ -236,26 +254,32 @@ impl DockView {
 
                 // 分隔线 + 托盘图标
                 if show_tray && !tray_icons.is_empty() {
+                    // 任务图标组与托盘图标组之间**只隔一个普通间距**：分隔线画在这格
+                    // 间隙正中（不再额外加 DOCK_TRAY_SEP），整排图标的间距保持一致
                     if !icons.is_empty() {
-                        pos += cfg::DOCK_TRAY_SEP;
+                        let dc = (cross - cfg::DIVIDER_H) / 2.0;
+                        let mid = pos + gap * 0.5;
+                        // 两端淡出的细分隔线（纯 1px 实线在深底上太硬）
+                        let line = argb(cfg::cur().divider);
+                        if vertical {
+                            fade_line(
+                                &p,
+                                egui::pos2(dc, mid),
+                                egui::pos2(dc + cfg::DIVIDER_H, mid),
+                                1.0,
+                                line,
+                            );
+                        } else {
+                            fade_line(
+                                &p,
+                                egui::pos2(mid, dc),
+                                egui::pos2(mid, dc + cfg::DIVIDER_H),
+                                1.0,
+                                line,
+                            );
+                        }
+                        pos += gap;
                     }
-                    let dc = (cross - cfg::DIVIDER_H) / 2.0;
-                    // 两端淡出的细分隔线（纯 1px 实线在深底上太硬）
-                    let line = argb(cfg::cur().divider);
-                    if vertical {
-                        let y = pos + 0.5;
-                        fade_line(
-                            &p,
-                            egui::pos2(dc, y),
-                            egui::pos2(dc + cfg::DIVIDER_H, y),
-                            1.0,
-                            line,
-                        );
-                    } else {
-                        let x = pos + 0.5;
-                        fade_line(&p, egui::pos2(x, dc), egui::pos2(x, dc + cfg::DIVIDER_H), 1.0, line);
-                    }
-                    pos += 1.0 + cfg::DOCK_TRAY_SEP;
 
                     let tslot = cfg::DOCK_TRAY_SLOT;
                     let tisz = cfg::DOCK_TRAY_ICON;
@@ -327,23 +351,22 @@ impl DockView {
                     let bar = egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(bw, bh));
                     let r_bar = thin / 2.0;
 
-                    // 颜色用"文字色 + 低 alpha"：深色主题下是提亮的白，浅色主题下是压暗的黑，
-                    // 两种主题都能和底板分层；悬停时整条提到强调色，并向外放一圈柔光
+                    // **只有鼠标停在这一条上才画出形状**（用户要求"不触发就不显示"）：
+                    // 平时整条透明，只保留命中区，悬停时条身变强调色 + 外放一圈柔光
                     // （向内画，窗口边不会裁掉）
-                    let text = cfg::cur().text;
                     if hovered_desktop {
+                        let text = cfg::cur().text;
                         p.rect_filled(
                             bar.expand(2.5),
                             r_bar + 2.5,
                             argb(crate::egui_soft::with_alpha(text, 0.10)),
                         );
+                        p.rect_filled(
+                            bar,
+                            r_bar,
+                            argb(crate::egui_soft::with_alpha(cfg::cur().accent, 0.95)),
+                        );
                     }
-                    let fill = if hovered_desktop {
-                        crate::egui_soft::with_alpha(cfg::cur().accent, 0.95)
-                    } else {
-                        crate::egui_soft::with_alpha(text, 0.28)
-                    };
-                    p.rect_filled(bar, r_bar, argb(fill));
 
                     // 命中区要比细条宽一圈，否则 7 点宽根本点不准；两侧都是空白，不会抢图标
                     let gap = cfg::DOCK_DESKTOP_GAP;

@@ -124,7 +124,7 @@ main.rs → app.rs（启动/消息循环）
 | `data/mail.txt` | IMAP 账号（host/port/user/pass 授权码），首次运行由 `config.rs` 默认值生成 |
 | `data/mail_read.txt` | 已读邮件的 IMAP UID，一行一个（服务器 `\Seen` 的本地兜底） |
 | `data/clipboard.txt` | 剪贴板历史，每行 `时间 \x1f 固定标记 \x1f 文本`（换行转义 `\x1e`；老格式两字段按未固定读入） |
-| `data/settings.txt` | 可调设置，`key=value` 一行一个：`clock_format`（strftime 格式串，默认 `%Y-%m-%d %H:%M:%S`）、`module_order`（模块排序列表）、`weather_mode` / `mail_mode` / `clipboard_mode`（pill/left/right/off）、`pill_alpha`（0.2~1.0）、`pill_anchor`（float/island/bottom）、`dock_anchor`（bottom/top/left/right）、`weather_text_scale`（0.8~1.8，默认 1.25）、`lyric_position`（right/left/bottom）、`lyric_size`（10~26，默认 14）、`weather_source`（amap/openmeteo）、`amap_key`（设置页写入的高德 key 覆盖）、`mail_host` / `mail_port` / `mail_user` / `mail_pass`（设置页写入的邮箱账号覆盖，留空回落 `mail.txt`）、`show_tray` / `show_desktop_btn`（1/0）、`hide_tray`（要单独隐藏的托盘图标键，`;` 分隔）。老键 `clock_order` / `time_format` / `date_format` / `*_pos` 在读取时自动迁移 |
+| `data/settings.txt` | 可调设置，`key=value` 一行一个：`clock_format`（strftime 格式串，默认 `%Y-%m-%d %H:%M:%S`）、`module_order`（模块排序列表）、`weather_mode` / `mail_mode` / `clipboard_mode`（pill/left/right/off）、`pill_alpha`（0.2~1.0）、`pill_anchor`（float/island/bottom）、`dock_anchor`（bottom/top/left/right）、`weather_text_scale`（0.8~1.8，默认 1.25）、`lyric_position`（right/left/bottom）、`lyric_size`（10~26，默认 14）、`weather_source`（amap/openmeteo）、`amap_key`（设置页写入的高德 key 覆盖）、`mail_host` / `mail_port` / `mail_user` / `mail_pass`（设置页写入的邮箱账号覆盖，留空回落 `mail.txt`）、`show_tray` / `show_desktop_btn`（1/0）、`hide_tray`（要单独隐藏的托盘图标键，`;` 分隔）、`dock_pins`（Dock 固定图标，`;` 分隔的 exe/.lnk 全路径；键不存在 = 沿系统任务栏钉选）、`pill_scale` / `icon_scale`（胶囊 / Dock 整体倍率，1.0 = 滑条 100%）。老键 `clock_order` / `time_format` / `date_format` / `*_pos` 在读取时自动迁移 |
 
 ### 可调设置（settings.rs）
 - 文件不存在时写入带注释的默认值；老版本文件缺新键会自动补到末尾（`append_missing`），方便直接编辑。
@@ -132,7 +132,7 @@ main.rs → app.rs（启动/消息循环）
 - 天气卡片的字号、行距、卡片宽高都乘 `weather_text_scale`，所以调大字号不会把文字挤出卡片；卡片高度还会按左栏实际行数撑高。
 - 音乐条按 `lyric_position` 决定贴哪一侧、按 `lyric_size` 决定歌词字号（宽度随文本自适应，超出按侧边可用空间截断）。
 - 模块位置按 `weather_pos` / `mail_pos` / `clipboard_pos`：`pill` 留在胶囊里，`left[2|3]` / `right[2|3]` 分离成胶囊旁的模块条并按编号分组（同侧同编号合并成一条）。**默认全部分离且一个模块一条**（天气左1、邮件右1、剪贴板右2），胶囊里只剩时间和日期。
-- `show_tray` 控制 Dock 是否显示托盘图标，`show_desktop_btn` 控制 Dock 右端那条"返回桌面"细长条。
+- `show_tray` 控制 Dock 是否显示托盘图标，`show_desktop_btn` 控制 Dock 右端那条"返回桌面"细长条（平时不画形状，只留命中区，鼠标停上去才亮起来）。
 - `hide_tray` 是"在 Dock 上单独隐藏某个托盘图标"的名单（`;` 分隔）。键由 `tray::TrayItem::key` 生成，**跨会话稳定**：GUID 注册的图标用 GUID，否则用 `exe 全路径#uID`（hWnd 每次启动都变、tooltip 会随状态变，都不能当键）。`Dock::refresh_tray_shown` 在"与 Dock 图标去重"之后再过一遍这份名单，所以被隐藏的图标既不占槽位也不参与悬停/点击；它仍然注册在托盘托管表里，设置页随时能恢复。
 - **两份读取路径共用一套值**：手改文件走 mtime 轮询（`reload_if_changed`，胶囊 500ms 一次，Dock 另开 500ms 定时器 `T_SETTINGS`）；设置页面改值走 `set_xxx()`（更新原子量 + 写文件 + `VERSION += 1`），两边都靠 `settings::version()` 判断"我该重绘了"。这样多个窗口不再争抢"谁先看到 mtime 变化"（争抢会让后到的窗口永远看不到变化）。
 - `save()` 只替换**它管的键**的值，注释、空行、用户自己加的其它键原样保留。
@@ -144,6 +144,15 @@ main.rs → app.rs（启动/消息循环）
 
 ### Dock 锚位
 **底部 Dock 的命名**：窗口类名 `ORBIT_DOCK`（`src/dock.rs`，结构体 `Dock`），中文叫"底部 Dock"。`dock_anchor` 支持 `bottom`（默认，贴工作区下沿居中）/ `top`（贴主屏上沿）/ `left` / `right`（左右两侧竖排居中）：竖排模式 `dockview::dock_size` 返回 (宽, 高) 互换、`dockview::paint` 用主轴抽象（`cross`/`long`）复用同一套布局，分隔线、悬停底、返回桌面细长条都跟着转向；Dock 在顶部时悬停卡片守位到 Dock 下方（`below`），提示条 `ORBIT_TIP` 也按锚位改到不遮挡的一侧。
+
+**尺寸基准（2026-11-20 起）**：两个滑条上的"100%"都不再等于理论基准值 ——
+`settings::pill_scale()` = 滑条值 × `PILL_SCALE_BASE (0.85)`，
+`settings::icon_scale()` = 滑条值 × `ICON_SCALE_BASE (0.95)`。
+即默认胶囊是旧基准的 85%、Dock 是 95%（用户要求"默认百分百 = 现在 85%/95% 的大小"）；
+滑条本身仍显示 1.0~100%，落盘的也是滑条原值，界面读数不变。
+胶囊内模块间距同步收紧（`GAP` 10→7、`WIDGET_PAD_X` 5→4、`WIDGET_ICON_GAP` 4→3），
+展开面板也压了一档（`PANEL_PAD` 16→12、`PANEL_HEAD_H` 58→48、`PANEL_ROW_H` 46→40、
+`WEATHER_PANEL_W` 560→520、`WEATHER_PANEL_H` 190→172）。
 
 ### 设置页面（settingsui.rs）
 
@@ -168,14 +177,23 @@ main.rs → app.rs（启动/消息循环）
 3. **图标**：`SHGFI_SYSICONINDEX` → `SHGetImageList(SHIL_JUMBO)` 取 256px 图标 → `render::resize_rgba()` 面积平均缩到 Dock 尺寸。
 4. **钉选项去重**：`.lnk` 目标路径（展开 `%windir%` 等变量）与运行 exe 路径比对；CLSID 快捷方式（如 File Explorer）无目标路径，退化为归一化名称包含匹配（仅长度 ≥ 8 时启用，避免"微信/企业微信"误合并）。
 5. **点击**：钉选项 `ShellExecuteW("open", lnk)`；运行项 `IsIconic → SW_RESTORE` + `AttachThreadInput` 绕过前台锁后 `SetForegroundWindow`。
-6. **托盘区**：应用图标之后接一条分隔线，再排托盘图标。托盘图标尺寸与任务图标**完全一致**（`DOCK_TRAY_ICON = DOCK_ICON` 44、`DOCK_TRAY_SLOT = DOCK_SLOT` 46、`DOCK_TRAY_GAP = DOCK_GAP` 6），悬停药丸也共用同一半径（`槽位/2 + 3`），这样底部就是一排等大的图标。托盘槽位单独一套 `tray_rects`，命中时**先查托盘再查应用**。
-7. **右端"返回桌面"细长条**：Dock 最右侧一条 `DOCK_DESKTOP_W = 7`、高 `DOCK_DESKTOP_H = 0.62·DOCK_H` 的竖圆角条，悬停变亮、提示条写"返回桌面"，点击调 Shell 的 `IShellDispatch4::ToggleDesktop`（= Win+D，桌面图标一起收/展）。**左侧按同样宽度留空白占位**（`DOCK_DESKTOP_W + DOCK_DESKTOP_GAP`），否则右边多出来一块会把整排图标推离屏幕中心。命中区两侧各外扩 `DOCK_DESKTOP_GAP`（7 点宽根本点不准）。`show_desktop_btn = 0` 时两侧同时消失，Dock 宽度随之收窄。
-8. **托盘轮询**：托盘镜像由 Dock 持有，跟应用重扫共用 2s 定时器（`T_RESCAN`）：`scan() | poll_tray()` 任一有变化就重绘。收到 `TaskbarCreated`（explorer 重启）时把镜像整个丢掉重建。
-9. **鼠标转发**：左键直接调 `TrayMirror::click(idx, false)`（内部走 `DoDefaultAction`，之前先 `AllowSetForegroundWindow(ASFW_ANY)`——托盘动作常要弹窗口/菜单，没有前台权限会被焦点锁挡住，表现为"点了没反应"）；右键**必须等 `WM_RBUTTONUP` 再注入**——在 `WM_RBUTTONDOWN` 里注入的右键会和用户正按着的那次物理按键合成一次"按下-抬起"，真实托盘图标收不到点击（实测 traytest 无任何回调）。
-10. **闪烁跟随**（`T_FLASH`，70ms）：应用用"托盘图标一闪一闪"提示新消息（微信就是这样，实测两个双开实例都在闪：约 250ms 亮 / 250ms 灭，灭帧是 `NIM_MODIFY(NIF_ICON)` 带 `hIcon=0`，亮帧是真实 `hIcon`）。托管模式下 `trayhost::apply()` 把 `hIcon=0` 标到 `Icon.dim`；渲染时**灭帧画全透明像素**（`blank = vec![0; px·px·4]`），亮帧画真实图标，即用户要的"图标-消失-图标-消失"真交替，与真托盘同频。关键：`poll_flash()` 在托管模式下**也调 `tray.poll()`**（早期版本直接 return false，导致 dim 只由 2s 重扫驱动而严重漏帧、卡在灭帧不恢复）；70ms 定时器足以跟上微信 200~300ms 一跳的帧。`poll_hosted()` 用 `host_rgba` 缓存按 (hwnd,uid,guid) 存最近一次抓到的像素，灭帧 hicon=0 或抓图偶发失败时沿用，保证亮帧一定能恢复出图标、不掉到 placeholder 暗点。兜底的 UIA 路径才用 `PrintWindow` 采样墨量判灭。
+6. **托盘区**：应用图标之后接一条分隔线，再排托盘图标。托盘图标尺寸与任务图标**完全一致**（`DOCK_TRAY_ICON = DOCK_ICON` 44、`DOCK_TRAY_SLOT = DOCK_SLOT` 46、`DOCK_TRAY_GAP = DOCK_GAP` 6），悬停药丸也共用同一半径（`槽位/2 + 3`），这样底部就是一排等大的图标。**两组之间也只隔一个普通间距**（分隔线画在那格间隙正中，`dock_size` 不再额外加宽），因此整排间距完全均匀。托盘槽位单独一套 `tray_rects`，命中时**先查托盘再查应用**。
+7. **右端"返回桌面"细长条**：Dock 最右侧一条 `DOCK_DESKTOP_W = 7`、长 `DOCK_DESKTOP_H = 0.62·Dock 厚度` 的圆角条（横排 dock 是竖条，左右竖排 dock 自动转成横条）。**平时完全不画**，鼠标停上去才出现形状（强调色 + 外圈柔光）——所以"看不见但能点"，命中区始终存在。悬停提示条写"返回桌面"，点击调 Shell 的 `IShellDispatch4::ToggleDesktop`（= Win+D，桌面图标一起收/展）。**左侧按同样宽度留空白占位**（`DOCK_DESKTOP_W + DOCK_DESKTOP_GAP`），否则右边多出来一块会把整排图标推离屏幕中心。命中区两侧各外扩 `DOCK_DESKTOP_GAP`（7 点宽根本点不准）。`show_desktop_btn = 0` 时两侧同时消失，Dock 宽度随之收窄。
+8. **固定图标（钉选）**：默认读系统任务栏的钉选（`%APPDATA%\...\User Pinned\TaskBar\*.lnk`），
+   一旦在设置页增删过就以 `settings.txt` 的 `dock_pins=`（分号分隔的 exe / .lnk 全路径）为准；
+   键不存在 = 还没改过 → 回落到系统钉选。设置页「Dock → 固定图标」里可以逐个移除、
+   从"正在运行的应用"一键固定、或用系统文件对话框挑 exe/快捷方式。固定项**不要求程序在运行**
+   （图标从 exe/lnk 取，点一下 `ShellExecuteW` 启动）；取不到图标的钉选项直接跳过，不占空槽。
+9. **前台应用指示条**：`Dock::active_index()` 用 `GetForegroundWindow()` 定位当前前台应用
+   （先按窗口句柄精确匹配，再按 exe 兜底），`T_FLASH`（70ms）里比对变化后重绘。
+   `dockview` 在这个图标下方画一条 `DOCK_ACTIVE_H = 3` 点厚、槽位 34% 长的强调色短条
+   （竖排 dock 转 90°，贴在外侧边上）。
+10. **托盘轮询**：托盘镜像由 Dock 持有，跟应用重扫共用 2s 定时器（`T_RESCAN`）：`scan() | poll_tray()` 任一有变化就重绘。收到 `TaskbarCreated`（explorer 重启）时把镜像整个丢掉重建。
+11. **鼠标转发**：左键直接调 `TrayMirror::click(idx, false)`（内部走 `DoDefaultAction`，之前先 `AllowSetForegroundWindow(ASFW_ANY)`——托盘动作常要弹窗口/菜单，没有前台权限会被焦点锁挡住，表现为"点了没反应"）；右键**必须等 `WM_RBUTTONUP` 再注入**——在 `WM_RBUTTONDOWN` 里注入的右键会和用户正按着的那次物理按键合成一次"按下-抬起"，真实托盘图标收不到点击（实测 traytest 无任何回调）。
+12. **闪烁跟随**（`T_FLASH`，70ms）：应用用"托盘图标一闪一闪"提示新消息（微信就是这样，实测两个双开实例都在闪：约 250ms 亮 / 250ms 灭，灭帧是 `NIM_MODIFY(NIF_ICON)` 带 `hIcon=0`，亮帧是真实 `hIcon`）。托管模式下 `trayhost::apply()` 把 `hIcon=0` 标到 `Icon.dim`；渲染时**灭帧画全透明像素**（`blank = vec![0; px·px·4]`），亮帧画真实图标，即用户要的"图标-消失-图标-消失"真交替，与真托盘同频。关键：`poll_flash()` 在托管模式下**也调 `tray.poll()`**（早期版本直接 return false，导致 dim 只由 2s 重扫驱动而严重漏帧、卡在灭帧不恢复）；70ms 定时器足以跟上微信 200~300ms 一跳的帧。`poll_hosted()` 用 `host_rgba` 缓存按 (hwnd,uid,guid) 存最近一次抓到的像素，灭帧 hicon=0 或抓图偶发失败时沿用，保证亮帧一定能恢复出图标、不掉到 placeholder 暗点。兜底的 UIA 路径才用 `PrintWindow` 采样墨量判灭。
     **微信提示音**（`src/notify.rs`，设置键 `wechat_sound`，默认开）：微信系的托盘图标**从"没在闪"变成"在闪"**的那一下（`publish_flash` 里对比上一轮快照），Orbit 播一声嵌进二进制的提示音（`include_bytes!`，约 36 KB）——不改微信本体，微信自己的声音照旧。mp3 首播时释放到 `data/wechat_notify.mp3` 再走 MCI（`mciSendStringW`，DirectShow 后端免解码依赖），alias 打开一次复用、每次 seek 回头重播；想换音效用同名文件覆盖它即可。同一轮提醒只响一声：调用侧靠"新出现在闪烁集合"判定 + 3 秒最小间隔双保险，亮/灭交替帧不会连环轰炸。
-11. **图标来源**：优先用程序 exe 的 256px 图标（`appicon`：注册表 `NotifyIconSettings` 的 `InitialTooltip` → `ExecutablePath`，进程名兜底），比从任务栏抠 16px 再放大清晰得多；但**必须先验相似度**——输入法这类"中/英状态"图标的 exe 图标完全不是一回事，`icon_diff()`（只比两边都不透明的像素）超过 `TRAY_ICON_MAX_DIFF` 就保留抓图。反过来，抓到的若是"闪烁熄灭"那一帧（整块空白，`coverage` ≈ 0），直接丢掉换 exe 图标，否则会把空白当图标存下来。
-12. **托盘悬停/点击转发（走图标自己的回调消息，不动光标）**：实现对齐 C# 版 Orbit 的 `TrayClickForwarder`（`Interop/TrayClickForwarder.cs`）。托盘图标注册时会带来 `hWnd` / `uID` / `uCallbackMessage` / `uVersion`，向宿主窗口投这个**回调消息号**并按协议版本编码，就等于"用户把指针放上去/点了键"，完全不用移动系统光标：
+13. **图标来源**：优先用程序 exe 的 256px 图标（`appicon`：注册表 `NotifyIconSettings` 的 `InitialTooltip` → `ExecutablePath`，进程名兜底），比从任务栏抠 16px 再放大清晰得多；但**必须先验相似度**——输入法这类"中/英状态"图标的 exe 图标完全不是一回事，`icon_diff()`（只比两边都不透明的像素）超过 `TRAY_ICON_MAX_DIFF` 就保留抓图。反过来，抓到的若是"闪烁熄灭"那一帧（整块空白，`coverage` ≈ 0），直接丢掉换 exe 图标，否则会把空白当图标存下来。
+14. **托盘悬停/点击转发（走图标自己的回调消息，不动光标）**：实现对齐 C# 版 Orbit 的 `TrayClickForwarder`（`Interop/TrayClickForwarder.cs`）。托盘图标注册时会带来 `hWnd` / `uID` / `uCallbackMessage` / `uVersion`，向宿主窗口投这个**回调消息号**并按协议版本编码，就等于"用户把指针放上去/点了键"，完全不用移动系统光标：
 
     | 版本 | wParam | lParam |
     |---|---|---|
@@ -193,14 +211,14 @@ main.rs → app.rs（启动/消息循环）
 
     实现见 `src/traymsg.rs`。**参数从哪来**：托管模式下 `hWnd/uID/uCallbackMessage/uVersion/GUID` 全部直接来自 `trayhost::Icon`（从 `WM_COPYDATA` 的 `NOTIFYICONDATA` 解析，见"托盘完整托管"一节），零扫描、零延迟；兜底路径才读 explorer 的 `TRAYDATA` 或扫进程内存找 `NOTIFYICONDATAW`，结果缓存进 `orbit.traycache`。点击链路已验证能让微信从前台切出/切回；悬停弹卡片已实测能被搬到 Dock 上方（微信有未读消息时）。
 
-13. **悬停弹窗重定位**（`src/flyout.rs`，`TRAY_RELOCATE_FLYOUT`）：悬停转发让应用自己弹预览小窗（微信 `Qt51514QWindowToolSaveBits`），但这个窗定位在**旧托盘角**（实测负坐标 (-24,-24)，屏幕左上角外）。所以悬停一开始就起一个后台线程找它可见的 tool window（`WS_EX_TOOLWINDOW` 或类名带 `tool`、尺寸 60×40 ~ 800×900、非最大化、无 `WS_EX_APPWINDOW`；多个候选取面积最小的），找到后用 `SetWindowPos(SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSENDCHANGING)` 摆到 Dock 上方：**水平居中于悬停的托盘图标中心**（`watch()` 传入的 `anchor_x`，先在 Dock 区间内夹取；原来锚 Dock 中心 = 屏幕正中，跟鼠标没关系）、下沿距 Dock 上沿 1px（贴胶囊行上沿），再夹在显示器工作区内。锚点用图标中心而不是实时光标：悬停在 Dock 上会被反复重发，用光标的话鼠标在图标里微动一下卡片就左右跟着滑。**全局 `LATEST` 约束**：多线程可能同时找到同一个卡片 hwnd（微信双开的两个图标按 exe 名互相匹配到对方的卡片），只有最新一次悬停的线程允许 `SetWindowPos`，否则两条线程各按自己的锚点摆，卡片左右乱跳。三个针对微信双开的**关键修正**（实测踩坑）：
+15. **悬停弹窗重定位**（`src/flyout.rs`，`TRAY_RELOCATE_FLYOUT`）：悬停转发让应用自己弹预览小窗（微信 `Qt51514QWindowToolSaveBits`），但这个窗定位在**旧托盘角**（实测负坐标 (-24,-24)，屏幕左上角外）。所以悬停一开始就起一个后台线程找它可见的 tool window（`WS_EX_TOOLWINDOW` 或类名带 `tool`、尺寸 60×40 ~ 800×900、非最大化、无 `WS_EX_APPWINDOW`；多个候选取面积最小的），找到后用 `SetWindowPos(SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOSENDCHANGING)` 摆到 Dock 上方：**水平居中于悬停的托盘图标中心**（`watch()` 传入的 `anchor_x`，先在 Dock 区间内夹取；原来锚 Dock 中心 = 屏幕正中，跟鼠标没关系）、下沿距 Dock 上沿 1px（贴胶囊行上沿），再夹在显示器工作区内。锚点用图标中心而不是实时光标：悬停在 Dock 上会被反复重发，用光标的话鼠标在图标里微动一下卡片就左右跟着滑。**全局 `LATEST` 约束**：多线程可能同时找到同一个卡片 hwnd（微信双开的两个图标按 exe 名互相匹配到对方的卡片），只有最新一次悬停的线程允许 `SetWindowPos`，否则两条线程各按自己的锚点摆，卡片左右乱跳。三个针对微信双开的**关键修正**（实测踩坑）：
     - **归属匹配**：双开时图标宿主 pid 与真正建卡片的进程不同（图标 A 宿主 8504、图标 B 宿主 3608，但两张卡片都由 8504 创建），所以不能只按 pid，要按 exe 名前缀（`weixin`）匹配兄弟进程，否则第二个实例的卡片永远找不到。
     - **不要按"抢前台"排除**：微信的悬停预览卡片自身会抢前台（`GetForegroundWindow()==卡片`），C# 原版那条"抢前台就是真实 UI、撒手"的过滤在实测里恰好把第二个实例的卡片漏掉（用户看到"一个正常、一个弹到左上角"）。改为不因抢前台排除——真正用户点开的是微信主窗口（带 `WS_EX_APPWINDOW` 已排除），卡片被点后会销毁，守位线程自然退出。
     - **generation 按图标 hwnd 分组**（不再全局单值）：两个微信图标各有一条线程，互不取消；同一图标的新悬停才取消它自己的旧线程。弹窗有 2~3s 延迟且闪烁时反复销毁重建，所以搜索窗口 4s、守位期窗口消失后 3.5s 宽限内重新找新 hwnd 接着守。
     摆好后每 140ms 复查、漂移 >2px 就再摆（上限 100 次），最多守 20 秒。系统外壳图标（explorer / ShellExperienceHost）不处理。实测：双开两个微信悬停都把卡片搬到 Dock 上方（(814,751) / (814,695)），全程不动光标。
 
-14. **悬停提示条**：`ORBIT_TIP` 是第四个窗口（分层 + 置顶 + `WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`，点击穿透、不抢焦点），贴在 Dock 上方。托盘图标显示 UIA 的 tooltip 首行（"微信"），任务图标显示窗口标题（拿不到就用程序名）。悬停变化时先重绘 Dock（画出悬停底/椭圆）再定位提示条。
-15. **与 Dock 图标去重**：Dock 上已经有的程序，不再重复显示它的托盘图标。判定分两步——托盘元素的 `CurrentProcessId` 在 Win11 上恒为 `explorer.exe`（XAML 树在导出器进程里），所以先按 exe、拿不到再按名字到"有可见窗口的 Dock 项"里做归一化包含匹配。**数量必须一一对应才藏**（`dock 数 == 托盘数`）：微信多开时托盘有 2 个、Dock 只有 1 个（按 exe 去重），这时**两个都保留**——分不清该藏哪一个，藏错了某个账号就彻底没有入口。窗口最小化到托盘（`EnumWindows` 里不再可见）后，该程序不计入"有可见窗口"，托盘图标会自动回到 Dock 右侧。
+16. **悬停提示条**：`ORBIT_TIP` 是第四个窗口（分层 + 置顶 + `WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`，点击穿透、不抢焦点），贴在 Dock 上方。托盘图标显示 UIA 的 tooltip 首行（"微信"），任务图标显示窗口标题（拿不到就用程序名）。悬停变化时先重绘 Dock（画出悬停底/椭圆）再定位提示条。
+17. **与 Dock 图标去重**：Dock 上已经有的程序，不再重复显示它的托盘图标。判定分两步——托盘元素的 `CurrentProcessId` 在 Win11 上恒为 `explorer.exe`（XAML 树在导出器进程里），所以先按 exe、拿不到再按名字到"有可见窗口的 Dock 项"里做归一化包含匹配。**数量必须一一对应才藏**（`dock 数 == 托盘数`）：微信多开时托盘有 2 个、Dock 只有 1 个（按 exe 去重），这时**两个都保留**——分不清该藏哪一个，藏错了某个账号就彻底没有入口。窗口最小化到托盘（`EnumWindows` 里不再可见）后，该程序不计入"有可见窗口"，托盘图标会自动回到 Dock 右侧。
 
 ### 托盘完整托管（trayhost.rs）—— 核心架构
 

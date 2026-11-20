@@ -537,7 +537,7 @@ impl SettingsApp {
                 ui.label(row_label("大小"));
                 scale_row(
                     ui,
-                    settings::pill_scale(),
+                    settings::pill_scale_setting(),
                     settings::PILL_SCALE_MIN,
                     settings::PILL_SCALE_MAX,
                     settings::preview_pill_scale,
@@ -589,7 +589,7 @@ impl SettingsApp {
                 ui.label(row_label("图标大小"));
                 scale_row(
                     ui,
-                    settings::icon_scale(),
+                    settings::icon_scale_setting(),
                     settings::ICON_SCALE_MIN,
                     settings::ICON_SCALE_MAX,
                     settings::preview_icon_scale,
@@ -603,6 +603,77 @@ impl SettingsApp {
                 .size(11.5)
                 .weak(),
         );
+
+        ui.add_space(10.0);
+        self.pins(ui);
+    }
+
+    /// 固定图标：已固定的一行一个（右侧「移除」），下面列正在运行但还没固定的应用，
+    /// 再给一个「浏览程序…」从磁盘挑 exe / 快捷方式。所有改动都整体写回列表。
+    fn pins(&mut self, ui: &mut egui::Ui) {
+        section(ui, "固定图标");
+        let (pins, running) = pins_view();
+
+        if pins.is_empty() {
+            ui.label(
+                egui::RichText::new("还没有固定图标：只显示正在运行的应用")
+                    .size(11.5)
+                    .weak(),
+            );
+        }
+        for path in &pins {
+            let label = pin_label(path);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(egui::RichText::new(label).size(12.5));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("移除").small()).clicked() {
+                        let mut list = pins.clone();
+                        list.retain(|p| !p.eq_ignore_ascii_case(path));
+                        settings::set_dock_pins(list);
+                    }
+                });
+            });
+        }
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("添加：正在运行的应用").size(11.5).weak());
+        let running: Vec<(String, String)> = running
+            .into_iter()
+            .filter(|(_, exe)| !pins.iter().any(|p| p.eq_ignore_ascii_case(exe)))
+            .collect();
+        if running.is_empty() {
+            ui.label(egui::RichText::new("（没有可添加的运行中应用）").size(11.5).weak());
+        }
+        for (name, exe) in &running {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(egui::RichText::new(name).size(12.5));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("固定").small()).clicked() {
+                        let mut list = pins.clone();
+                        list.push(exe.clone());
+                        settings::set_dock_pins(list);
+                    }
+                });
+            });
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new("浏览程序…").small()).clicked() {
+                if let Some(path) = pick_program() {
+                    let mut list = pins.clone();
+                    if !list.iter().any(|p| p.eq_ignore_ascii_case(&path)) {
+                        list.push(path);
+                        settings::set_dock_pins(list);
+                    }
+                }
+            }
+            if !pins.is_empty() && ui.add(egui::Button::new("清空固定").small()).clicked() {
+                settings::set_dock_pins(Vec::new());
+            }
+        });
     }
 
     fn detail_music(&mut self, ui: &mut egui::Ui) {
@@ -1067,6 +1138,65 @@ fn seg(ui: &mut egui::Ui, options: &[&str], active: usize) -> Option<usize> {
 ///
 /// 拖动过程只做即时预览（`preview`），松手才落盘（`persist`）——和透明度滑条
 /// 同一套逻辑，避免每移一像素就重写一次 settings.txt。
+/// 「固定图标」区块的输入数据：(已固定列表, 正在运行的应用)。
+///
+/// immediate mode 每帧都会重跑界面函数，`EnumWindows` + 读 TaskBar 目录太贵，
+/// 这里按 2 秒缓存一份；固定列表本身改动会立刻体现在下一帧（缓存被 `set_dock_pins` 之外的
+/// 路径不会清，所以保留 2 秒的自然过期）。
+fn pins_view() -> (Vec<String>, Vec<(String, String)>) {
+    static CACHE: Mutex<Option<(std::time::Instant, Vec<String>, Vec<(String, String)>)>> =
+        Mutex::new(None);
+    if let Ok(c) = CACHE.lock() {
+        if let Some((at, pins, running)) = c.as_ref() {
+            if at.elapsed().as_millis() < 2000 {
+                return (pins.clone(), running.clone());
+            }
+        }
+    }
+    let pins = crate::dock::effective_pins();
+    let running = crate::dock::running_app_list();
+    if let Ok(mut c) = CACHE.lock() {
+        *c = Some((std::time::Instant::now(), pins.clone(), running.clone()));
+    }
+    (pins, running)
+}
+
+/// 固定列表里显示的名字：去掉目录和扩展名
+fn pin_label(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// 挑一个 exe / 快捷方式（系统「打开文件」对话框）
+fn pick_program() -> Option<String> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OPENFILENAMEW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST,
+    };
+    let mut buf = vec![0u16; 1024];
+    let filter: Vec<u16> = "程序 (*.exe;*.lnk)\0*.exe;*.lnk\0所有文件 (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        nFilterIndex: 1,
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER,
+        ..Default::default()
+    };
+    if !unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
+        return None;
+    }
+    let s = String::from_utf16_lossy(&buf);
+    let s = s.trim_end_matches('\0').trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 fn scale_row(
     ui: &mut egui::Ui,
     value: f32,

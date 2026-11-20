@@ -125,6 +125,10 @@ pub struct Dock {
     scale: f32,
     items: Vec<DockItem>,
     hovered: Option<usize>,
+    /// 前台应用在 `items` 里的下标（图标下面那条指示条用）
+    active: Option<usize>,
+    /// 上次查前台应用的时刻（70ms 定时器里节流，别每帧都去 OpenProcess）
+    active_checked: Option<Instant>,
     mouse_tracked: bool,
     /// 每个应用图标槽位 [x, y, size]（client 坐标）
     rects: Vec<[f32; 3]>,
@@ -188,6 +192,20 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 LRESULT(0)
             }
             WM_TIMER if w.0 == T_FLASH => {
+                // 顺带跟随前台应用：变了就重画（指示条）。查一次要走 GetForegroundWindow
+                // 和可能的 OpenProcess，节流到 ~300ms，Alt-Tab 后仍然是"立刻"跟上的观感
+                let due = dock
+                    .active_checked
+                    .map(|t| t.elapsed().as_millis() >= 300)
+                    .unwrap_or(true);
+                if due {
+                    dock.active_checked = Some(Instant::now());
+                    let act = dock.active_index();
+                    if act != dock.active {
+                        dock.active = act;
+                        dock.render();
+                    }
+                }
                 if dock.poll_flash() {
                     dock.render();
                 }
@@ -203,9 +221,11 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     if (k - dock.icon_scale).abs() > 1e-3 {
                         dock.icon_scale = k;
                         dock.tray.invalidate();
-                        dock.scan();
-                        dock.poll_tray();
                     }
+                    // 固定图标列表 / 开关都可能变，内容整轮重扫（签名没变时等价于空转）
+                    dock.scan();
+                    dock.poll_tray();
+                    dock.active = dock.active_index();
                     dock.render();
                 }
                 LRESULT(0)
@@ -408,6 +428,8 @@ impl Dock {
             scale: 1.0,
             items: Vec::new(),
             hovered: None,
+            active: None,
+            active_checked: None,
             mouse_tracked: false,
             rects: Vec::new(),
             tray_rects: Vec::new(),
@@ -648,10 +670,31 @@ impl Dock {
         let mut pinned_exes: Vec<String> = Vec::new();
         // 解析不出目标的钉选项（CLSID 快捷方式，如 File Explorer）靠名字匹配运行项
         let mut pinned_names: Vec<String> = Vec::new();
-        for lnk in pinned_links() {
-            let target = shell_link_target(&lnk).map(|t| expand_env(&t)).unwrap_or_default();
+        for pin in effective_pins() {
+            // 设置文件里手写 / 从别处粘来的路径可能是正斜杠：Win32 取图标、比对 exe
+            // 都只认反斜杠，这里统一转一遍（ShellExecuteW 两种都吃，转完更保险）
+            let pin = pin.replace('/', "\\");
+            let lnk = PathBuf::from(&pin);
+            let is_lnk = lnk
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("lnk"))
+                .unwrap_or(false);
+            let target = if is_lnk {
+                shell_link_target(&lnk).map(|t| expand_env(&t)).unwrap_or_default()
+            } else {
+                pin.clone()
+            };
             let name = lnk.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            let rgba = pinned_icon(&lnk, &target, px);
+            let rgba = if is_lnk {
+                pinned_icon(&lnk, &target, px)
+            } else {
+                large_icon_of_path(&lnk, px)
+            };
+            // 认不出图标（路径失效 / 权限）就别占一个空格子：留着只会让 Dock 左边空一块
+            if rgba.is_empty() {
+                crate::tlog!("[dock] 固定项 {pin} 取不到图标，跳过");
+                continue;
+            }
             if target.is_empty() {
                 let n = normalize_name(&name);
                 if n.len() >= 8 {
@@ -763,8 +806,8 @@ impl Dock {
             .map(|it| if it.dim { blank.as_slice() } else { it.rgba.as_slice() })
             .collect();
         let out = self.view.paint(
-            w, h, self.scale, &icons, self.hovered, &tray_icons, self.hovered_tray,
-            show_tray, show_desktop, self.hovered_desktop, vertical,
+            w, h, self.scale, &icons, self.hovered, self.active, &tray_icons,
+            self.hovered_tray, show_tray, show_desktop, self.hovered_desktop, vertical,
         );
         self.rects = out.rects.clone();
         self.tray_rects = out.tray_rects.clone();
@@ -1093,6 +1136,24 @@ impl Dock {
         }
     }
 
+    /// 前台应用在 `items` 里的下标：先按窗口句柄精确匹配，再按 exe 兜底
+    /// （同一程序有多个窗口时，前台那个可能不是 Dock 记下的那个）
+    fn active_index(&self) -> Option<usize> {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.0.is_null() {
+            return None;
+        }
+        if let Some(i) = self.items.iter().position(
+            |it| matches!(&it.target, Target::Window(h) if *h == fg),
+        ) {
+            return Some(i);
+        }
+        let exe = exe_path(fg)?.to_lowercase();
+        self.items
+            .iter()
+            .position(|it| !it.exe.is_empty() && it.exe == exe)
+    }
+
     fn activate(&self, idx: usize) {
         let Some(item) = self.items.get(idx) else { return };
         match &item.target {
@@ -1147,6 +1208,20 @@ unsafe fn create_tip_window() -> HWND {
 
 // ---------- 数据采集 ----------
 
+/// 当前生效的固定图标（exe / .lnk 全路径，顺序即显示顺序）。
+///
+/// 设置页还没改过（`settings::dock_pins()` = None）时回落到系统任务栏的钉选，
+/// 这样从旧版本升上来的观感不变；一旦在设置页增删过，就以 Orbit 自己的列表为准。
+pub fn effective_pins() -> Vec<String> {
+    match settings::dock_pins() {
+        Some(list) => list,
+        None => pinned_links()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+    }
+}
+
 /// `%APPDATA%\...\User Pinned\TaskBar` 下的 .lnk（Explorer 的钉选来源）
 fn pinned_links() -> Vec<PathBuf> {
     let Ok(appdata) = std::env::var("APPDATA") else { return Vec::new() };
@@ -1178,6 +1253,22 @@ fn running_apps() -> BTreeMap<String, HWND> {
         }
     }
     map
+}
+
+/// 设置页「添加固定图标」用：正在运行的应用（显示名, exe 全路径），按名字排序
+pub fn running_app_list() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = running_apps()
+        .into_keys()
+        .map(|exe| {
+            let name = PathBuf::from(&exe)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| exe.clone());
+            (name, exe)
+        })
+        .collect();
+    out.sort_by_key(|(n, _)| n.to_lowercase());
+    out
 }
 
 /// 窗口标题（悬停提示用；空标题返回 None）

@@ -13,8 +13,10 @@
 //! - `pill_alpha`         胶囊（含分离模块条）整体透明度 0.2 ~ 1.0，默认 1.0。
 //!                         拉到 100% 时底色**强制实底**（半透明主题也变不透明），
 //!                         见 `config::pill_bg_effective`
-//! - `pill_scale`         胶囊（含模块条 / 音乐条）整体大小 0.8 ~ 1.35，默认 1.0
-//! - `icon_scale`         Dock 图标（连同 Dock 高度与托盘图标）大小 0.8 ~ 1.35，默认 1.0
+//! - `pill_scale`         胶囊（含模块条 / 音乐条）整体大小 0.8 ~ 1.35，默认 1.0。
+//!                         1.0 = 滑条 100%，实际倍率是"老的基准 × 0.85"
+//! - `icon_scale`         Dock 图标（连同 Dock 高度与托盘图标）大小 0.8 ~ 1.35，默认 1.0。
+//!                         1.0 = 滑条 100%，实际倍率是"老的基准 × 0.95"
 //! - `theme`              外观主题 key（`calm_light` / `calm_dark` / `glass2_light` /
 //!                         `glass2_dark` / `m3_light` / `m3_dark`）；三套风格各带深浅色。
 //!                         老版本的 `glass`/`liquid`/`mica`/`paper`/`neon`/`terminal`
@@ -33,6 +35,9 @@
 //! - `show_desktop_btn`   Dock"返回桌面"细长条（0 = 不显示；设置页在「托盘图标」
 //!                          列表的"返回桌面"格里开关）
 //! - `hide_tray`          Dock 上要**单独隐藏**的托盘图标（分号分隔，键由程序生成）
+//! - `dock_pins`          Dock 固定图标（分号分隔的 exe / .lnk 全路径，按顺序显示）。
+//!                          **键不存在**时回落到系统任务栏的钉选；一旦在设置页增删过
+//!                          就以这份列表为准（空值 = 一个都不钉）
 //!
 //! 设置页面（`settingsui.rs`）改值走的也是这里：`set_*` 更新内存 + 重写文件，
 //! 并把 `VERSION` 加一；各窗口在自己的定时器里比对版本号决定是否重绘。
@@ -58,9 +63,14 @@ pub const ALPHA_MAX: f32 = 1.0;
 /// 缩放的是"逻辑点"而不是像素：文字与图标按新尺寸重新排版光栅化，不会发虚。
 pub const PILL_SCALE_MIN: f32 = 0.80;
 pub const PILL_SCALE_MAX: f32 = 1.35;
+/// 滑条"100%"对应的实际倍率：胶囊基准整体收到原来的 85%
+/// （用户要求"默认百分百 = 现在 85% 的大小"，滑条数值本身仍从 1.0 开始算）
+const PILL_SCALE_BASE: f32 = 0.85;
 /// Dock 图标缩放上下限（Dock 高度 / 槽位 / 托盘图标随之等比变化）
 pub const ICON_SCALE_MIN: f32 = 0.80;
 pub const ICON_SCALE_MAX: f32 = 1.35;
+/// 滑条"100%"对应的实际倍率：Dock 整体收到原来的 95%
+const ICON_SCALE_BASE: f32 = 0.95;
 /// AtomicU32 的 0 表示"还没加载"
 const UNLOADED: u32 = 0;
 
@@ -103,6 +113,9 @@ static SHOW_DESKTOP: AtomicU32 = AtomicU32::new(UNLOADED);
 static WECHAT_SOUND: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 被单独隐藏的托盘图标键（`tray::TrayItem::key`）。数量很少，读写都走这把锁
 static HIDE_TRAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Dock 固定图标（exe / .lnk 全路径，按顺序显示）。
+/// `None` = 用户还没在设置页改过 → 由 dock 回落到系统任务栏的钉选
+static DOCK_PINS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 /// 设置版本号：任何值变化（手改文件或设置页面改）都 +1，各窗口据此判断要不要重绘
 static VERSION: AtomicU64 = AtomicU64::new(1);
 /// 正在写盘：这时读文件可能拿到半成品，轮询先跳过
@@ -255,26 +268,46 @@ pub fn persist_pill_alpha() {
 
 // ---------- 尺寸 ----------
 
-/// 胶囊（顶部胶囊 + 分离模块条 + 音乐条）的整体缩放，1.0 = 基准
-pub fn pill_scale() -> f32 {
+/// 滑条上的原始值（1.0 = 滑条 100%），夹到量程内
+pub fn pill_scale_setting() -> f32 {
+    pill_scale_raw()
+}
+
+/// 滑条上的原始值（1.0 = 滑条 100%）
+pub fn icon_scale_setting() -> f32 {
+    icon_scale_raw()
+}
+
+fn pill_scale_raw() -> f32 {
     match PILL_SCALE.load(Ordering::Relaxed) {
         UNLOADED => 1.0,
         bits => f32::from_bits(bits).clamp(PILL_SCALE_MIN, PILL_SCALE_MAX),
     }
 }
 
-/// Dock 图标（连同 Dock 高度 / 槽位 / 托盘图标）的缩放，1.0 = 基准
-pub fn icon_scale() -> f32 {
+fn icon_scale_raw() -> f32 {
     match ICON_SCALE.load(Ordering::Relaxed) {
         UNLOADED => 1.0,
         bits => f32::from_bits(bits).clamp(ICON_SCALE_MIN, ICON_SCALE_MAX),
     }
 }
 
+/// 胶囊（顶部胶囊 + 分离模块条 + 音乐条）的整体缩放，1.0 = 滑条 100%。
+/// 实际绘制倍率已经乘上 `PILL_SCALE_BASE`（100% = 老基准的 85%）。
+pub fn pill_scale() -> f32 {
+    pill_scale_raw() * PILL_SCALE_BASE
+}
+
+/// Dock 图标（连同 Dock 高度 / 槽位 / 托盘图标）的缩放，1.0 = 滑条 100%。
+/// 实际绘制倍率已经乘上 `ICON_SCALE_BASE`（100% = 老基准的 95%）。
+pub fn icon_scale() -> f32 {
+    icon_scale_raw() * ICON_SCALE_BASE
+}
+
 /// 滑条拖动中的即时预览（只改内存 + 通知重绘，不写盘）
 pub fn preview_pill_scale(v: f32) {
     let v = v.clamp(PILL_SCALE_MIN, PILL_SCALE_MAX);
-    if (v - pill_scale()).abs() < 1e-4 {
+    if (v - pill_scale_raw()).abs() < 1e-4 {
         return;
     }
     PILL_SCALE.store(v.to_bits(), Ordering::Relaxed);
@@ -288,7 +321,7 @@ pub fn persist_pill_scale() {
 
 pub fn preview_icon_scale(v: f32) {
     let v = v.clamp(ICON_SCALE_MIN, ICON_SCALE_MAX);
-    if (v - icon_scale()).abs() < 1e-4 {
+    if (v - icon_scale_raw()).abs() < 1e-4 {
         return;
     }
     ICON_SCALE.store(v.to_bits(), Ordering::Relaxed);
@@ -303,7 +336,7 @@ pub fn persist_icon_scale() {
 /// 一步到位地设值（「重置」按钮用）：改内存 + 落盘 + 通知重绘
 pub fn set_pill_scale(v: f32) {
     let v = v.clamp(PILL_SCALE_MIN, PILL_SCALE_MAX);
-    if (v - pill_scale()).abs() < 1e-4 {
+    if (v - pill_scale_raw()).abs() < 1e-4 {
         return;
     }
     PILL_SCALE.store(v.to_bits(), Ordering::Relaxed);
@@ -777,6 +810,28 @@ pub fn version() -> u64 {
     VERSION.load(Ordering::Relaxed)
 }
 
+// ---------- Dock 固定图标 ----------
+
+/// Dock 固定图标列表（exe / .lnk 全路径，按显示顺序）。
+///
+/// `None` = 用户还没在设置页改过 → 调用方回落到系统任务栏的钉选（保持老观感）；
+/// `Some(vec![])` = 用户明确清空了固定列表（一个都不钉）。
+pub fn dock_pins() -> Option<Vec<String>> {
+    DOCK_PINS.lock().ok().and_then(|v| v.clone())
+}
+
+/// 覆盖整个固定列表（设置页的增 / 删 / 清空都走这里）。
+///
+/// 注意：第一次改动必须传"完整的期望列表"——`dock_pins()` 为 `None` 时界面上显示的
+/// 其实是系统任务栏的钉选，调用方要先用 `dock::effective_pins()` 取到实际列表再增删。
+pub fn set_dock_pins(list: Vec<String>) {
+    if let Ok(mut v) = DOCK_PINS.lock() {
+        *v = Some(list);
+    }
+    save();
+    bump();
+}
+
 fn bump() {
     VERSION.fetch_add(1, Ordering::Relaxed);
 }
@@ -845,15 +900,15 @@ fn save() {
         IMAP_PASS.lock().map(|s| s.clone()).unwrap_or_default(),
     );
     let mode = |name: &str| module_mode(name).as_str().to_string();
-    let vals: Vec<(&str, String)> = vec![
+    let mut vals: Vec<(&str, String)> = vec![
         ("clock_format", fmt),
         ("module_order", order),
         ("weather_mode", mode("weather")),
         ("mail_mode", mode("mail")),
         ("clipboard_mode", mode("clipboard")),
         ("pill_alpha", trim_num(pill_alpha())),
-        ("pill_scale", trim_num(pill_scale())),
-        ("icon_scale", trim_num(icon_scale())),
+        ("pill_scale", trim_num(pill_scale_raw())),
+        ("icon_scale", trim_num(icon_scale_raw())),
         ("theme", crate::theme::cur().key.to_string()),
         ("pill_anchor", pill_anchor().as_str().to_string()),
         ("dock_anchor", dock_anchor().as_str().to_string()),
@@ -871,6 +926,10 @@ fn save() {
         ("wechat_sound", on_off(wechat_sound()).to_string()),
         ("hide_tray", hidden_tray().join(";")),
     ];
+    // 固定列表按需写：用户还没改过（None）就不落键，免得把系统任务栏钉选"写空"
+    if let Some(pins) = dock_pins() {
+        vals.push(("dock_pins", pins.join(";")));
+    }
     let raw = std::fs::read_to_string(path()).unwrap_or_default();
     let mut out = String::with_capacity(raw.len() + 128);
     let mut seen: Vec<&str> = Vec::with_capacity(vals.len());
@@ -1096,7 +1155,7 @@ mail_mode=right
 clipboard_mode=right
 # 胶囊透明度（0.2 ~ 1.0，含分离出去的模块条）
 pill_alpha=1.0
-# 胶囊整体大小 / Dock 图标大小（1.0 为基准，0.8 ~ 1.35；设置页里有滑条和「重置」）
+# 胶囊整体大小 / Dock 图标大小（1.0 = 滑条 100%，0.8 ~ 1.35；设置页里有滑条和「重置」）
 pill_scale=1
 icon_scale=1
 # 外观主题（每套都有深色 + 浅色）：calm_light/calm_dark（平静极简）/
@@ -1152,7 +1211,11 @@ fn append_missing() {
         ("module_order", "# 顶部胶囊模块排列（拖动排序写回）\nmodule_order=weather,mail,clipboard\n"),
         ("weather_mode", "# 模块摆哪：pill / left / right / off\nweather_mode=left\nmail_mode=right\nclipboard_mode=right\n"),
         ("pill_alpha", "# 胶囊透明度（0.2 ~ 1.0）\npill_alpha=1.0\n"),
-        ("pill_scale", "# 胶囊 / Dock 图标大小（1.0 为基准，0.8 ~ 1.35）\npill_scale=1\nicon_scale=1\n"),
+        (
+            "pill_scale",
+            "# 胶囊 / Dock 图标大小（1.0 = 滑条 100%，0.8 ~ 1.35；设置页有滑条和「重置」）\n\
+             pill_scale=1\nicon_scale=1\n",
+        ),
         (
             "theme",
             "# 外观主题：calm_light/calm_dark（平静极简）/ glass2_light/glass2_dark（玻璃 2.0）\n\
@@ -1201,6 +1264,7 @@ fn load() {
     let mut desktop = cfg::SHOW_DESKTOP_BTN;
     let mut wsound = true;
     let mut hide_tray: Vec<String> = Vec::new();
+    let mut dpins: Option<Vec<String>> = None;
     let mut alpha = 1.0f32;
     let mut pscale = 1.0f32;
     let mut iscale = 1.0f32;
@@ -1295,6 +1359,7 @@ fn load() {
             "imap_user" => iuser = Some(v.to_string()),
             "imap_pass" => ipass = Some(v.to_string()),
             "hide_tray" => hide_tray = parse_hide(v),
+            "dock_pins" => dpins = Some(parse_list(v)),
             "weather_text_scale" => {
                 if let Some(n) = parse_num(v) {
                     scale = n.clamp(SCALE_MIN, SCALE_MAX);
@@ -1423,6 +1488,11 @@ fn load() {
     if let Ok(mut v) = HIDE_TRAY.lock() {
         *v = hide_tray;
     }
+    if let Some(p) = dpins {
+        if let Ok(mut v) = DOCK_PINS.lock() {
+            *v = Some(p);
+        }
+    }
 }
 
 /// 布尔：1/0、true/false、on/off、开/关
@@ -1438,13 +1508,18 @@ fn parse_num(v: &str) -> Option<f32> {
     v.trim().parse::<f32>().ok().filter(|n| n.is_finite())
 }
 
-/// 隐藏列表写盘用 `;` 分隔；读到空值 = 全部显示
-fn parse_hide(v: &str) -> Vec<String> {
+/// 分号分隔的字符串列表（`hide_tray` 的图标键、`dock_pins` 的路径都走它）
+fn parse_list(v: &str) -> Vec<String> {
     v.split(';')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// 隐藏列表写盘用 `;` 分隔；读到空值 = 全部显示
+fn parse_hide(v: &str) -> Vec<String> {
+    parse_list(v)
 }
 
 fn mtime() -> u64 {
@@ -1501,6 +1576,16 @@ mod tests {
         assert_eq!(migrate_place("pill"), Some((ModuleMode::Pill, 0)));
         assert_eq!(migrate_place("right3"), Some((ModuleMode::BarRight, 3)));
         assert_eq!(migrate_place("左下"), None);
+    }
+
+    #[test]
+    fn semicolon_lists_are_trimmed() {
+        assert_eq!(
+            parse_list(" C:/a.exe ; D:/b.lnk ;;"),
+            vec!["C:/a.exe".to_string(), "D:/b.lnk".to_string()]
+        );
+        assert!(parse_list("").is_empty());
+        assert!(parse_list(" ; ; ").is_empty());
     }
 
     #[test]

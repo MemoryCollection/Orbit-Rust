@@ -34,8 +34,8 @@ pub const PILL_H: f32 = 44.0;
 pub const PAD_X: f32 = 18.0;
 /// 时钟字号（粗体）：日期与时间**合并成一段**，整段共用这个字号
 pub const TIME_SIZE: f32 = 20.0;
-/// 元素间距
-pub const GAP: f32 = 10.0;
+/// 元素间距（时钟 ↔ 模块、模块 ↔ 模块）
+pub const GAP: f32 = 7.0;
 /// 图标悬停背景边长
 pub const ICON_BG: f32 = 26.0;
 /// 分隔线高度
@@ -84,9 +84,9 @@ pub const WIDGET_BAR_GAP: i32 = 6;
 /// 每侧最多分几条（= `slot` 取值上限，也决定 widgetbar 预建的窗口数）
 pub const WIDGET_BAR_MAX_SLOT: u8 = 3;
 /// 模块条的左右内边距
-pub const WIDGET_BAR_PAD_X: f32 = 10.0;
-/// 模块条内相邻 widget 的间距（比胶囊里松一点，单独一条时更透得过气）
-pub const WIDGET_BAR_ITEM_GAP: f32 = 4.0;
+pub const WIDGET_BAR_PAD_X: f32 = 8.0;
+/// 模块条内相邻 widget 的间距
+pub const WIDGET_BAR_ITEM_GAP: f32 = 3.0;
 /// widget 符号图标字号（Segoe UI Symbol，只作为字形蒙版的渲染基准）
 pub const WIDGET_ICON_SIZE: f32 = 15.0;
 /// 图标格子边长：所有 widget 图标都占同样大的格子，间距才均匀
@@ -97,9 +97,9 @@ pub const WIDGET_GLYPH_INK: f32 = 12.5;
 /// widget 文本字号
 pub const WIDGET_TEXT_SIZE: f32 = 13.0;
 /// 符号与文本之间的间距
-pub const WIDGET_ICON_GAP: f32 = 4.0;
+pub const WIDGET_ICON_GAP: f32 = 3.0;
 /// widget 悬停背景的左右内边距
-pub const WIDGET_PAD_X: f32 = 5.0;
+pub const WIDGET_PAD_X: f32 = 4.0;
 /// 胶囊右侧的托盘闪烁图标显示边长（位图，非字形）
 pub const FLASH_ICON: f32 = 22.0;
 /// 闪烁判定窗口：最后一次"灭帧"后多久内还算"正在闪烁"（毫秒）。
@@ -133,11 +133,11 @@ pub const MAIL_FETCH: usize = 6;
 // ---------- 展开面板 ----------
 
 /// 内边距
-pub const PANEL_PAD: f32 = 16.0;
+pub const PANEL_PAD: f32 = 12.0;
 /// 标题区高度（含副标题）
-pub const PANEL_HEAD_H: f32 = 58.0;
+pub const PANEL_HEAD_H: f32 = 48.0;
 /// 每行高度
-pub const PANEL_ROW_H: f32 = 46.0;
+pub const PANEL_ROW_H: f32 = 40.0;
 /// 面板最小/最大宽度
 pub const PANEL_MIN_W: f32 = 210.0;
 pub const PANEL_MAX_W: f32 = 360.0;
@@ -151,15 +151,15 @@ pub const PANEL_ROW_TITLE: f32 = 13.5;
 pub const PANEL_ROW_SUB: f32 = 11.5;
 pub const PANEL_VALUE_SIZE: f32 = 13.0;
 /// 图标与文字的间距
-pub const PANEL_ICON_GAP: f32 = 8.0;
+pub const PANEL_ICON_GAP: f32 = 7.0;
 /// 标题与右侧数值的间距
-pub const PANEL_VALUE_GAP: f32 = 14.0;
+pub const PANEL_VALUE_GAP: f32 = 12.0;
 
 // ---------- 天气面板（宽卡片，左当前 / 右四天）----------
 
-pub const WEATHER_PANEL_W: f32 = 560.0;
+pub const WEATHER_PANEL_W: f32 = 520.0;
 /// 卡片高度基准（实际高度取 `WEATHER_PANEL_H * 0.88 * 字号倍率`，左栏更高时再撑高）
-pub const WEATHER_PANEL_H: f32 = 190.0;
+pub const WEATHER_PANEL_H: f32 = 172.0;
 /// 大字号温度
 pub const WEATHER_TEMP_SIZE: f32 = 34.0;
 /// 左侧大图标
@@ -212,8 +212,8 @@ pub const DOCK_TRAY_ICON: f32 = DOCK_ICON;
 pub const DOCK_TRAY_SLOT: f32 = DOCK_SLOT;
 /// Dock 托盘区：图标间距
 pub const DOCK_TRAY_GAP: f32 = DOCK_GAP;
-/// Dock 托盘区与左侧应用图标之间的间距（分隔线两侧各留这么多）
-pub const DOCK_TRAY_SEP: f32 = 8.0;
+/// 前台应用指示条厚度（逻辑点）。长度按槽位的 30% 算，见 `dockview`
+pub const DOCK_ACTIVE_H: f32 = 3.0;
 
 // ---------- Dock：返回桌面（右端细竖条）----------
 
