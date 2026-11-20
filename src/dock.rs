@@ -29,7 +29,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, EnumWindows, GetClassNameW, GetForegroundWindow,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HMENU, IsIconic, IsWindowVisible, PostMessageW, RegisterWindowMessageW,
+    GetWindowThreadProcessId, HICON, HMENU, IsIconic, IsWindowVisible, LoadImageW, PostMessageW,
+    RegisterWindowMessageW, IMAGE_ICON, LR_LOADFROMFILE,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWLP_USERDATA,
     GW_OWNER, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, SWP_NOACTIVATE, SW_HIDE, SW_RESTORE,
     SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN,
@@ -129,6 +130,11 @@ pub struct Dock {
     active: Option<usize>,
     /// 上次查前台应用的时刻（70ms 定时器里节流，别每帧都去 OpenProcess）
     active_checked: Option<Instant>,
+    /// 用户"指定了图标"的托盘项像素（键 → 预乘外的 straight RGBA）。
+    /// 只有本帧要画的托盘项才在这里，避免每帧都去 exe 里抠图标
+    over_px: Vec<(String, Vec<u8>)>,
+    /// 上次构建 `over_px` 的 (设置版本, 图标像素边长)
+    over_key: (u64, i32),
     mouse_tracked: bool,
     /// 每个应用图标槽位 [x, y, size]（client 坐标）
     rects: Vec<[f32; 3]>,
@@ -430,6 +436,8 @@ impl Dock {
             hovered: None,
             active: None,
             active_checked: None,
+            over_px: Vec::new(),
+            over_key: (0, 0),
             mouse_tracked: false,
             rects: Vec::new(),
             tray_rects: Vec::new(),
@@ -772,6 +780,10 @@ impl Dock {
         self.refresh_tray_shown();
         self.hide_dock_duplicates();
         self.seen_settings = settings::version();
+        // 托盘图标允许在设置页"指定图标"（源 exe 的 256px 大图标）。
+        // 缓存必须在构造 icons/tray_icons 的借用之前刷新
+        let tray_px = (cfg::DOCK_TRAY_ICON * self.scale * settings::icon_scale()).round() as i32;
+        self.refresh_icon_over(tray_px);
         let show_tray = settings::show_tray();
         let show_desktop = settings::show_desktop_btn();
         let n = self.items.len();
@@ -803,7 +815,16 @@ impl Dock {
         let blank = vec![0u8; shown_items.first().map(|it| it.rgba.len()).unwrap_or(0)];
         let tray_icons: Vec<&[u8]> = shown_items
             .iter()
-            .map(|it| if it.dim { blank.as_slice() } else { it.rgba.as_slice() })
+            .map(|it| {
+                if it.dim {
+                    return blank.as_slice();
+                }
+                let k = it.key();
+                match self.over_px.iter().find(|(kk, _)| *kk == k) {
+                    Some((_, px)) => px.as_slice(),
+                    None => it.rgba.as_slice(),
+                }
+            })
             .collect();
         let out = self.view.paint(
             w, h, self.scale, &icons, self.hovered, self.active, &tray_icons,
@@ -1136,6 +1157,25 @@ impl Dock {
         }
     }
 
+    /// 重建"用户指定了图标"的托盘项像素缓存（设置版本或图标尺寸变了才做）
+    fn refresh_icon_over(&mut self, px: i32) {
+        let ver = settings::version();
+        if self.over_key == (ver, px) {
+            return;
+        }
+        self.over_key = (ver, px);
+        self.over_px.clear();
+        let keys: Vec<String> = self.tray.items.iter().map(|it| it.key()).collect();
+        for k in keys {
+            if settings::icon_override(&k).is_none() {
+                continue;
+            }
+            if let Some(rgba) = override_icon(&k, px) {
+                self.over_px.push((k, rgba));
+            }
+        }
+    }
+
     /// 前台应用在 `items` 里的下标：先按窗口句柄精确匹配，再按 exe 兜底
     /// （同一程序有多个窗口时，前台那个可能不是 Dock 记下的那个）
     fn active_index(&self) -> Option<usize> {
@@ -1207,6 +1247,22 @@ unsafe fn create_tip_window() -> HWND {
 }
 
 // ---------- 数据采集 ----------
+
+/// 查"图标指定"：给某个托盘图标键返回用户指定的图标像素。
+///
+/// 托盘图标常只有 16px 的 hIcon，放大到 Dock 尺寸必然糊。用户在设置页指定一个
+/// 图标源（exe / dll / .ico / png…）后，这里读它的图标顶上；没指定 / 读不到返回 None。
+/// 只作用于托盘图标：钉选项和运行项读的是 exe 自带大图标，不参与"指定"。
+pub fn override_icon(key: &str, px: i32) -> Option<Vec<u8>> {
+    let path = settings::icon_override(key)?;
+    let p = PathBuf::from(path.replace('/', "\\"));
+    let rgba = large_icon_of_path(&p, px);
+    if rgba.is_empty() {
+        crate::tlog!("[dock] 指定的图标源 {path} 读不到图标");
+        return None;
+    }
+    Some(rgba)
+}
 
 /// 当前生效的固定图标（exe / .lnk 全路径，顺序即显示顺序）。
 ///
@@ -1380,8 +1436,24 @@ fn pinned_icon(lnk: &std::path::Path, target: &str, px: i32) -> Vec<u8> {
     large_icon_of_path(lnk, px)
 }
 
-/// 取 256px 系统图像列表图标并高质量缩放到 px；取不到则退回 32px 直接绘制
+/// 取 256px 系统图像列表图标并高质量缩放到 px；取不到则退回 32px 直接绘制。
+/// `.ico` 走 `LoadImageW`（外壳对 .ico 只回"图标文件"的类型图标，不是里面那张图），
+/// 常见位图（png/jpg…）走 GDI+ 解码 —— 这样「图标指定」既能挑程序也能挑图片。
 pub(crate) fn large_icon_of_path(path: &std::path::Path, px: i32) -> Vec<u8> {
+    if path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("ico"))
+        .unwrap_or(false)
+    {
+        if let Some(rgba) = icon_from_ico_file(path, px) {
+            return rgba;
+        }
+    }
+    if is_bitmap_ext(path) {
+        if let Some(rgba) = icon_from_image_file(path, px) {
+            return rgba;
+        }
+    }
     let wide = to_wide(path.as_os_str());
     unsafe {
         let mut info = SHFILEINFOW::default();
@@ -1422,6 +1494,51 @@ pub(crate) fn large_icon_of_path(path: &std::path::Path, px: i32) -> Vec<u8> {
         let _ = DestroyIcon(fallback.hIcon);
         rgba
     }
+}
+
+/// 从 `.ico` 文件读图标。图标文件里一般并存 16/32/48/256 多档，
+/// 先按目标边长取（命中即像素级清晰），退而取 256 再高质量缩放。
+fn icon_from_ico_file(path: &std::path::Path, px: i32) -> Option<Vec<u8>> {
+    let wide = to_wide(path.as_os_str());
+    unsafe {
+        for size in [px, 256, 48] {
+            let h = LoadImageW(
+                None,
+                PCWSTR(wide.as_ptr()),
+                IMAGE_ICON,
+                size,
+                size,
+                LR_LOADFROMFILE,
+            );
+            let Ok(h) = h else { continue };
+            let hicon = HICON(h.0);
+            let rgba = render::capture_icon_rgba(hicon, size);
+            let _ = DestroyIcon(hicon);
+            let Some(rgba) = rgba else { continue };
+            if size == px {
+                return Some(rgba);
+            }
+            return Some(render::resize_rgba(&rgba, size, size, px, px));
+        }
+        None
+    }
+}
+
+/// 位图图标源（GDI+ 能解的格式；.ico 另走 `LoadImageW`）
+fn is_bitmap_ext(path: &std::path::Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => matches!(
+            e.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "bmp" | "gif"
+        ),
+        None => false,
+    }
+}
+
+/// 从图片文件读图标：GDI+ 解码 + 居中裁方 + 缩放到 px
+fn icon_from_image_file(path: &std::path::Path, px: i32) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    render::decode_cover(&bytes, px)
 }
 
 /// 展开 `%windir%` 这类环境变量（.lnk 的目标常带变量）

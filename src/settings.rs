@@ -35,6 +35,8 @@
 //! - `show_desktop_btn`   Dock"返回桌面"细长条（0 = 不显示；设置页在「托盘图标」
 //!                          列表的"返回桌面"格里开关）
 //! - `hide_tray`          Dock 上要**单独隐藏**的托盘图标（分号分隔，键由程序生成）
+//! - `icon_over`          Dock 图标指定（分号分隔的 `键|exe全路径`）：键是托盘图标键
+//!                         或 `app:<exe小写>`；值是拿图标的 exe / .lnk
 //! - `dock_pins`          Dock 固定图标（分号分隔的 exe / .lnk 全路径，按顺序显示）。
 //!                          **键不存在**时回落到系统任务栏的钉选；一旦在设置页增删过
 //!                          就以这份列表为准（空值 = 一个都不钉）
@@ -116,6 +118,10 @@ static HIDE_TRAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Dock 固定图标（exe / .lnk 全路径，按顺序显示）。
 /// `None` = 用户还没在设置页改过 → 由 dock 回落到系统任务栏的钉选
 static DOCK_PINS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+/// 图标指定：键（托盘图标键 / `app:<exe>`）→ 取图标的 exe/.lnk 全路径。
+/// 有些程序注册的托盘 hIcon 只有 16px，放大到 Dock 尺寸必然糊，用户可以指定一个
+/// 图标清晰的 exe 顶替它。
+static ICON_OVER: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// 设置版本号：任何值变化（手改文件或设置页面改）都 +1，各窗口据此判断要不要重绘
 static VERSION: AtomicU64 = AtomicU64::new(1);
 /// 正在写盘：这时读文件可能拿到半成品，轮询先跳过
@@ -804,6 +810,52 @@ pub fn clear_hidden_tray() {
     }
 }
 
+// ---------- 图标指定 ----------
+
+/// 图标指定表：`(键, 取图标的 exe/.lnk)`
+pub fn icon_overrides() -> Vec<(String, String)> {
+    ICON_OVER.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+/// 查某个键（托盘图标键 / `app:<exe>`）有没有被指定图标
+pub fn icon_override(key: &str) -> Option<String> {
+    ICON_OVER
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, p)| p.clone())
+}
+
+/// 指定 / 取消指定某个键的图标来源（`None` = 恢复默认）
+pub fn set_icon_override(key: &str, path: Option<&str>) {
+    let mut changed = false;
+    if let Ok(mut v) = ICON_OVER.lock() {
+        let pos = v.iter().position(|(k, _)| k.eq_ignore_ascii_case(key));
+        match (path.map(str::trim).filter(|p| !p.is_empty()), pos) {
+            (Some(p), Some(i)) => {
+                if !v[i].1.eq_ignore_ascii_case(p) {
+                    v[i].1 = p.to_string();
+                    changed = true;
+                }
+            }
+            (Some(p), None) => {
+                v.push((key.to_string(), p.to_string()));
+                changed = true;
+            }
+            (None, Some(i)) => {
+                v.remove(i);
+                changed = true;
+            }
+            (None, None) => {}
+        }
+    }
+    if changed {
+        save();
+        bump();
+    }
+}
+
 /// 设置版本号：任何一项变化都 +1。各窗口记下自己见过的版本，
 /// 对不上就重绘——比"谁先看到 mtime 变化"更可靠（设置页面改值不经过 mtime 轮询）。
 pub fn version() -> u64 {
@@ -930,6 +982,11 @@ fn save() {
     if let Some(pins) = dock_pins() {
         vals.push(("dock_pins", pins.join(";")));
     }
+    let overs: Vec<String> = icon_overrides()
+        .into_iter()
+        .map(|(k, p)| format!("{k}|{p}"))
+        .collect();
+    vals.push(("icon_over", overs.join(";")));
     let raw = std::fs::read_to_string(path()).unwrap_or_default();
     let mut out = String::with_capacity(raw.len() + 128);
     let mut seen: Vec<&str> = Vec::with_capacity(vals.len());
@@ -1265,6 +1322,7 @@ fn load() {
     let mut wsound = true;
     let mut hide_tray: Vec<String> = Vec::new();
     let mut dpins: Option<Vec<String>> = None;
+    let mut iover: Vec<(String, String)> = Vec::new();
     let mut alpha = 1.0f32;
     let mut pscale = 1.0f32;
     let mut iscale = 1.0f32;
@@ -1360,6 +1418,7 @@ fn load() {
             "imap_pass" => ipass = Some(v.to_string()),
             "hide_tray" => hide_tray = parse_hide(v),
             "dock_pins" => dpins = Some(parse_list(v)),
+            "icon_over" => iover = parse_pairs(v),
             "weather_text_scale" => {
                 if let Some(n) = parse_num(v) {
                     scale = n.clamp(SCALE_MIN, SCALE_MAX);
@@ -1493,6 +1552,9 @@ fn load() {
             *v = Some(p);
         }
     }
+    if let Ok(mut v) = ICON_OVER.lock() {
+        *v = iover;
+    }
 }
 
 /// 布尔：1/0、true/false、on/off、开/关
@@ -1506,6 +1568,17 @@ fn parse_bool(v: &str) -> Option<bool> {
 
 fn parse_num(v: &str) -> Option<f32> {
     v.trim().parse::<f32>().ok().filter(|n| n.is_finite())
+}
+
+/// `键|值` 对，分号分隔（`icon_over` 用）。键和值里都不允许出现 `|` 或 `;`
+fn parse_pairs(v: &str) -> Vec<(String, String)> {
+    v.split(';')
+        .filter_map(|item| {
+            let (k, p) = item.split_once('|')?;
+            let (k, p) = (k.trim(), p.trim());
+            (!k.is_empty() && !p.is_empty()).then(|| (k.to_string(), p.to_string()))
+        })
+        .collect()
 }
 
 /// 分号分隔的字符串列表（`hide_tray` 的图标键、`dock_pins` 的路径都走它）
@@ -1586,6 +1659,21 @@ mod tests {
         );
         assert!(parse_list("").is_empty());
         assert!(parse_list(" ; ; ").is_empty());
+    }
+
+    #[test]
+    fn icon_over_pairs_keep_windows_paths() {
+        // 键里带盘符冒号和 `#uid`，值里带盘符冒号：只能用 `|` 分隔，别拿 `:` 或 `=` 切
+        let v = "e:d:\\tencent\\workbuddy\\workbuddy.exe#3|D:/sh\\ic.png;\
+                 g:GUID(0x1, 0x2, 0x3, [0x4])|C:\\a\\b.ico";
+        let got = parse_pairs(v);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "e:d:\\tencent\\workbuddy\\workbuddy.exe#3");
+        assert_eq!(got[0].1, "D:/sh\\ic.png");
+        assert_eq!(got[1].1, "C:\\a\\b.ico");
+        // 缺 `|` 或空白的半边直接丢掉，不要产生 "键→空路径" 这种脏数据
+        assert!(parse_pairs("only_key").is_empty());
+        assert!(parse_pairs("k|").is_empty());
     }
 
     #[test]

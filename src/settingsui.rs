@@ -153,6 +153,22 @@ fn argb(argb: u32) -> egui::Color32 {
 
 /// 把颜色整体调亮/调暗：`k > 1` 提亮、`k < 1` 压暗（alpha 不变）。
 /// 用来从面板底色派生输入框底、非交互控件底这些"同一色系的邻近色"。
+/// 强调色填充上该用的文字色：按填充亮度选深底白字 / 浅底深字。
+///
+/// M3 深色的主色是浅紫（`#C8BEF0`），压在它上面的白字几乎读不出来；统一按亮度
+/// 反选就能同时照顾浅色主题（深强调色 → 白字）。
+fn ink_on(fill: u32) -> egui::Color32 {
+    let r = ((fill >> 16) & 0xFF) as f32;
+    let g = ((fill >> 8) & 0xFF) as f32;
+    let b = (fill & 0xFF) as f32;
+    let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    if lum > 150.0 {
+        egui::Color32::from_rgb(0x1C, 0x1A, 0x1F)
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
 fn shade(c: u32, k: f32) -> u32 {
     let ch = |v: u32| ((v as f32 * k).round().clamp(0.0, 255.0)) as u32;
     (c & 0xFF00_0000) | (ch((c >> 16) & 0xFF) << 16) | (ch((c >> 8) & 0xFF) << 8) | ch(c & 0xFF)
@@ -202,7 +218,8 @@ fn apply_style(ctx: &egui::Context) {
         v.window_fill = panel;
         v.override_text_color = Some(text_body);
         v.selection.bg_fill = accent;
-        v.selection.stroke = egui::Stroke::NONE;
+        // 选中项的文字色跟着强调色的亮度走（否则浅紫底 + 白字读不清）
+        v.selection.stroke = egui::Stroke::new(0.0, ink_on(t.accent));
         v.widgets.hovered.bg_fill = hover;
         v.widgets.active.bg_fill = hover;
         v.window_corner_radius = egui::CornerRadius::same(WIN_RADIUS as u8);
@@ -348,34 +365,57 @@ impl eframe::App for SettingsApp {
                     .inner_margin(14.0),
             )
             .show(ui, |ui| {
-                self.header(ui, &ctx);
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    // 左：分组导航（显式 vertical，防止布局方向从 horizontal 继承）
-                    ui.vertical(|ui| {
-                        ui.set_width(NAV_W);
-                        for g in Group::ALL {
-                            let sel = self.group == g;
-                            let txt = egui::RichText::new(g.label()).size(13.0);
-                            if ui
-                                .add_sized([NAV_W, 30.0], egui::Button::selectable(sel, txt))
-                                .clicked()
-                            {
-                                self.group = g;
-                            }
-                        }
+                // 用「顶栏 + 左侧导航 + 内容」三段面板：内容区的 ScrollArea 才能拿到
+                // 整块剩余高度。早先塞在 `ui.horizontal` 里时，它的可用高度会被
+                // 前面那块导航列"传染"，右栏只剩两百来像素、下面内容全被裁掉。
+                egui::Panel::top("set_hdr")
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        self.header(ui, &ctx);
+                        ui.add_space(6.0);
                     });
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(12.0);
-                    // 右：所选分组的详细设置（组内滚动；
-                    // ScrollArea 会继承父布局方向，内容必须显式 top_down）
-                    let detail_w = ui.available_width();
+
+                egui::Panel::left("set_nav")
+                    .resizable(false)
+                    .exact_size(NAV_W + 8.0)
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(NAV_W);
+                            for g in Group::ALL {
+                                let sel = self.group == g;
+                                let txt = egui::RichText::new(g.label())
+                                    .size(13.0)
+                                    .color(if sel {
+                                        ink_on(cfg::cur().accent)
+                                    } else {
+                                        argb(cfg::cur().text_body)
+                                    });
+                                if ui
+                                    .add_sized([NAV_W, 30.0], egui::Button::selectable(sel, txt))
+                                    .clicked()
+                                {
+                                    self.group = g;
+                                }
+                            }
+                        });
+                        // 导航列右侧的竖线（原来是 horizontal 里的 separator）
+                        let r = ui.max_rect();
+                        ui.painter().vline(
+                            r.right() - 1.0,
+                            r.y_range(),
+                            egui::Stroke::new(1.0, argb(cfg::cur().divider)),
+                        );
+                    });
+
+                egui::CentralPanel::no_frame().show(ui, |ui| {
                     egui::ScrollArea::vertical()
-                        .auto_shrink([false, true])
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                ui.set_width(detail_w);
+                                // 取滚动区自己的可用宽度：出滚动条后要自动减掉，
+                                // 否则右侧「移除 / 指定图标…」按钮会被挤出可视区
+                                ui.set_width(ui.available_width());
                                 self.detail(ui, ver_changed);
                             });
                         });
@@ -662,7 +702,7 @@ impl SettingsApp {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.add(egui::Button::new("浏览程序…").small()).clicked() {
-                if let Some(path) = pick_program() {
+                if let Some(path) = pick_program(false) {
                     let mut list = pins.clone();
                     if !list.iter().any(|p| p.eq_ignore_ascii_case(&path)) {
                         list.push(path);
@@ -674,6 +714,68 @@ impl SettingsApp {
                 settings::set_dock_pins(Vec::new());
             }
         });
+
+        ui.add_space(10.0);
+        self.icon_override(ui);
+    }
+
+    /// 图标指定：某些程序注册的托盘 hIcon 只有 16px，放大到 Dock 必然糊。
+    /// 这里可以给某个图标单挑一个 exe，Orbit 会读它的 256px 图标顶上。
+    fn icon_override(&mut self, ui: &mut egui::Ui) {
+        section(ui, "图标指定");
+        ui.label(
+            egui::RichText::new(
+                "托盘图标糊的话，可以给它换一张：选程序的 exe / dll，或 .ico / png 等图标图片",
+            )
+            .size(11.5)
+            .weak(),
+        );
+
+        let overs = settings::icon_overrides();
+        for (key, path) in &overs {
+            let target = override_target_name(key);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(egui::RichText::new(target).size(12.5));
+                ui.label(
+                    egui::RichText::new(format!("→ {}", pin_label(path)))
+                        .size(11.5)
+                        .color(argb(cfg::cur().accent)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("还原").small()).clicked() {
+                        settings::set_icon_override(key, None);
+                    }
+                });
+            });
+        }
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("可选托盘图标").size(11.5).weak());
+        // 候选只有托盘图标：任务栏（钉选项 / 运行项）读的是 exe 自带的大图标，本来就不糊
+        let mut cands: Vec<(String, String)> = tray_entries().into_iter().collect();
+        let mut shown = 0;
+        for (key, name) in cands {
+            if overs.iter().any(|(k, _)| k.eq_ignore_ascii_case(&key)) {
+                continue;
+            }
+            if shown >= 16 {
+                ui.label(egui::RichText::new("…（更多图标请先关掉一些再刷新）").size(11.5).weak());
+                break;
+            }
+            shown += 1;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(egui::RichText::new(name).size(12.5));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("指定图标…").small()).clicked() {
+                        if let Some(path) = pick_program(true) {
+                            settings::set_icon_override(&key, Some(&path));
+                        }
+                    }
+                });
+            });
+        }
     }
 
     fn detail_music(&mut self, ui: &mut egui::Ui) {
@@ -758,7 +860,11 @@ impl SettingsApp {
                 if ui
                     .add(egui::Button::selectable(
                         sel,
-                        egui::RichText::new(name).size(12.5),
+                        egui::RichText::new(name).size(12.5).color(if sel {
+                            ink_on(cfg::cur().accent)
+                        } else {
+                            argb(cfg::cur().text_body)
+                        }),
                     ))
                     .clicked()
                 {
@@ -770,7 +876,11 @@ impl SettingsApp {
             if ui
                 .add(egui::Button::selectable(
                     custom,
-                    egui::RichText::new("自定义").size(12.5),
+                    egui::RichText::new("自定义").size(12.5).color(if custom {
+                        ink_on(cfg::cur().accent)
+                    } else {
+                        argb(cfg::cur().text_body)
+                    }),
                 ))
                 .clicked()
             {
@@ -1125,7 +1235,14 @@ fn seg(ui: &mut egui::Ui, options: &[&str], active: usize) -> Option<usize> {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (i, o) in options.iter().enumerate() {
-            let btn = egui::Button::selectable(i == active, egui::RichText::new(*o).size(12.0));
+            let btn = egui::Button::selectable(
+                i == active,
+                egui::RichText::new(*o).size(12.0).color(if i == active {
+                    ink_on(cfg::cur().accent)
+                } else {
+                    argb(cfg::cur().text_body)
+                }),
+            );
             if ui.add(btn).clicked() {
                 pick = Some(i);
             }
@@ -1161,6 +1278,18 @@ fn pins_view() -> (Vec<String>, Vec<(String, String)>) {
     (pins, running)
 }
 
+/// 图标指定的键 → 给人看的名字：`app:<exe>` 取文件名，托盘键在托盘表里查 tooltip
+fn override_target_name(key: &str) -> String {
+    if let Some(exe) = key.strip_prefix("app:") {
+        return pin_label(exe);
+    }
+    tray_entries()
+        .into_iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, n)| n)
+        .unwrap_or_else(|| pin_label(key))
+}
+
 /// 固定列表里显示的名字：去掉目录和扩展名
 fn pin_label(path: &str) -> String {
     std::path::Path::new(path)
@@ -1170,16 +1299,19 @@ fn pin_label(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// 挑一个 exe / 快捷方式（系统「打开文件」对话框）
-fn pick_program() -> Option<String> {
+/// 挑一个文件：`for_icon` = 图标源（exe / dll / ico 都行），否则只要程序（exe / 快捷方式）
+fn pick_program(for_icon: bool) -> Option<String> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::UI::Controls::Dialogs::{
         GetOpenFileNameW, OPENFILENAMEW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST,
     };
     let mut buf = vec![0u16; 1024];
-    let filter: Vec<u16> = "程序 (*.exe;*.lnk)\0*.exe;*.lnk\0所有文件 (*.*)\0*.*\0\0"
-        .encode_utf16()
-        .collect();
+    let spec = if for_icon {
+        "程序或图标 (*.exe;*.dll;*.ico;*.png;*.jpg)\0*.exe;*.dll;*.ico;*.png;*.jpg;*.bmp\0图标文件 (*.ico)\0*.ico\0图片 (*.png;*.jpg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0所有文件 (*.*)\0*.*\0\0"
+    } else {
+        "程序 (*.exe;*.lnk)\0*.exe;*.lnk\0所有文件 (*.*)\0*.*\0\0"
+    };
+    let filter: Vec<u16> = spec.encode_utf16().collect();
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         lpstrFile: PWSTR(buf.as_mut_ptr()),

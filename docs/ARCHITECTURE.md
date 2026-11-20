@@ -124,7 +124,7 @@ main.rs → app.rs（启动/消息循环）
 | `data/mail.txt` | IMAP 账号（host/port/user/pass 授权码），首次运行由 `config.rs` 默认值生成 |
 | `data/mail_read.txt` | 已读邮件的 IMAP UID，一行一个（服务器 `\Seen` 的本地兜底） |
 | `data/clipboard.txt` | 剪贴板历史，每行 `时间 \x1f 固定标记 \x1f 文本`（换行转义 `\x1e`；老格式两字段按未固定读入） |
-| `data/settings.txt` | 可调设置，`key=value` 一行一个：`clock_format`（strftime 格式串，默认 `%Y-%m-%d %H:%M:%S`）、`module_order`（模块排序列表）、`weather_mode` / `mail_mode` / `clipboard_mode`（pill/left/right/off）、`pill_alpha`（0.2~1.0）、`pill_anchor`（float/island/bottom）、`dock_anchor`（bottom/top/left/right）、`weather_text_scale`（0.8~1.8，默认 1.25）、`lyric_position`（right/left/bottom）、`lyric_size`（10~26，默认 14）、`weather_source`（amap/openmeteo）、`amap_key`（设置页写入的高德 key 覆盖）、`mail_host` / `mail_port` / `mail_user` / `mail_pass`（设置页写入的邮箱账号覆盖，留空回落 `mail.txt`）、`show_tray` / `show_desktop_btn`（1/0）、`hide_tray`（要单独隐藏的托盘图标键，`;` 分隔）、`dock_pins`（Dock 固定图标，`;` 分隔的 exe/.lnk 全路径；键不存在 = 沿系统任务栏钉选）、`pill_scale` / `icon_scale`（胶囊 / Dock 整体倍率，1.0 = 滑条 100%）。老键 `clock_order` / `time_format` / `date_format` / `*_pos` 在读取时自动迁移 |
+| `data/settings.txt` | 可调设置，`key=value` 一行一个：`clock_format`（strftime 格式串，默认 `%Y-%m-%d %H:%M:%S`）、`module_order`（模块排序列表）、`weather_mode` / `mail_mode` / `clipboard_mode`（pill/left/right/off）、`pill_alpha`（0.2~1.0）、`pill_anchor`（float/island/bottom）、`dock_anchor`（bottom/top/left/right）、`weather_text_scale`（0.8~1.8，默认 1.25）、`lyric_position`（right/left/bottom）、`lyric_size`（10~26，默认 14）、`weather_source`（amap/openmeteo）、`amap_key`（设置页写入的高德 key 覆盖）、`mail_host` / `mail_port` / `mail_user` / `mail_pass`（设置页写入的邮箱账号覆盖，留空回落 `mail.txt`）、`show_tray` / `show_desktop_btn`（1/0）、`hide_tray`（要单独隐藏的托盘图标键，`;` 分隔）、`dock_pins`（Dock 固定图标，`;` 分隔的 exe/.lnk 全路径；键不存在 = 沿系统任务栏钉选）、`icon_over`（托盘图标指定，`;` 分隔的 `图标键|图标源路径`，源可以是 exe/dll/ico/png/jpg/bmp）、`pill_scale` / `icon_scale`（胶囊 / Dock 整体倍率，1.0 = 滑条 100%）。老键 `clock_order` / `time_format` / `date_format` / `*_pos` 在读取时自动迁移 |
 
 ### 可调设置（settings.rs）
 - 文件不存在时写入带注释的默认值；老版本文件缺新键会自动补到末尾（`append_missing`），方便直接编辑。
@@ -218,7 +218,17 @@ main.rs → app.rs（启动/消息循环）
     摆好后每 140ms 复查、漂移 >2px 就再摆（上限 100 次），最多守 20 秒。系统外壳图标（explorer / ShellExperienceHost）不处理。实测：双开两个微信悬停都把卡片搬到 Dock 上方（(814,751) / (814,695)），全程不动光标。
 
 16. **悬停提示条**：`ORBIT_TIP` 是第四个窗口（分层 + 置顶 + `WS_EX_NOACTIVATE | WS_EX_TRANSPARENT`，点击穿透、不抢焦点），贴在 Dock 上方。托盘图标显示 UIA 的 tooltip 首行（"微信"），任务图标显示窗口标题（拿不到就用程序名）。悬停变化时先重绘 Dock（画出悬停底/椭圆）再定位提示条。
-17. **与 Dock 图标去重**：Dock 上已经有的程序，不再重复显示它的托盘图标。判定分两步——托盘元素的 `CurrentProcessId` 在 Win11 上恒为 `explorer.exe`（XAML 树在导出器进程里），所以先按 exe、拿不到再按名字到"有可见窗口的 Dock 项"里做归一化包含匹配。**数量必须一一对应才藏**（`dock 数 == 托盘数`）：微信多开时托盘有 2 个、Dock 只有 1 个（按 exe 去重），这时**两个都保留**——分不清该藏哪一个，藏错了某个账号就彻底没有入口。窗口最小化到托盘（`EnumWindows` 里不再可见）后，该程序不计入"有可见窗口"，托盘图标会自动回到 Dock 右侧。
+18. **图标指定（只作用于托盘图标）**：托盘图标常只有 16px 的 `hIcon`，放大到 Dock 尺寸必然糊。
+    设置页「Dock → 图标指定」可以给某个托盘图标单独换一张：图标源既可以是程序的 `exe` / `dll`，
+    也可以是 `.ico` 图标文件或 `png` / `jpg` / `bmp` 这类图片。选完写进 `settings.txt` 的
+    `icon_over=`（`;` 分隔的多组 `图标键|路径`），键就是 `TrayItem::key()` 那套稳定键
+    （`g:<GUID>` / `e:<exe>#<uid>` / `t:<名字>`）。
+    **任务栏的钉选项和运行项不参与**——它们读的是 exe 自带的大图标，本来就不糊，多一层覆盖只会让人困惑。
+    读取顺序：`.ico` → `LoadImageW`（先按目标边长取，命中即像素级清晰；退而取 256 再 `resize_rgba`）；
+    `png/jpg/bmp/gif` → GDI+ 解码（复用 `render::decode_cover`，居中裁方 + 面积平均缩放）；
+    其他（exe / dll / lnk）→ `SHGetFileInfo` + `SHIL_JUMBO` 取 256px。
+    `Dock::refresh_icon_over()` 按 `(设置版本, 图标边长)` 缓存覆盖结果，设置一改立刻生效。
+19. **与 Dock 图标去重**：Dock 上已经有的程序，不再重复显示它的托盘图标。判定分两步——托盘元素的 `CurrentProcessId` 在 Win11 上恒为 `explorer.exe`（XAML 树在导出器进程里），所以先按 exe、拿不到再按名字到"有可见窗口的 Dock 项"里做归一化包含匹配。**数量必须一一对应才藏**（`dock 数 == 托盘数`）：微信多开时托盘有 2 个、Dock 只有 1 个（按 exe 去重），这时**两个都保留**——分不清该藏哪一个，藏错了某个账号就彻底没有入口。窗口最小化到托盘（`EnumWindows` 里不再可见）后，该程序不计入"有可见窗口"，托盘图标会自动回到 Dock 右侧。
 
 ### 托盘完整托管（trayhost.rs）—— 核心架构
 
@@ -271,7 +281,7 @@ main.rs → app.rs（启动/消息循环）
 
 ## 路线图
 1. **托盘溢出区**：需要（临时）展开溢出面板采集隐藏图标，或读 `HKCU\Control Panel\NotifyIconSettings` 把 `IsPromoted` 打开。
-2. **设置页面继续补内容**：已有 `settingsui.rs`（时钟格式串编辑 + 实时预览、胶囊透明度/形状、Dock 锚位、模块芯片拖动排序与显隐、天气数据源与 Key、邮箱账户、歌词位置/字号、天气字号倍率、托盘与返回桌面开关、逐个托盘图标显隐），还没做的是主题/配色、天气城市手动指定、Dock 图标个数上限的调整入口。
+2. **设置页面继续补内容**：已有 `settingsui.rs`（主题与明暗、时钟格式串编辑 + 实时预览、胶囊透明度/形状、Dock 锚位与图标大小、固定图标的增删、托盘图标指定图标源、模块芯片拖动排序与显隐、天气数据源与 Key、邮箱账户、歌词位置/字号、天气字号倍率、托盘与返回桌面开关、逐个托盘图标显隐），还没做的是天气城市手动指定、Dock 图标个数上限的调整入口。
 3. 邮件：按需拉正文全文、支持多账号。
 4. 歌词：翻译/罗马音、逐字高亮、无歌词时手动搜索换一首。
 5. 面板：键盘导航、滚动（超过一屏的历史）、邮件全文预览。
