@@ -156,17 +156,9 @@ impl PillUi {
         if !v.items.is_empty() {
             total += cfg::GAP + 1.0 + cfg::GAP + padx;
             for (i, _) in v.items.iter().enumerate() {
-                total += item_w[i] + 2.0 * padx + cfg::GAP;
+                total += item_w[i] + 2.0 * padx + cfg::WIDGET_ITEM_GAP;
             }
-            total -= cfg::GAP;
-        }
-        if !v.flash.is_empty() {
-            total += cfg::GAP + 1.0 + cfg::GAP + padx;
-            let cell = cfg::FLASH_ICON + 2.0 * padx;
-            for _ in 0..v.flash.len() {
-                total += cell + cfg::GAP;
-            }
-            total -= cfg::GAP;
+            total -= cfg::WIDGET_ITEM_GAP;
         }
         total += cfg::PAD_X;
 
@@ -188,10 +180,8 @@ impl PillUi {
         let mut rects_pts: Vec<[f32; 4]> = Vec::new();
         let mut events: Vec<PillEvent> = Vec::new();
         let (mut hov_w, mut hov_f) = (None, None);
-        // 克隆 Context：闭包里要用 &mut soft（上传闪烁图标纹理），
-        // 而 Context 内部是 Arc，clone 共享同一上下文
+        // Context 内部是 Arc，clone 出来共享同一上下文（闭包里只读它）
         let ctx = self.soft.ctx().clone();
-        let soft = &mut self.soft;
 
         let out = ctx.run_ui(input, |ui| {
             egui::CentralPanel::default()
@@ -219,6 +209,10 @@ impl PillUi {
                     }
 
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        // egui 会在每个控件后面自动加 `item_spacing`（默认 8 点），
+                        // 和这里手写的间距叠在一起就会显得"图标之间空隙很大"，
+                        // 而且宽度公式算不出来（宽度短一截，最右边被裁）。全部交给 add_space。
+                        ui.spacing_mut().item_spacing.x = 0.0;
                         ui.add_space(cfg::PAD_X);
                         let cx = ui.cursor().left();
                         p.text(
@@ -236,7 +230,7 @@ impl PillUi {
                             ui.add_space(cfg::GAP + 1.0 + cfg::GAP + padx);
                             for (i, item) in v.items.iter().enumerate() {
                                 if i > 0 {
-                                    ui.add_space(cfg::GAP);
+                                    ui.add_space(cfg::WIDGET_ITEM_GAP);
                                 }
                                 let hw = item_w[i] + 2.0 * padx;
                                 let (rect, resp) =
@@ -291,43 +285,8 @@ impl PillUi {
                             }
                         }
 
-                        // ---- 托盘闪烁图标区 ----
-                        if !v.flash.is_empty() {
-                            ui.add_space(cfg::GAP + 1.0 + cfg::GAP + padx);
-                            let cell = cfg::FLASH_ICON + 2.0 * padx;
-                            for (i, f) in v.flash.iter().enumerate() {
-                                if i > 0 {
-                                    ui.add_space(cfg::GAP);
-                                }
-                                let (rect, resp) =
-                                    ui.allocate_exact_size(egui::vec2(cell, cfg::ICON_BG), egui::Sense::click());
-                                rects_pts.push([rect.left(), rect.top(), rect.width(), rect.height()]);
-                                if resp.hovered() {
-                                    hov_f = Some(i);
-                                    p.rect_filled(rect, 8.0_f32, argb(cfg::cur().hover));
-                                }
-                                if resp.contains_pointer()
-                                    && ui.input(|inp| inp.pointer.primary_pressed())
-                                {
-                                    events.push(PillEvent::FlashClick(i));
-                                }
-                                if !f.dim {
-                                    // 灭帧留空位（格子保留，胶囊宽度不抖）
-                                    let tex = soft.soft_image(f.rgba, f.px as usize, f.px as usize);
-                                    let side = cfg::FLASH_ICON;
-                                    let ir = egui::Rect::from_min_size(
-                                        egui::pos2(rect.left() + padx, (fh - side) / 2.0),
-                                        egui::vec2(side, side),
-                                    );
-                                    p.image(
-                                        tex.id(),
-                                        ir,
-                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                        egui::Color32::WHITE,
-                                    );
-                                }
-                            }
-                        }
+                        // 托盘闪烁图标区已移除：托盘交给应用自己渲染，
+                        // 胶囊宽度不随通知抖动，也就不会把整排图标挤错位
                     });
                 });
         });

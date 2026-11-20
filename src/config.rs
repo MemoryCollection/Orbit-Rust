@@ -100,6 +100,9 @@ pub const WIDGET_TEXT_SIZE: f32 = 13.0;
 pub const WIDGET_ICON_GAP: f32 = 3.0;
 /// widget 悬停背景的左右内边距
 pub const WIDGET_PAD_X: f32 = 4.0;
+/// 相邻两个 widget 之间的间距（不含两侧 pad）。
+/// 注意：egui 的 `item_spacing` 会再叠一层，胶囊布局里已显式置 0，间距只由它决定
+pub const WIDGET_ITEM_GAP: f32 = 4.0;
 /// 胶囊右侧的托盘闪烁图标显示边长（位图，非字形）
 pub const FLASH_ICON: f32 = 22.0;
 /// 闪烁判定窗口：最后一次"灭帧"后多久内还算"正在闪烁"（毫秒）。
@@ -214,6 +217,23 @@ pub const DOCK_TRAY_SLOT: f32 = DOCK_SLOT;
 pub const DOCK_TRAY_GAP: f32 = DOCK_GAP;
 /// 前台应用指示条厚度（逻辑点）。长度按槽位的 30% 算，见 `dockview`
 pub const DOCK_ACTIVE_H: f32 = 3.0;
+
+// ---------- Dock：同程序多开时的窗口选择弹窗 ----------
+
+/// 每行高度
+pub const WINLIST_ROW_H: f32 = 30.0;
+/// 弹窗内边距
+pub const WINLIST_PAD: f32 = 6.0;
+/// 最小宽度（标题都短时别缩成一条）
+pub const WINLIST_MIN_W: f32 = 190.0;
+/// 最大宽度（标题超长按省略号截断）
+pub const WINLIST_MAX_W: f32 = 340.0;
+/// 行文字字号
+pub const WINLIST_FONT: f32 = 12.5;
+/// 弹窗与 Dock 图标的间距
+pub const WINLIST_GAP: i32 = 6;
+/// 鼠标离开弹窗多久后自动收起（毫秒）
+pub const WINLIST_GRACE_MS: u128 = 450;
 
 // ---------- Dock：返回桌面（右端细竖条）----------
 

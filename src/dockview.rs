@@ -36,6 +36,25 @@ fn icon_k() -> f32 {
     crate::settings::icon_scale().clamp(0.5, 2.0)
 }
 
+/// 前台指示条：图标下沿一条短横条（任务栏那套视觉语言）。竖排时整条转向，
+/// 贴在"远离屏幕中心"的那一侧。任务图标和托盘图标共用，前台是谁就给谁画。
+fn active_bar(p: &egui::Painter, rect: egui::Rect, slot: f32, cross: f32, vertical: bool) {
+    let th = cfg::DOCK_ACTIVE_H;
+    let tw = (slot * 0.34).max(9.0);
+    let bar = if vertical {
+        egui::Rect::from_min_size(
+            egui::pos2(cross - th - 1.6, rect.center().y - tw / 2.0),
+            egui::vec2(th, tw),
+        )
+    } else {
+        egui::Rect::from_min_size(
+            egui::pos2(rect.center().x - tw / 2.0, cross - th - 1.6),
+            egui::vec2(tw, th),
+        )
+    };
+    p.rect_filled(bar, th / 2.0, argb(cfg::cur().accent));
+}
+
 /// 一个四边形，沿 a→b 方向把颜色从 `ca` 渐变到 `cb`，横向铺开 `w`。
 ///
 /// Dock 的顶面反光和分隔线的两端淡出都靠它：epaint 的顶点色本身就是预乘 sRGBA，
@@ -114,7 +133,7 @@ impl DockView {
         &mut self,
         w: i32, h: i32, scale: f32,
         icons: &[&[u8]], hovered: Option<usize>, active: Option<usize>,
-        tray_icons: &[&[u8]], hovered_tray: Option<usize>,
+        tray_icons: &[&[u8]], hovered_tray: Option<usize>, active_tray: Option<usize>,
         show_tray: bool, show_desktop: bool, hovered_desktop: bool,
         vertical: bool,
     ) -> DockPainted {
@@ -230,20 +249,7 @@ impl DockView {
                     // 前台应用：图标下沿一条短横条（任务栏那套视觉语言）。
                     // 竖排时整条转向，贴在"远离屏幕中心"的那一侧
                     if Some(i) == active {
-                        let th = cfg::DOCK_ACTIVE_H;
-                        let tw = (slot * 0.34).max(9.0);
-                        let bar = if vertical {
-                            egui::Rect::from_min_size(
-                                egui::pos2(cross - th - 1.6, rect.center().y - tw / 2.0),
-                                egui::vec2(th, tw),
-                            )
-                        } else {
-                            egui::Rect::from_min_size(
-                                egui::pos2(rect.center().x - tw / 2.0, cross - th - 1.6),
-                                egui::vec2(tw, th),
-                            )
-                        };
-                        p.rect_filled(bar, th / 2.0, argb(cfg::cur().accent));
+                        active_bar(&p, rect, slot, cross, vertical);
                     }
 
                     pos += slot + gap;
@@ -327,10 +333,16 @@ impl DockView {
                                 );
                             }
                         }
+                        // 前台窗口就是这个托盘程序时，图标下沿同样给一条指示条
+                        // （之前只有任务图标有，托盘在最前就没有视觉反馈）
+                        if Some(i) == active_tray {
+                            let trect =
+                                egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(tslot, tslot));
+                            active_bar(&p, trect, tslot, cross, vertical);
+                        }
                         pos += tslot + cfg::DOCK_TRAY_GAP;
                     }
                 }
-
                 // 末端"返回桌面"细竖条：一根短圆角条，不做图标按钮（克制、不抢视觉）
                 if show_desktop {
                     // 条的"厚度"永远垂直于 Dock 主轴（横排 → 竖条，竖排 → 横条），
@@ -458,5 +470,116 @@ impl DockView {
         self.soft.update_textures(&out.textures_delta);
         let rgba = self.soft.rasterize(out.shapes, out.pixels_per_point, w, h);
         (w, h, rgba)
+    }
+
+    // ---------- 同程序多开：窗口选择弹窗 ----------
+
+    /// 弹窗尺寸（逻辑点 → 物理像素）。宽度按最长标题撑开，夹在 MIN/MAX 之间。
+    pub fn winlist_size(&mut self, titles: &[String], scale: f32) -> (i32, i32) {
+        if titles.is_empty() {
+            return (0, 0);
+        }
+        let scale = scale.max(0.5);
+        let font = egui::FontId::proportional(cfg::WINLIST_FONT);
+        let widest = titles
+            .iter()
+            .map(|t| self.soft.text_width(t, font.clone()))
+            .fold(0.0f32, f32::max);
+        let text_w = widest.clamp(
+            cfg::WINLIST_MIN_W - cfg::WINLIST_PAD * 2.0 - 18.0,
+            cfg::WINLIST_MAX_W - cfg::WINLIST_PAD * 2.0 - 18.0,
+        );
+        let fw = text_w + cfg::WINLIST_PAD * 2.0 + 18.0;
+        let fh = titles.len() as f32 * cfg::WINLIST_ROW_H + cfg::WINLIST_PAD * 2.0;
+        ((fw * scale).ceil() as i32, (fh * scale).ceil() as i32)
+    }
+
+    /// 画窗口选择弹窗：一行一个窗口标题，悬停行高亮。返回 (预乘 RGBA, 每行命中矩形[px])
+    pub fn paint_winlist(
+        &mut self,
+        titles: &[String],
+        hovered: Option<usize>,
+        scale: f32,
+        w: i32,
+        h: i32,
+    ) -> (Vec<u8>, Vec<[f32; 4]>) {
+        if titles.is_empty() || w <= 0 || h <= 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let scale = scale.max(0.5);
+        self.soft.set_scale(scale);
+        let fw = w as f32 / scale;
+        let fh = h as f32 / scale;
+        let pad = cfg::WINLIST_PAD;
+        let row_h = cfg::WINLIST_ROW_H;
+        let font = egui::FontId::proportional(cfg::WINLIST_FONT);
+        // 文本可用宽度（右侧留 18 给"前台"小点，别顶着边）
+        let text_w = fw - pad * 2.0 - 18.0;
+        // 逐条截断（度量走 SoftBackend，pass 之前也能用）
+        let mut labels: Vec<String> = Vec::with_capacity(titles.len());
+        for t in titles {
+            let t = t.trim();
+            let mut s = if t.is_empty() { "（无标题）".to_string() } else { t.to_string() };
+            if self.soft.text_width(&s, font.clone()) > text_w {
+                let mut chars: Vec<char> = s.chars().collect();
+                while self.soft.text_width(&format!("{}…", chars.iter().collect::<String>()), font.clone())
+                    > text_w
+                    && chars.len() > 1
+                {
+                    chars.pop();
+                }
+                s = format!("{}…", chars.iter().collect::<String>());
+            }
+            labels.push(s);
+        }
+
+        let mut rows_pt: Vec<[f32; 4]> = Vec::with_capacity(labels.len());
+        let ctx = self.soft.ctx().clone();
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(fw, fh),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let p = ui.painter().clone();
+                let board = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
+                let rad = egui::CornerRadius::same(cfg::cur().panel_radius.min(12.0) as u8);
+                p.rect_filled(board, rad, argb(cfg::cur().panel_bg));
+                p.rect_stroke(
+                    board.shrink(0.5),
+                    rad,
+                    egui::Stroke::new(1.0, argb(cfg::cur().panel_border)),
+                    egui::StrokeKind::Inside,
+                );
+                for (i, label) in labels.iter().enumerate() {
+                    let ry = pad + i as f32 * row_h;
+                    let row = egui::Rect::from_min_size(
+                        egui::pos2(pad * 0.5, ry),
+                        egui::vec2(fw - pad, row_h - 2.0),
+                    );
+                    rows_pt.push([row.min.x, row.min.y, row.width(), row.height()]);
+                    if Some(i) == hovered {
+                        p.rect_filled(row, egui::CornerRadius::same(8), argb(cfg::cur().hover));
+                    }
+                    p.text(
+                        egui::pos2(row.min.x + 9.0, row.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        font.clone(),
+                        argb(cfg::cur().text_body),
+                    );
+                }
+            },
+        );
+        self.soft.update_textures(&out.textures_delta);
+        let rgba = self.soft.rasterize(out.shapes, out.pixels_per_point, w, h);
+        let rows = rows_pt
+            .iter()
+            .map(|r| [r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale])
+            .collect();
+        (rgba, rows)
     }
 }

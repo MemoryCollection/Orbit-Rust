@@ -27,10 +27,11 @@ use windows::Win32::UI::Shell::{
     SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHIL_JUMBO, SLGP_RAWPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, EnumWindows, GetClassNameW, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HICON, HMENU, IsIconic, IsWindowVisible, LoadImageW, PostMessageW,
-    RegisterWindowMessageW, IMAGE_ICON, LR_LOADFROMFILE,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, EnumWindows, GetClassNameW, GetCursorPos,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HICON, HMENU, IDC_ARROW, IsIconic, IsWindowVisible, LoadCursorW,
+    LoadImageW, PostMessageW, RegisterClassW, RegisterWindowMessageW, CREATESTRUCTW, IMAGE_ICON,
+    LR_LOADFROMFILE, WNDCLASSW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWLP_USERDATA,
     GW_OWNER, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, SWP_NOACTIVATE, SW_HIDE, SW_RESTORE,
     SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDOWN,
@@ -114,6 +115,10 @@ struct DockItem {
     /// 是否代表一个可见窗口：托盘里的后台进程没有窗口，不能算进去
     running: bool,
     target: Target,
+    /// 该程序当前所有可见窗口（前台窗口排第一）。
+    /// 空 = 没在运行；1 个 = 直接切过去；多个 = 左键弹窗让用户挑。
+    /// 钉选项也带这份列表：程序已经在跑时点图标应该切窗口，而不是再启动一个
+    wins: Vec<HWND>,
     rgba: Vec<u8>,
 }
 
@@ -128,6 +133,8 @@ pub struct Dock {
     hovered: Option<usize>,
     /// 前台应用在 `items` 里的下标（图标下面那条指示条用）
     active: Option<usize>,
+    /// 前台窗口属于哪个托盘图标（`tray_shown` 的下标）：托盘程序在最前也要有指示条
+    active_tray: Option<usize>,
     /// 上次查前台应用的时刻（70ms 定时器里节流，别每帧都去 OpenProcess）
     active_checked: Option<Instant>,
     /// 用户"指定了图标"的托盘项像素（键 → 预乘外的 straight RGBA）。
@@ -174,6 +181,20 @@ pub struct Dock {
     seen_settings: u64,
     /// 上次绘制用的图标缩放（变了要把应用图标 / 托盘像素按新尺寸重抓）
     icon_scale: f32,
+
+    // ---- 同程序多开的窗口选择弹窗 ----
+    /// 弹窗窗口句柄（ORBIT_WINLIST，独立分层窗）
+    winlist: HWND,
+    /// 弹窗里的一行一个窗口：(句柄, 标题)
+    winlist_rows: Vec<(HWND, String)>,
+    /// 鼠标悬停行
+    winlist_hover: Option<usize>,
+    /// 每行命中矩形（物理像素 client 坐标）
+    winlist_rects: Vec<[f32; 4]>,
+    /// 弹窗尺寸
+    winlist_size: (i32, i32),
+    /// 鼠标离开弹窗的那一刻（超过 `WINLIST_GRACE_MS` 就收起）
+    winlist_left: Option<Instant>,
 }
 
 pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -206,14 +227,16 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     .unwrap_or(true);
                 if due {
                     dock.active_checked = Some(Instant::now());
-                    let act = dock.active_index();
-                    if act != dock.active {
-                        dock.active = act;
+                    if dock.refresh_active() {
                         dock.render();
                     }
                 }
                 if dock.poll_flash() {
                     dock.render();
+                }
+                // 弹窗的自动收起也搭这趟车（鼠标离开 450ms），不另开定时器
+                if dock.winlist_tick() {
+                    // 收起本身不需要重绘 Dock
                 }
                 // 就算没有新帧，也要把"闪烁停了"的图标从快照里过期掉
                 dock.publish_flash();
@@ -231,7 +254,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     // 固定图标列表 / 开关都可能变，内容整轮重扫（签名没变时等价于空转）
                     dock.scan();
                     dock.poll_tray();
-                    dock.active = dock.active_index();
+                    dock.refresh_active();
                     dock.render();
                 }
                 LRESULT(0)
@@ -319,6 +342,9 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             WM_LBUTTONDOWN => {
                 let x = (l.0 & 0xFFFF) as u16 as i16 as i32;
                 let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                // 任何一次点在 Dock 上都把窗口列表收掉（点图标 = 换目标，点空白 = 取消）
+                let had_winlist = dock.winlist_is_open();
+                dock.hide_winlist();
                 if dock.desktop_at(x as f32, y as f32) {
                     // 右端细长条：显示桌面 / 再点还原
                     crate::settingsui::hide();
@@ -346,6 +372,8 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     }
                 } else if let Some(idx) = dock.index_at(x as f32, y as f32) {
                     dock.activate(idx);
+                } else if had_winlist {
+                    // 点在 Dock 空白处：只是收起列表，不做别的
                 }
                 dock.hide_tip();
                 LRESULT(0)
@@ -435,6 +463,7 @@ impl Dock {
             items: Vec::new(),
             hovered: None,
             active: None,
+            active_tray: None,
             active_checked: None,
             over_px: Vec::new(),
             over_key: (0, 0),
@@ -459,6 +488,12 @@ impl Dock {
             last_lclick: None,
             seen_settings: 0,
             icon_scale: 1.0,
+            winlist: HWND::default(),
+            winlist_rows: Vec::new(),
+            winlist_hover: None,
+            winlist_rects: Vec::new(),
+            winlist_size: (0, 0),
+            winlist_left: None,
         }
     }
 
@@ -468,8 +503,11 @@ impl Dock {
         self.taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
         self.seen_settings = settings::version();
         self.tip = unsafe { create_tip_window() };
+        // 弹窗的窗口过程要拿回 Dock 实例：把 self 的指针当 lpCreateParams 传进去
+        self.winlist = unsafe { create_winlist_window(self as *mut Dock) };
         self.tray.attach_host();
         self.scan();
+        self.refresh_active();
         self.poll_tray();
         self.render();
     }
@@ -671,8 +709,13 @@ impl Dock {
     pub fn scan(&mut self) -> bool {
         let px = (cfg::DOCK_ICON * self.scale * settings::icon_scale()).round() as i32;
         let mut items: Vec<DockItem> = Vec::new();
-        // 有可见窗口的应用（exe 小写 → 一个窗口）；托盘去重要靠它判断"程序是否已在 Dock 上"
-        let run_map = running_apps();
+        // 有可见窗口的应用（exe 小写 → 该程序的全部窗口，前台优先）；
+        // 托盘去重要靠它判断"程序是否已在 Dock 上"
+        let groups = running_groups();
+        let run_map: BTreeMap<String, HWND> = groups
+            .iter()
+            .filter_map(|(exe, w)| w.first().map(|h| (exe.clone(), *h)))
+            .collect();
 
         // 钉选应用（顺序按文件名）
         let mut pinned_exes: Vec<String> = Vec::new();
@@ -712,13 +755,15 @@ impl Dock {
             let exe = target.to_lowercase();
             let norm = normalize_name(&name);
             pinned_exes.push(exe.clone());
+            let wins = groups.get(&exe).cloned().unwrap_or_default();
             items.push(DockItem {
                 tip: name.clone(),
                 name,
                 norm,
-                running: !exe.is_empty() && run_map.contains_key(&exe),
+                running: !wins.is_empty(),
                 exe,
                 target: Target::Lnk(lnk),
+                wins,
                 rgba,
             });
         }
@@ -743,13 +788,21 @@ impl Dock {
                     .and_then(|h| render::capture_icon_rgba(h, px))
                     .unwrap_or_default();
             }
+            let wins = groups.get(exe).cloned().unwrap_or_else(|| vec![*hwnd]);
+            // 多开时提示条写"名字 + 窗口数"，用户才知道点一下会弹列表
+            let tip = if wins.len() > 1 {
+                format!("{}（{} 个窗口）", name, wins.len())
+            } else {
+                window_title(*hwnd).unwrap_or_else(|| name.clone())
+            };
             items.push(DockItem {
-                tip: window_title(*hwnd).unwrap_or_else(|| name.clone()),
+                tip,
                 name,
                 norm,
                 exe: exe.clone(),
                 running: true,
                 target: Target::Window(*hwnd),
+                wins,
                 rgba,
             });
         }
@@ -828,7 +881,8 @@ impl Dock {
             .collect();
         let out = self.view.paint(
             w, h, self.scale, &icons, self.hovered, self.active, &tray_icons,
-            self.hovered_tray, show_tray, show_desktop, self.hovered_desktop, vertical,
+            self.hovered_tray, self.active_tray,
+            show_tray, show_desktop, self.hovered_desktop, vertical,
         );
         self.rects = out.rects.clone();
         self.tray_rects = out.tray_rects.clone();
@@ -1178,50 +1232,297 @@ impl Dock {
 
     /// 前台应用在 `items` 里的下标：先按窗口句柄精确匹配，再按 exe 兜底
     /// （同一程序有多个窗口时，前台那个可能不是 Dock 记下的那个）
-    fn active_index(&self) -> Option<usize> {
+    /// 查前台落在哪个 Dock 图标、哪个托盘图标上：返回 (应用下标, 托盘下标)。
+    ///
+    /// 应用位按"该程序的任一窗口是不是前台"判定（多开折叠后不能只比一个句柄），
+    /// 拿不到再退回 exe 比对；托盘位按托盘图标所属 exe 比对（explorer 那批没 exe 的不参与）。
+    fn foreground_hits(&self) -> (Option<usize>, Option<usize>) {
         let fg = unsafe { GetForegroundWindow() };
         if fg.0.is_null() {
-            return None;
+            return (None, None);
         }
-        if let Some(i) = self.items.iter().position(
-            |it| matches!(&it.target, Target::Window(h) if *h == fg),
-        ) {
-            return Some(i);
-        }
-        let exe = exe_path(fg)?.to_lowercase();
-        self.items
+        let exe = exe_path(fg).map(|s| s.to_lowercase());
+        let app = self
+            .items
             .iter()
-            .position(|it| !it.exe.is_empty() && it.exe == exe)
+            .position(|it| it.wins.iter().any(|h| *h == fg))
+            .or_else(|| {
+                exe.as_ref().and_then(|e| {
+                    self.items
+                        .iter()
+                        .position(|it| !it.exe.is_empty() && it.exe == *e)
+                })
+            });
+        let tray = exe.as_ref().and_then(|e| {
+            self.tray_shown.iter().position(|&k| {
+                self.tray
+                    .items
+                    .get(k)
+                    .map(|it| !it.exe.is_empty() && it.exe.eq_ignore_ascii_case(e))
+                    .unwrap_or(false)
+            })
+        });
+        (app, tray)
     }
 
-    fn activate(&self, idx: usize) {
+    /// 重算前台指示条；返回是否有变化（变了才重绘）
+    fn refresh_active(&mut self) -> bool {
+        let (app, tray) = self.foreground_hits();
+        let changed = app != self.active || tray != self.active_tray;
+        self.active = app;
+        self.active_tray = tray;
+        changed
+    }
+
+    fn activate(&mut self, idx: usize) {
         let Some(item) = self.items.get(idx) else { return };
-        match &item.target {
-            Target::Lnk(path) => {
-                let wide = to_wide(path.as_os_str());
-                unsafe {
-                    ShellExecuteW(
-                        HWND::default(),
-                        w!("open"),
-                        PCWSTR(wide.as_ptr()),
-                        PCWSTR::null(),
-                        PCWSTR::null(),
-                        SW_SHOWNORMAL,
-                    );
+        // 程序已经在跑：切到已开的窗口，别再启动一个（钉选项也一样）
+        match item.wins.len() {
+            1 => {
+                if let Some(h) = item.wins.first() {
+                    activate_hwnd(*h);
+                }
+                return;
+            }
+            n if n > 1 => {
+                self.open_winlist(idx);
+                return;
+            }
+            _ => {}
+        }
+        if let Target::Lnk(path) = &item.target {
+            let wide = to_wide(path.as_os_str());
+            unsafe {
+                ShellExecuteW(
+                    HWND::default(),
+                    w!("open"),
+                    PCWSTR(wide.as_ptr()),
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    SW_SHOWNORMAL,
+                );
+            }
+        }
+    }
+
+    // ---------- 同程序多开：窗口选择弹窗 ----------
+
+    /// 在图标旁边弹出窗口列表（多开时点一下图标走这里）
+    fn open_winlist(&mut self, idx: usize) {
+        let Some(item) = self.items.get(idx) else { return };
+        let rows: Vec<(HWND, String)> = item
+            .wins
+            .iter()
+            .map(|h| (*h, window_title(*h).unwrap_or_else(|| item.name.clone())))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let titles: Vec<String> = rows.iter().map(|r| r.1.clone()).collect();
+        let (w, h) = self.view.winlist_size(&titles, self.scale);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        self.winlist_rows = rows;
+        self.winlist_hover = None;
+        self.winlist_left = None;
+        self.winlist_size = (w, h);
+        self.paint_winlist();
+        let Some(rect) = self.rects.get(idx).copied() else { return };
+        let (x, y) = self.place_popup(rect, w, h);
+        unsafe {
+            let _ = SetWindowPos(self.winlist, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+            let _ = ShowWindow(self.winlist, SW_SHOWNOACTIVATE);
+        }
+        crate::vlog!("[dock] 窗口列表 {} 行 {w}x{h} @({x},{y})", self.winlist_rows.len());
+    }
+
+    fn paint_winlist(&mut self) {
+        if self.winlist.is_invalid() || self.winlist_rows.is_empty() {
+            return;
+        }
+        let titles: Vec<String> = self.winlist_rows.iter().map(|r| r.1.clone()).collect();
+        let (w, h) = self.winlist_size;
+        let (rgba, rects) = self
+            .view
+            .paint_winlist(&titles, self.winlist_hover, self.scale, w, h);
+        if rgba.is_empty() {
+            return;
+        }
+        self.winlist_rects = rects;
+        let bgra = render::premultiplied_rgba_to_bgra(&rgba);
+        render::present(self.winlist, &bgra, w, h);
+    }
+
+    /// 弹窗摆放：跟着 Dock 锚位走（下=图标上方，上=下方，左=右侧，右=左侧），
+    /// 主轴方向按图标中心居中，最后夹在显示器工作区内。
+    fn place_popup(&self, rect: [f32; 3], w: i32, h: i32) -> (i32, i32) {
+        let mut wr = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut wr);
+        }
+        let cx = wr.left + (rect[0] + rect[2] / 2.0) as i32;
+        let cy = wr.top + (rect[1] + rect[2] / 2.0) as i32;
+        let top = wr.top + rect[1] as i32;
+        let bottom = top + rect[2] as i32;
+        let gap = (cfg::WINLIST_GAP as f32 * self.scale) as i32;
+        let mon = crate::window::primary_monitor().rcMonitor;
+        let clamp_x = |x: i32| x.clamp(mon.left + 4, (mon.right - w - 4).max(mon.left + 4));
+        let clamp_y = |y: i32| y.clamp(mon.top + 4, (mon.bottom - h - 4).max(mon.top + 4));
+        match settings::dock_anchor() {
+            crate::settings::DockAnchor::Bottom => (clamp_x(cx - w / 2), clamp_y(top - h - gap)),
+            crate::settings::DockAnchor::Top => (clamp_x(cx - w / 2), clamp_y(bottom + gap)),
+            crate::settings::DockAnchor::Left => (clamp_x(wr.right + gap), clamp_y(cy - h / 2)),
+            crate::settings::DockAnchor::Right => (clamp_x(wr.left - w - gap), clamp_y(cy - h / 2)),
+        }
+    }
+
+    fn winlist_is_open(&self) -> bool {
+        !self.winlist.is_invalid() && unsafe { IsWindowVisible(self.winlist).as_bool() }
+    }
+
+    fn hide_winlist(&mut self) {
+        if !self.winlist.is_invalid() {
+            unsafe {
+                let _ = ShowWindow(self.winlist, SW_HIDE);
+            }
+        }
+        self.winlist_rows.clear();
+        self.winlist_rects.clear();
+        self.winlist_hover = None;
+        self.winlist_left = None;
+    }
+
+    /// 弹窗自动收起：鼠标离开"弹窗 + Dock"整片区域超过 `WINLIST_GRACE_MS` 才隐藏。
+    /// 从 70ms 的 `T_FLASH` 里调用，不额外开定时器。
+    ///
+    /// 为什么把 Dock 也算"里面"：弹窗是从 Dock 图标点出来的，刚弹出时光标必然还在
+    /// 图标上；只按弹窗矩形判定的话，用户还没移过去就被收回去了（450ms 根本不够）。
+    fn winlist_tick(&mut self) -> bool {
+        if !self.winlist_is_open() {
+            return false;
+        }
+        let inside = unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_err() {
+                false
+            } else {
+                let hit = |hwnd: HWND| {
+                    if hwnd.is_invalid() {
+                        return false;
+                    }
+                    let mut wr = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut wr);
+                    pt.x >= wr.left && pt.x < wr.right && pt.y >= wr.top && pt.y < wr.bottom
+                };
+                hit(self.winlist) || hit(self.hwnd)
+            }
+        };
+        if inside {
+            self.winlist_left = None;
+            return false;
+        }
+        match self.winlist_left {
+            None => {
+                // 指针一离开就先把高亮行清掉，别让最后一行亮着等 450ms
+                if self.winlist_hover.take().is_some() {
+                    self.paint_winlist();
+                }
+                self.winlist_left = Some(Instant::now());
+                false
+            }
+            Some(t) => {
+                if t.elapsed().as_millis() >= cfg::WINLIST_GRACE_MS {
+                    self.hide_winlist();
+                    true
+                } else {
+                    false
                 }
             }
-            Target::Window(hwnd) => unsafe {
-                if IsIconic(*hwnd).as_bool() {
-                    let _ = ShowWindow(*hwnd, SW_RESTORE);
+        }
+    }
+
+    /// 弹窗里点了第 i 行：切到那个窗口
+    fn winlist_pick(&mut self, i: usize) {
+        if let Some((h, _)) = self.winlist_rows.get(i).map(|r| (r.0, r.1.clone())) {
+            activate_hwnd(h);
+        }
+        self.hide_winlist();
+    }
+
+    fn winlist_hit(&self, x: f32, y: f32) -> Option<usize> {
+        self.winlist_rects.iter().position(|r|
+            x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3])
+    }
+}
+
+/// 提示条窗口：分层 + 置顶 + 点击穿透，不抢焦点也不会挡鼠标
+/// 窗口选择弹窗：分层 + 置顶 + 工具窗，**不点击穿透**（要收鼠标）、
+/// 但带 `WS_EX_NOACTIVATE`——点它不抢焦点，选完直接把目标窗口拉前台。
+unsafe fn create_winlist_window(dock: *mut Dock) -> HWND {
+    let hinstance = GetModuleHandleW(None).unwrap_or_default();
+    // 重复注册返回 0，忽略即可（窗口类引用计数不会故意泄漏）
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(winlist_proc),
+        hInstance: hinstance.into(),
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+        lpszClassName: w!("ORBIT_WINLIST"),
+        ..Default::default()
+    };
+    RegisterClassW(&wc);
+    CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        w!("ORBIT_WINLIST"),
+        PCWSTR::null(),
+        WS_POPUP,
+        0,
+        0,
+        10,
+        10,
+        HWND::default(),
+        HMENU::default(),
+        hinstance,
+        Some(dock as *const core::ffi::c_void),
+    )
+    .unwrap_or_default()
+}
+
+/// 弹窗自己的窗口过程：悬停高亮 + 左键选窗口 + 右键/中键收起
+pub unsafe extern "system" fn winlist_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        if msg == WM_CREATE {
+            let cs = *(l.0 as *const CREATESTRUCTW);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+            return LRESULT(0);
+        }
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Dock;
+        if ptr.is_null() {
+            return DefWindowProcW(hwnd, msg, w, l);
+        }
+        let dock = &mut *ptr;
+        let lx = || (l.0 & 0xFFFF) as u16 as i16 as i32 as f32;
+        let ly = || ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32 as f32;
+        match msg {
+            WM_MOUSEMOVE => {
+                let h = dock.winlist_hit(lx(), ly());
+                dock.winlist_left = None;
+                if h != dock.winlist_hover {
+                    dock.winlist_hover = h;
+                    dock.paint_winlist();
                 }
-                // 绕过前台锁：临时把本线程输入队列挂到当前前台线程
-                let fg = GetForegroundWindow();
-                let tid_fg = GetWindowThreadProcessId(fg, None);
-                let tid_me = GetCurrentThreadId();
-                let _ = AttachThreadInput(tid_me, tid_fg, true);
-                let _ = SetForegroundWindow(*hwnd);
-                let _ = AttachThreadInput(tid_me, tid_fg, false);
-            },
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                if let Some(i) = dock.winlist_hit(lx(), ly()) {
+                    dock.winlist_pick(i);
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN => {
+                dock.hide_winlist();
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
         }
     }
 }
@@ -1297,18 +1598,33 @@ fn pinned_links() -> Vec<PathBuf> {
 }
 
 /// 运行中的应用：exe 小写路径 → 该应用的一个可见窗口。已过滤工具窗/幽灵窗/无标题窗。
-fn running_apps() -> BTreeMap<String, HWND> {
+/// 用户进程的所有可见窗口按 exe 分组（前台窗口排第一，其余按枚举顺序）。
+/// 同一程序开多个窗口时 Dock 上只留一个图标，左键再弹窗挑窗口。
+fn running_groups() -> BTreeMap<String, Vec<HWND>> {
     let mut hwnds: Vec<HWND> = Vec::new();
     unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut hwnds as *mut Vec<HWND> as isize));
     }
-    let mut map = BTreeMap::new();
+    let fg = unsafe { GetForegroundWindow() };
+    let mut map: BTreeMap<String, Vec<HWND>> = BTreeMap::new();
     for hwnd in hwnds {
-        if let Some(exe) = exe_path(hwnd) {
-            map.entry(exe.to_lowercase()).or_insert(hwnd);
+        let Some(exe) = exe_path(hwnd) else { continue };
+        map.entry(exe.to_lowercase()).or_default().push(hwnd);
+    }
+    // 前台窗口提到组首：布局别按枚举顺序乱动，但"点一下切过去"要命中用户正在看的那个
+    for wins in map.values_mut() {
+        if let Some(pos) = wins.iter().position(|h| *h == fg) {
+            wins.swap(0, pos);
         }
     }
     map
+}
+
+fn running_apps() -> BTreeMap<String, HWND> {
+    running_groups()
+        .into_iter()
+        .filter_map(|(exe, wins)| wins.first().map(|h| (exe, *h)))
+        .collect()
 }
 
 /// 设置页「添加固定图标」用：正在运行的应用（显示名, exe 全路径），按名字排序
@@ -1325,6 +1641,23 @@ pub fn running_app_list() -> Vec<(String, String)> {
         .collect();
     out.sort_by_key(|(n, _)| n.to_lowercase());
     out
+}
+
+/// 切到一个窗口：还原（最小化过）+ 绕过前台锁把它拉到最前。
+/// Dock 图标点击、窗口列表选择共用这一条。
+fn activate_hwnd(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        // 绕过前台锁：临时把本线程输入队列挂到当前前台线程
+        let fg = GetForegroundWindow();
+        let tid_fg = GetWindowThreadProcessId(fg, None);
+        let tid_me = GetCurrentThreadId();
+        let _ = AttachThreadInput(tid_me, tid_fg, true);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = AttachThreadInput(tid_me, tid_fg, false);
+    }
 }
 
 /// 窗口标题（悬停提示用；空标题返回 None）
