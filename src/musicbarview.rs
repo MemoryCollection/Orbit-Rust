@@ -78,7 +78,8 @@ pub fn paint(
             let center = egui::pos2(cx0 + d / 2.0, cy0 + d / 2.0);
             let mut drew_cover = false;
             if let Some(src) = cover.filter(|s| !s.is_empty()) {
-                let px = d.round().max(8.0) as i32;
+                // 纹理按**物理像素**生成（否则 1.25× DPI 下封面会被拉伸发糊）
+                let px = (d * scale).round().max(8.0) as i32;
                 let rotated = crate::render::rotate_cover(src, px, angle);
                 if rotated.len() >= (px as usize) * (px as usize) * 4 {
                     let tex = soft_ref.soft_image(&rotated, px as usize, px as usize);

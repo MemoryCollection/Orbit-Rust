@@ -22,13 +22,18 @@ pub struct DockPainted {
     pub desktop_rect: Option<[f32; 4]>,
 }
 
-/// 右侧"返回桌面"细长条占掉的总宽度（逻辑点，含与图标区的间距）。
+/// 右侧"返回桌面"按钮占掉的总宽度（逻辑点，含与图标区的间距）。
 fn desktop_side(show_desktop: bool) -> f32 {
     if show_desktop {
         cfg::DOCK_DESKTOP_W + cfg::DOCK_DESKTOP_GAP
     } else {
         0.0
     }
+}
+
+/// Dock 图标大小设置（1.0 = 基准）：整个 Dock 等比缩放
+fn icon_k() -> f32 {
+    crate::settings::icon_scale().clamp(0.5, 2.0)
 }
 
 /// 一个四边形，沿 a→b 方向把颜色从 `ca` 渐变到 `cb`，横向铺开 `w`。
@@ -83,7 +88,10 @@ pub fn dock_size(
             + n_tray as f32 * cfg::DOCK_TRAY_SLOT
             + (n_tray as f32 - 1.0) * cfg::DOCK_TRAY_GAP;
     }
-    let thick = cfg::DOCK_H;
+    // 整套尺寸按"图标大小"设置等比放大/缩小（paint 里用同一个系数光栅化）
+    let k = icon_k();
+    let thick = cfg::DOCK_H * k;
+    let len = len * k;
     if vertical { (thick, len) } else { (len, thick) }
 }
 
@@ -111,7 +119,9 @@ impl DockView {
         show_tray: bool, show_desktop: bool, hovered_desktop: bool,
         vertical: bool,
     ) -> DockPainted {
-        let scale = scale.max(0.5);
+        // Dock 图标大小设置：整套尺寸（含底板高度、槽位、间距）等比缩放，
+        // 文字/图标按新的目标像素重新光栅化，不是位图拉伸
+        let scale = (scale * icon_k()).max(0.5);
         self.soft.set_scale(scale);
         let fw = w as f32 / scale;
         let fh = h as f32 / scale;
@@ -295,44 +305,85 @@ impl DockView {
                     }
                 }
 
-                // 末端"返回桌面"细长条
+                // 末端"返回桌面"按钮
                 if show_desktop {
-                    let bw = cfg::DOCK_DESKTOP_W;
-                    let bl = long * cfg::DOCK_DESKTOP_H;
-                    let (bx, by, bwid, bhei) = if vertical {
-                        (0.0, long - pad - bl, bl, bw)
+                    let bw = cfg::DOCK_DESKTOP_W.min(cross - 8.0).max(10.0);
+                    // 正方形按钮（高度上限取 Dock 高度的一个比例，竖排时主轴方向也只占这么长）
+                    let bh = (cross * cfg::DOCK_DESKTOP_H).min(bw).max(10.0);
+                    let (bx, by) = if vertical {
+                        (0.0, long - pad - bh)
                     } else {
-                        (long - pad - bw, 0.0, bw, bl)
+                        (long - pad - bw, 0.0)
                     };
                     let (rx, ry) = if vertical {
-                        ((cross - bwid) / 2.0, by)
+                        ((cross - bw) / 2.0, by)
                     } else {
-                        (bx, (cross - bhei) / 2.0)
+                        (bx, (cross - bh) / 2.0)
                     };
-                    let color = if hovered_desktop {
-                        cfg::cur().dock_desktop_hover
-                    } else {
-                        cfg::cur().dock_desktop
-                    };
-                    let bar = egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(bwid, bhei));
-                    let r_bar = (bw / 2.0).max(1.0);
+                    let bar = egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(bw, bh));
+                    let r_bar = (bw * 0.34).min(bh * 0.5);
+
+                    // 按钮底：用"文字色 + 低 alpha"当填充——深色主题下是提亮的白，
+                    // 浅色主题下是压暗的黑，两种主题都能和胶囊底分层，图标也始终看得清。
+                    let text = cfg::cur().text;
+                    let fill_a = if hovered_desktop { 0.20 } else { 0.09 };
                     if hovered_desktop {
-                        // 悬停：细条外面先垫一层柔和光晕，条身提亮并描边（像被点亮）
-                        p.rect_filled(bar.expand(4.0), r_bar + 4.0, argb(0x1F_FF_FF_FF));
-                    }
-                    p.rect_filled(bar, r_bar, argb(color));
-                    if hovered_desktop {
-                        p.rect_stroke(
-                            bar,
-                            r_bar,
-                            egui::Stroke::new(1.0, argb(0x59_FF_FF_FF)),
-                            egui::StrokeKind::Inside,
+                        // 悬停：外圈再垫一层更淡的方形光晕（向内画，窗口边不会裁掉）
+                        p.rect_filled(
+                            bar.expand(3.0),
+                            r_bar + 3.0,
+                            argb(crate::egui_soft::with_alpha(text, 0.08)),
                         );
                     }
+                    p.rect_filled(bar, r_bar, argb(crate::egui_soft::with_alpha(text, fill_a)));
+                    p.rect_stroke(
+                        bar,
+                        r_bar,
+                        egui::Stroke::new(
+                            1.0,
+                            argb(if hovered_desktop {
+                                crate::egui_soft::with_alpha(cfg::cur().accent, 0.75)
+                            } else {
+                                crate::egui_soft::with_alpha(text, 0.16)
+                            }),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+
+                    // 显示器图标：屏 + 立柱 + 底座
+                    let col = argb(text);
+                    let sw = (bw * 0.055).clamp(1.1, 1.6);
+                    let stroke = egui::Stroke::new(sw, col);
+                    let c = bar.center();
+                    let mw = bw * 0.52;
+                    let mh = mw * 0.66;
+                    let screen = egui::Rect::from_center_size(
+                        egui::pos2(c.x, c.y - bh * 0.09),
+                        egui::vec2(mw, mh),
+                    );
+                    p.rect_stroke(
+                        screen,
+                        egui::CornerRadius::same(2),
+                        stroke,
+                        egui::StrokeKind::Inside,
+                    );
+                    let foot_y = screen.bottom() + bh * 0.13;
+                    p.line_segment(
+                        [egui::pos2(c.x, screen.bottom()), egui::pos2(c.x, foot_y)],
+                        stroke,
+                    );
+                    p.line_segment(
+                        [
+                            egui::pos2(c.x - mw * 0.34, foot_y),
+                            egui::pos2(c.x + mw * 0.34, foot_y),
+                        ],
+                        stroke,
+                    );
+
                     desktop_rect_pt = Some(if vertical {
-                        [0.0, ry - cfg::DOCK_DESKTOP_GAP, cross, bhei + cfg::DOCK_DESKTOP_GAP]
+                        [0.0, ry - cfg::DOCK_DESKTOP_GAP, cross, bh + cfg::DOCK_DESKTOP_GAP]
                     } else {
-                        [rx - cfg::DOCK_DESKTOP_GAP, 0.0, bwid + cfg::DOCK_DESKTOP_GAP, cross]
+                        [rx - cfg::DOCK_DESKTOP_GAP, 0.0, bw + cfg::DOCK_DESKTOP_GAP, cross]
                     });
                 }
             },

@@ -162,6 +162,8 @@ pub struct Dock {
     last_lclick: Option<Instant>,
     /// 上次见过的设置版本号（变了就重绘：托盘开关、返回桌面按钮都会改宽度）
     seen_settings: u64,
+    /// 上次绘制用的图标缩放（变了要把应用图标 / 托盘像素按新尺寸重抓）
+    icon_scale: f32,
 }
 
 pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -196,6 +198,14 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             WM_TIMER if w.0 == T_SETTINGS => {
                 // 设置页面改了托盘开关 / 返回桌面按钮，宽度和内容都要重排
                 if dock.seen_settings != settings::version() {
+                    // 图标大小变了：应用图标与托盘像素都要按新尺寸重抓（否则放大会糊）
+                    let k = settings::icon_scale();
+                    if (k - dock.icon_scale).abs() > 1e-3 {
+                        dock.icon_scale = k;
+                        dock.tray.invalidate();
+                        dock.scan();
+                        dock.poll_tray();
+                    }
                     dock.render();
                 }
                 LRESULT(0)
@@ -210,7 +220,13 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 pt.x -= wr.left;
                 pt.y -= wr.top;
                 let (dw, dh) = dock.size;
-                if inside_round(pt.x as f32, pt.y as f32, dw as f32, dh as f32, cfg::cur().dock_radius * dock.scale) {
+                if inside_round(
+                    pt.x as f32,
+                    pt.y as f32,
+                    dw as f32,
+                    dh as f32,
+                    cfg::cur().dock_radius * dock.scale * settings::icon_scale(),
+                ) {
                     LRESULT(HTCLIENT as isize)
                 } else {
                     LRESULT(HTTRANSPARENT as isize)
@@ -412,6 +428,7 @@ impl Dock {
             last_hover_move: None,
             last_lclick: None,
             seen_settings: 0,
+            icon_scale: 1.0,
         }
     }
 
@@ -432,7 +449,7 @@ impl Dock {
         if !settings::show_tray() {
             return false;
         }
-        let px = (cfg::DOCK_TRAY_ICON * self.scale).round() as i32;
+        let px = (cfg::DOCK_TRAY_ICON * self.scale * settings::icon_scale()).round() as i32;
         let changed = self.tray.poll(px);
         if changed {
             // 托管模式：回调消息/GUID/版本都来自 NOTIFYICONDATA，直接建目标，
@@ -449,7 +466,7 @@ impl Dock {
         if !settings::show_tray() {
             return false;
         }
-        let px = (cfg::DOCK_TRAY_ICON * self.scale).round() as i32;
+        let px = (cfg::DOCK_TRAY_ICON * self.scale * settings::icon_scale()).round() as i32;
         if self.tray.hosted() {
             // 托管模式的 dim 来自 NIM_MODIFY(icon=0)。微信每帧只有 200~300ms，
             // 必须走这个高频定时器同步，不能等 2s 的整表重扫（会漏帧、卡在灭态）。
@@ -622,7 +639,7 @@ impl Dock {
 
     /// 重扫钉选 + 运行中应用；签名有变化才返回 true。
     pub fn scan(&mut self) -> bool {
-        let px = (cfg::DOCK_ICON * self.scale).round() as i32;
+        let px = (cfg::DOCK_ICON * self.scale * settings::icon_scale()).round() as i32;
         let mut items: Vec<DockItem> = Vec::new();
         // 有可见窗口的应用（exe 小写 → 一个窗口）；托盘去重要靠它判断"程序是否已在 Dock 上"
         let run_map = running_apps();

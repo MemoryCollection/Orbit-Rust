@@ -11,6 +11,8 @@
 //! - `weather_mode` / `mail_mode` / `clipboard_mode`
 //!   模块摆哪：`pill`（留在胶囊里）/ `left`（分离到胶囊左侧一条）/ `right` / `off`（隐藏）
 //! - `pill_alpha`         胶囊（含分离模块条）整体透明度 0.2 ~ 1.0，默认 1.0
+//! - `pill_scale`         胶囊（含模块条 / 音乐条）整体大小 0.8 ~ 1.35，默认 1.0
+//! - `icon_scale`         Dock 图标（连同 Dock 高度与托盘图标）大小 0.8 ~ 1.35，默认 1.0
 //! - `pill_anchor`        胶囊位置/形状：`float`（悬浮顶部，默认）/ `island`（吸顶刘海，
 //!                          顶部两角方形）/ `bottom`（吸底，底部两角方形）
 //! - `dock_anchor`        底部 Dock 位置：`bottom`（默认）/ `top` / `left` / `right`
@@ -46,6 +48,13 @@ const LYRIC_MAX: f32 = 26.0;
 /// 胶囊透明度上下限（再低就看不清了）；滑条量程直接用这两个值
 pub const ALPHA_MIN: f32 = 0.2;
 pub const ALPHA_MAX: f32 = 1.0;
+/// 胶囊（含模块条 / 音乐条）整体缩放上下限。1.0 = 基准尺寸。
+/// 缩放的是"逻辑点"而不是像素：文字与图标按新尺寸重新排版光栅化，不会发虚。
+pub const PILL_SCALE_MIN: f32 = 0.80;
+pub const PILL_SCALE_MAX: f32 = 1.35;
+/// Dock 图标缩放上下限（Dock 高度 / 槽位 / 托盘图标随之等比变化）
+pub const ICON_SCALE_MIN: f32 = 0.80;
+pub const ICON_SCALE_MAX: f32 = 1.35;
 /// AtomicU32 的 0 表示"还没加载"
 const UNLOADED: u32 = 0;
 
@@ -68,6 +77,9 @@ static CLIPBOARD_MODE: AtomicU32 = AtomicU32::new(UNLOADED);
 static CLOCK_FORMAT: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 /// 胶囊透明度（f32 位型）/ 锚位编码 / Dock 锚位编码
 static PILL_ALPHA: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 胶囊缩放 / Dock 图标缩放（f32 位型）
+static PILL_SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
+static ICON_SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
 static PILL_ANCHOR: AtomicU32 = AtomicU32::new(UNLOADED);
 static DOCK_ANCHOR: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 天气数据源编码 / 高德 key
@@ -231,6 +243,74 @@ pub fn preview_pill_alpha(v: f32) {
 
 /// 把当前透明度落盘（滑条松手 / 键盘微调后调用）
 pub fn persist_pill_alpha() {
+    save();
+    bump();
+}
+
+// ---------- 尺寸 ----------
+
+/// 胶囊（顶部胶囊 + 分离模块条 + 音乐条）的整体缩放，1.0 = 基准
+pub fn pill_scale() -> f32 {
+    match PILL_SCALE.load(Ordering::Relaxed) {
+        UNLOADED => 1.0,
+        bits => f32::from_bits(bits).clamp(PILL_SCALE_MIN, PILL_SCALE_MAX),
+    }
+}
+
+/// Dock 图标（连同 Dock 高度 / 槽位 / 托盘图标）的缩放，1.0 = 基准
+pub fn icon_scale() -> f32 {
+    match ICON_SCALE.load(Ordering::Relaxed) {
+        UNLOADED => 1.0,
+        bits => f32::from_bits(bits).clamp(ICON_SCALE_MIN, ICON_SCALE_MAX),
+    }
+}
+
+/// 滑条拖动中的即时预览（只改内存 + 通知重绘，不写盘）
+pub fn preview_pill_scale(v: f32) {
+    let v = v.clamp(PILL_SCALE_MIN, PILL_SCALE_MAX);
+    if (v - pill_scale()).abs() < 1e-4 {
+        return;
+    }
+    PILL_SCALE.store(v.to_bits(), Ordering::Relaxed);
+    bump();
+}
+
+pub fn persist_pill_scale() {
+    save();
+    bump();
+}
+
+pub fn preview_icon_scale(v: f32) {
+    let v = v.clamp(ICON_SCALE_MIN, ICON_SCALE_MAX);
+    if (v - icon_scale()).abs() < 1e-4 {
+        return;
+    }
+    ICON_SCALE.store(v.to_bits(), Ordering::Relaxed);
+    bump();
+}
+
+pub fn persist_icon_scale() {
+    save();
+    bump();
+}
+
+/// 一步到位地设值（「重置」按钮用）：改内存 + 落盘 + 通知重绘
+pub fn set_pill_scale(v: f32) {
+    let v = v.clamp(PILL_SCALE_MIN, PILL_SCALE_MAX);
+    if (v - pill_scale()).abs() < 1e-4 {
+        return;
+    }
+    PILL_SCALE.store(v.to_bits(), Ordering::Relaxed);
+    save();
+    bump();
+}
+
+pub fn set_icon_scale(v: f32) {
+    let v = v.clamp(ICON_SCALE_MIN, ICON_SCALE_MAX);
+    if (v - icon_scale()).abs() < 1e-4 {
+        return;
+    }
+    ICON_SCALE.store(v.to_bits(), Ordering::Relaxed);
     save();
     bump();
 }
@@ -766,6 +846,8 @@ fn save() {
         ("mail_mode", mode("mail")),
         ("clipboard_mode", mode("clipboard")),
         ("pill_alpha", trim_num(pill_alpha())),
+        ("pill_scale", trim_num(pill_scale())),
+        ("icon_scale", trim_num(icon_scale())),
         ("theme", crate::theme::cur().key.to_string()),
         ("pill_anchor", pill_anchor().as_str().to_string()),
         ("dock_anchor", dock_anchor().as_str().to_string()),
@@ -875,6 +957,9 @@ struct Snap {
     mail_mode: ModuleMode,
     clipboard_mode: ModuleMode,
     pill_alpha: f32,
+    pill_scale: f32,
+    icon_scale: f32,
+    theme: usize,
     pill_anchor: PillAnchor,
     dock_anchor: DockAnchor,
     weather_source: WeatherSource,
@@ -896,6 +981,9 @@ fn snapshot() -> Snap {
         mail_mode: module_mode("mail"),
         clipboard_mode: module_mode("clipboard"),
         pill_alpha: pill_alpha(),
+        pill_scale: pill_scale(),
+        icon_scale: icon_scale(),
+        theme: crate::theme::index(),
         pill_anchor: pill_anchor(),
         dock_anchor: dock_anchor(),
         weather_source: weather_source(),
@@ -987,6 +1075,9 @@ mail_mode=right
 clipboard_mode=right
 # 胶囊透明度（0.2 ~ 1.0，含分离出去的模块条）
 pill_alpha=1.0
+# 胶囊整体大小 / Dock 图标大小（1.0 为基准，0.8 ~ 1.35；设置页里有滑条和「重置」）
+pill_scale=1
+icon_scale=1
 # 胶囊位置形状：float（悬浮顶部，默认）/ island（吸顶刘海）/ bottom（吸底）
 pill_anchor=float
 # Dock 靠屏幕哪条边：bottom（默认）/ top / left / right
@@ -1037,6 +1128,7 @@ fn append_missing() {
         ("module_order", "# 顶部胶囊模块排列（拖动排序写回）\nmodule_order=weather,mail,clipboard\n"),
         ("weather_mode", "# 模块摆哪：pill / left / right / off\nweather_mode=left\nmail_mode=right\nclipboard_mode=right\n"),
         ("pill_alpha", "# 胶囊透明度（0.2 ~ 1.0）\npill_alpha=1.0\n"),
+        ("pill_scale", "# 胶囊 / Dock 图标大小（1.0 为基准，0.8 ~ 1.35）\npill_scale=1\nicon_scale=1\n"),
         (
             "theme",
             "# 外观主题：glass（深色玻璃）/ liquid（液态玻璃）/ mica（云母浅色）\n\
@@ -1086,6 +1178,8 @@ fn load() {
     let mut wsound = true;
     let mut hide_tray: Vec<String> = Vec::new();
     let mut alpha = 1.0f32;
+    let mut pscale = 1.0f32;
+    let mut iscale = 1.0f32;
     let mut tkey: String = crate::theme::cur().key.to_string();
     let mut panchor = PillAnchor::Float;
     let mut danchor = DockAnchor::Bottom;
@@ -1132,6 +1226,16 @@ fn load() {
             "pill_alpha" => {
                 if let Some(n) = parse_num(v) {
                     alpha = n.clamp(ALPHA_MIN, ALPHA_MAX);
+                }
+            }
+            "pill_scale" => {
+                if let Some(n) = parse_num(v) {
+                    pscale = n.clamp(PILL_SCALE_MIN, PILL_SCALE_MAX);
+                }
+            }
+            "icon_scale" => {
+                if let Some(n) = parse_num(v) {
+                    iscale = n.clamp(ICON_SCALE_MIN, ICON_SCALE_MAX);
                 }
             }
             "theme" => {
@@ -1254,6 +1358,8 @@ fn load() {
         *v = order;
     }
     PILL_ALPHA.store(alpha.to_bits(), Ordering::Relaxed);
+    PILL_SCALE.store(pscale.to_bits(), Ordering::Relaxed);
+    ICON_SCALE.store(iscale.to_bits(), Ordering::Relaxed);
     // 主题：所有绘制都走 theme::cur()，存一次索引即可，不必逐个窗口通知
     if let Some(i) = crate::theme::index_of(&tkey) {
         crate::theme::set_index(i);

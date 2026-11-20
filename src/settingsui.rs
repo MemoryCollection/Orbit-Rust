@@ -534,6 +534,18 @@ impl SettingsApp {
                 });
                 ui.end_row();
 
+                ui.label(row_label("大小"));
+                scale_row(
+                    ui,
+                    settings::pill_scale(),
+                    settings::PILL_SCALE_MIN,
+                    settings::PILL_SCALE_MAX,
+                    settings::preview_pill_scale,
+                    settings::persist_pill_scale,
+                    || settings::set_pill_scale(1.0),
+                );
+                ui.end_row();
+
                 ui.label(row_label("形状"));
                 let shape = match settings::pill_anchor() {
                     PillAnchor::Float => 0,
@@ -573,7 +585,24 @@ impl SettingsApp {
                     });
                 }
                 ui.end_row();
+
+                ui.label(row_label("图标大小"));
+                scale_row(
+                    ui,
+                    settings::icon_scale(),
+                    settings::ICON_SCALE_MIN,
+                    settings::ICON_SCALE_MAX,
+                    settings::preview_icon_scale,
+                    settings::persist_icon_scale,
+                    || settings::set_icon_scale(1.0),
+                );
+                ui.end_row();
             });
+        ui.label(
+            egui::RichText::new("图标大小会连同 Dock 高度、槽位和托盘图标等比缩放；点「重置」回到默认尺寸。")
+                .size(11.5)
+                .weak(),
+        );
     }
 
     fn detail_music(&mut self, ui: &mut egui::Ui) {
@@ -1032,6 +1061,52 @@ fn seg(ui: &mut egui::Ui, options: &[&str], active: usize) -> Option<usize> {
         }
     });
     pick
+}
+
+/// 尺寸滑条 + 百分比 + 「重置」。
+///
+/// 拖动过程只做即时预览（`preview`），松手才落盘（`persist`）——和透明度滑条
+/// 同一套逻辑，避免每移一像素就重写一次 settings.txt。
+fn scale_row(
+    ui: &mut egui::Ui,
+    value: f32,
+    min: f32,
+    max: f32,
+    preview: fn(f32),
+    persist: fn(),
+    reset: impl Fn(),
+) {
+    let mut v = value;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        // Slider 宽度取 spacing.slider_width（add_sized 管不到它）
+        ui.spacing_mut().slider_width = CTRL_W - 148.0;
+        let r = ui.add(
+            egui::Slider::new(&mut v, min..=max)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        if r.changed() {
+            preview(v);
+        }
+        if r.drag_stopped() || (r.changed() && !r.dragged()) {
+            persist();
+        }
+        ui.label(
+            egui::RichText::new(format!("{:.0}%", v * 100.0))
+                .size(12.5)
+                .monospace(),
+        );
+        // 默认 100% 时按钮没意义，置灰
+        let at_default = (v - 1.0).abs() < 1e-3;
+        if ui
+            .add_enabled(!at_default, egui::Button::new("重置").small())
+            .on_hover_text("回到默认大小（100%）")
+            .clicked()
+        {
+            reset();
+        }
+    });
 }
 
 /// 加减器：返回 -1 / +1（None = 没点）

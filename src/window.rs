@@ -204,9 +204,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let x = (l.0 & 0xFFFF) as u16 as i16 as i32;
                 let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
                 // 喂给 egui（逻辑点），悬停高亮/点击判定由 egui 响应决定
+                let k = app.pill_ui_scale();
                 app.pill_ui
                     .input()
-                    .pointer_moved(x as f32 / app.scale, y as f32 / app.scale);
+                    .pointer_moved(x as f32 / k, y as f32 / k);
                 if !app.mouse_tracked {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -232,18 +233,20 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 // 点胶囊上的 widget 就算"离开设置页面"
                 crate::settingsui::hide();
                 // 按下事件交给 egui，点击在 paint 后按旧语义分发（按下即触发）
+                let k = app.pill_ui_scale();
                 app.pill_ui
                     .input()
-                    .pointer_button(x as f32 / app.scale, y as f32 / app.scale, true);
+                    .pointer_button(x as f32 / k, y as f32 / k, true);
                 app.render();
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
                 let x = (l.0 & 0xFFFF) as u16 as i16 as i32;
                 let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let k = app.pill_ui_scale();
                 app.pill_ui
                     .input()
-                    .pointer_button(x as f32 / app.scale, y as f32 / app.scale, false);
+                    .pointer_button(x as f32 / k, y as f32 / k, false);
                 app.render();
                 LRESULT(0)
             }
@@ -344,6 +347,12 @@ impl App {
             anim_on: false,
             seen_settings: 0,
         }
+    }
+
+    /// 胶囊窗口里"逻辑点 → 物理像素"的实际换算系数：DPI 缩放 × 胶囊大小设置。
+    /// 鼠标坐标要按同一个系数折算回逻辑点，否则放大后点击位置会偏。
+    fn pill_ui_scale(&self) -> f32 {
+        (self.scale * settings::pill_scale()).max(0.5)
     }
 
     pub fn init(&mut self, hwnd: HWND) {
@@ -489,6 +498,7 @@ impl App {
                         icon: weather::glyph(s.code, s.day).to_string(),
                         icon_argb: weather_color(s.code, s.day),
                         text: format!("{}°", s.temp),
+                        icon_kind: 0,
                     },
                 ));
             }
@@ -500,7 +510,11 @@ impl App {
                 Badge::Unread => ("新邮件".to_string(), cfg::cur().accent),
                 Badge::None => (String::new(), cfg::cur().icon_dim),
             };
-            all.push((WidgetKind::Mail, WidgetItem { icon: "✉".to_string(), icon_argb: argb, text }));
+            // 图标用矢量信封（见 egui_soft::widget_icon），`icon` 只用来占格
+            all.push((
+                WidgetKind::Mail,
+                WidgetItem { icon: "✉".to_string(), icon_argb: argb, text, icon_kind: crate::egui_soft::KIND_MAIL },
+            ));
         }
         if cfg::SHOW_CLIPBOARD && !self.clipboard.items.is_empty() {
             // 只显示图标，不暴露当前剪贴板内容
@@ -510,6 +524,7 @@ impl App {
                     icon: "▤".to_string(),
                     icon_argb: cfg::cur().icon_dim,
                     text: String::new(),
+                    icon_kind: crate::egui_soft::KIND_CLIP,
                 },
             ));
         }
@@ -750,8 +765,10 @@ impl App {
         }
 
         // 封面：每首歌只解码一次（失败就记住这个版本没有封面，不反复试）
+        // 只按 art_ver 缓存：一次解码就按"胶囊放到最大"的像素数解，
+        // 之后无论用户把胶囊调大调小，封面都不会因为重采样而发虚
         if self.cover.as_ref().map(|c| c.0) != Some(self.music.art_ver) {
-            let px = render::cover_px(self.scale);
+            let px = render::cover_px(self.scale * settings::PILL_SCALE_MAX);
             let rgba = self
                 .music
                 .art

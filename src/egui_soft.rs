@@ -475,7 +475,62 @@ pub fn glow_edges(p: &egui::Painter, rect: egui::Rect, cr: egui::CornerRadius, c
     }
 }
 
-/// 分隔线（竖 1px，垂直居中）。
+/// 模块图标（矢量）：`KIND_MAIL` = 信封，`KIND_CLIP` = 剪贴板。
+///
+/// 以前用 `✉` / `▤` 字形，雅黑和 Segoe UI Symbol 里这两个字符笔画细、
+/// 基线还各不相同，15px 下基本看不清。矢量绘制能做到：
+/// 线条粗细统一、光学居中、颜色跟随主题，放大缩小都清晰。
+pub const KIND_MAIL: u8 = 1;
+pub const KIND_CLIP: u8 = 2;
+
+/// 在 `center` 处画一个边长为 `cell` 的模块图标（`kind` 见 `KIND_*`）
+pub fn widget_icon(p: &egui::Painter, center: egui::Pos2, cell: f32, kind: u8, color: egui::Color32) {
+    let stroke = egui::Stroke::new((cell * 0.085).clamp(1.1, 1.8), color);
+    match kind {
+        KIND_MAIL => {
+            // 信封：圆角矩形 + 上方 V 形封口（比"实心信封"更轻，和细字重更配）
+            let w = cell * 0.92;
+            let h = cell * 0.70;
+            let r = egui::Rect::from_center_size(center, egui::vec2(w, h));
+            p.rect_stroke(r, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            let cr = 2.0f32; // 与 rect_stroke 的圆角一致，线条起点内缩
+            // 起始点避开圆角，线条才不从转角尖端冒出去
+            let l = egui::pos2(r.left() + cr * 0.7, r.top() + 1.0);
+            let rr = egui::pos2(r.right() - cr * 0.7, r.top() + 1.0);
+            let mid = egui::pos2(center.x, r.top() + h * 0.58);
+            p.line_segment([l, mid], stroke);
+            p.line_segment([mid, rr], stroke);
+        }
+        KIND_CLIP => {
+            // 剪贴板：板 + 顶部夹子 + 两条内容线
+            let w = cell * 0.66;
+            let h = cell * 0.88;
+            let r = egui::Rect::from_center_size(center + egui::vec2(0.0, cell * 0.02), egui::vec2(w, h));
+            p.rect_stroke(r, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            // 夹子：一块压在顶边中央的小圆角矩形
+            let cw = cell * 0.36;
+            let ch = cell * 0.20;
+            let clip = egui::Rect::from_min_size(
+                egui::pos2(center.x - cw / 2.0, r.top() - ch * 0.45),
+                egui::vec2(cw, ch),
+            );
+            p.rect_filled(clip, egui::CornerRadius::same(1), color);
+            // 内容线：长度错开一点，避免看着像"等号"
+            for (i, k) in [0.42f32, 0.62].iter().enumerate() {
+                let pad = if i == 1 { w * 0.30 } else { w * 0.18 };
+                let y = r.top() + h * k;
+                p.line_segment(
+                    [egui::pos2(r.left() + pad, y), egui::pos2(r.right() - w * 0.16, y)],
+                    stroke,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 分隔线（竖 1px，垂直居中）。顶部胶囊已去掉分割线，保留给其它视图备用。
+#[allow(dead_code)]
 pub fn divider(p: &egui::Painter, x: f32, fh: f32) {
     p.rect_filled(
         egui::Rect::from_min_size(

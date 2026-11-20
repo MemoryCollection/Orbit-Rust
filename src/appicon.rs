@@ -51,6 +51,11 @@ impl IconCache {
         hit
     }
 
+    /// 丢掉已缩好的位图（图标尺寸变了要按新尺寸重取 256px 源图再缩）
+    pub fn clear(&mut self) {
+        self.icons.clear();
+    }
+
     /// tooltip 名字 → exe：先精确命中 `InitialTooltip`，再按包含关系在
     /// 名字/进程名里找最接近的一个。
     pub(crate) fn exe_for(&mut self, name: &str) -> Option<String> {

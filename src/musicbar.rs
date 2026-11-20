@@ -118,8 +118,10 @@ pub fn show(v: &View) {
         return;
     }
     let m = crate::window::primary_monitor().rcMonitor;
+    // 音乐条与胶囊等高：胶囊大小设置同样作用在这里（DPI × 胶囊缩放）
+    let scale = (v.scale * crate::settings::pill_scale()).max(0.5);
     let (px, py, pw, ph) = v.pill;
-    let gap = (cfg::LYRIC_GAP as f32 * v.scale) as i32;
+    let gap = (cfg::LYRIC_GAP as f32 * scale) as i32;
 
     // 该侧可用宽度：左右贴边时给胶囊让出位置，下方按整屏居中（物理像素）
     let avail = match v.pos {
@@ -127,11 +129,11 @@ pub fn show(v: &View) {
         LyricPos::Right => m.right - (px + pw + gap) - 6,
         LyricPos::Bottom => m.right - m.left - 12,
     } as f32;
-    let max_w_px = (cfg::LYRIC_MAX_W * v.scale).min(avail);
+    let max_w_px = (cfg::LYRIC_MAX_W * scale).min(avail);
 
     // 字体度量与布局都在逻辑点空间做（egui 内部按 pixels_per_point 缩放）
     let fixed = crate::musicbarview::fixed_w();
-    let max_w_l = max_w_px / v.scale;
+    let max_w_l = max_w_px / scale;
     if max_w_l < fixed + 40.0 {
         hide();
         return;
@@ -142,11 +144,12 @@ pub fn show(v: &View) {
             *slot = Some(crate::egui_soft::SoftBackend::new());
         }
         let soft = slot.as_mut().unwrap();
-        soft.set_scale(v.scale);
+        soft.set_scale(scale);
         let text = crate::musicbarview::ellipsize(soft, v.text, max_w_l - fixed, v.font);
         let w_l = fixed + crate::musicbarview::text_w(soft, &text, v.font);
-        let w = w_l.ceil() as i32;
-        let hh = (cfg::PILL_H * v.scale).ceil() as i32;
+        // w_l 是逻辑点，窗口尺寸要物理像素（乘以 DPI × 胶囊缩放）
+        let w = (w_l * scale).ceil() as i32;
+        let hh = (cfg::PILL_H * scale).ceil() as i32;
         let (x, y) = match v.pos {
             LyricPos::Right => (px + pw + gap, py),
             LyricPos::Left => (px - gap - w, py),
@@ -166,15 +169,15 @@ pub fn show(v: &View) {
 
         // 命中区 = 封面的圆（物理像素；与 musicbarview::cover_box 同几何）
         let (bx, by, d) = crate::musicbarview::cover_box(cfg::PILL_H);
-        let bx = bx * v.scale;
-        let by = by * v.scale;
-        let d = d * v.scale;
+        let bx = bx * scale;
+        let by = by * scale;
+        let d = d * scale;
         HIT.with(|c| c.set((bx + d / 2.0, by + d / 2.0, d / 2.0)));
 
         unsafe {
             if !SHOWN.with(|s| s.borrow().as_ref() == Some(&shown)) {
                 let rgba = crate::musicbarview::paint(
-                    soft, w, hh, v.scale, &shown.text, v.font, v.cover, angle, v.playing, shown.hovered,
+                    soft, w, hh, scale, &shown.text, v.font, v.cover, angle, v.playing, shown.hovered,
                 );
                 // egui 软件后端输出已是预乘 RGBA，直接换 BGRA 上屏
                 let bgra = render::premultiplied_rgba_to_bgra(&rgba);

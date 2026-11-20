@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, SoftBackend};
+use crate::egui_soft::{argb, widget_icon, SoftBackend};
 use crate::render::WidgetItem;
 
 pub struct BarPainted {
@@ -111,13 +111,24 @@ pub fn paint(
                     }
                     let mut cx = rect.left() + padx;
                     if !item.icon.is_empty() {
-                        p.text(
-                            egui::pos2(cx + cfg::WIDGET_ICON_CELL / 2.0, rect.center().y),
-                            egui::Align2::CENTER_CENTER,
-                            &item.icon,
-                            icon_font.clone(),
-                            argb(item.icon_argb),
-                        );
+                        let ic = egui::pos2(cx + cfg::WIDGET_ICON_CELL / 2.0, rect.center().y);
+                        if item.icon_kind != 0 {
+                            widget_icon(
+                                &p,
+                                ic,
+                                cfg::WIDGET_ICON_CELL,
+                                item.icon_kind,
+                                argb(item.icon_argb),
+                            );
+                        } else {
+                            p.text(
+                                ic,
+                                egui::Align2::CENTER_CENTER,
+                                &item.icon,
+                                icon_font.clone(),
+                                argb(item.icon_argb),
+                            );
+                        }
                         cx += cfg::WIDGET_ICON_CELL;
                         if !item.text.is_empty() {
                             cx += cfg::WIDGET_ICON_GAP;

@@ -15,7 +15,7 @@ use std::time::Instant;
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, divider, SoftBackend};
+use crate::egui_soft::{argb, widget_icon, SoftBackend};
 use crate::render::{FlashView, PillShape, WidgetItem};
 
 // ---------- 对外接口 ----------
@@ -118,7 +118,9 @@ impl PillUi {
 
     /// 画一帧。返回 `changed=false` 时 rgba/rects 无效（内容与上帧一致）。
     pub fn paint(&mut self, v: &View) -> Painted {
-        let scale = v.scale.max(0.5);
+        // 胶囊大小设置直接乘在"逻辑点 → 物理像素"的换算上：整块布局（字号、
+        // 间距、圆角）等比放大，文字仍按目标像素重新光栅化，不会糊。
+        let scale = (v.scale * crate::settings::pill_scale()).max(0.5);
         self.soft.set_scale(scale);
 
         // ---- 布局预量宽（走 SoftBackend 的独立度量通道：pass 之前也能量） ----
@@ -230,9 +232,8 @@ impl PillUi {
 
                         // ---- widget 区 ----
                         if !v.items.is_empty() {
-                            ui.add_space(cfg::GAP);
-                            divider(&p, ui.cursor().left(), fh);
-                            ui.add_space(1.0 + cfg::GAP + padx);
+                            // 不再画竖分割线：靠间距分隔就够，线条会打断胶囊的整体感
+                            ui.add_space(cfg::GAP + 1.0 + cfg::GAP + padx);
                             for (i, item) in v.items.iter().enumerate() {
                                 if i > 0 {
                                     ui.add_space(cfg::GAP);
@@ -252,13 +253,27 @@ impl PillUi {
                                 }
                                 let mut cx = rect.left() + padx;
                                 if !item.icon.is_empty() {
-                                    p.text(
-                                        egui::pos2(cx + cfg::WIDGET_ICON_CELL / 2.0, rect.center().y),
-                                        egui::Align2::CENTER_CENTER,
-                                        &item.icon,
-                                        icon_font.clone(),
-                                        argb(item.icon_argb),
+                                    let ic = egui::pos2(
+                                        cx + cfg::WIDGET_ICON_CELL / 2.0,
+                                        rect.center().y,
                                     );
+                                    if item.icon_kind != 0 {
+                                        widget_icon(
+                                            &p,
+                                            ic,
+                                            cfg::WIDGET_ICON_CELL,
+                                            item.icon_kind,
+                                            argb(item.icon_argb),
+                                        );
+                                    } else {
+                                        p.text(
+                                            ic,
+                                            egui::Align2::CENTER_CENTER,
+                                            &item.icon,
+                                            icon_font.clone(),
+                                            argb(item.icon_argb),
+                                        );
+                                    }
                                     cx += cfg::WIDGET_ICON_CELL;
                                     if !item.text.is_empty() {
                                         cx += cfg::WIDGET_ICON_GAP;
@@ -278,9 +293,7 @@ impl PillUi {
 
                         // ---- 托盘闪烁图标区 ----
                         if !v.flash.is_empty() {
-                            ui.add_space(cfg::GAP);
-                            divider(&p, ui.cursor().left(), fh);
-                            ui.add_space(1.0 + cfg::GAP + padx);
+                            ui.add_space(cfg::GAP + 1.0 + cfg::GAP + padx);
                             let cell = cfg::FLASH_ICON + 2.0 * padx;
                             for (i, f) in v.flash.iter().enumerate() {
                                 if i > 0 {

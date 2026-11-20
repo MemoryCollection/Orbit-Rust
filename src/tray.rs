@@ -135,6 +135,18 @@ impl TrayMirror {
         self.hosted.is_some()
     }
 
+    /// 丢掉所有已缓存的图标像素（图标尺寸变化后按新尺寸重抓）。
+    ///
+    /// 托管路径的缓存没有 px 维度，所以只能整体清空；清完把 `host_gen` 设成
+    /// 不可能的值，下一次 `poll` 就会整表重建。
+    pub fn invalidate(&mut self) {
+        self.icons.clear();
+        self.host_rgba.clear();
+        self.last_sig.clear();
+        self.last_capture = None;
+        self.host_gen = u64::MAX;
+    }
+
     /// 轮询托盘变化：托管模式走 NOTIFYICONDATA 表，否则走 UIA。
     pub fn poll(&mut self, icon_px: i32) -> bool {
         if self.hosted.is_some() {
@@ -297,11 +309,26 @@ impl TrayMirror {
                     .map(|(_, _, _, rgba)| rgba.clone())
             };
             let raw = if ic.hicon != 0 {
-                match crate::render::capture_icon_rgba(
-                    windows::Win32::UI::WindowsAndMessaging::HICON(ic.hicon as *mut core::ffi::c_void),
-                    icon_px,
-                ) {
+                let hicon =
+                    windows::Win32::UI::WindowsAndMessaging::HICON(ic.hicon as *mut core::ffi::c_void);
+                // 按图标**原生尺寸**抓像素，再自己缩到 Dock 尺寸：让 DrawIconEx 直接画到
+                // 目标尺寸，GDI 会用最粗糙的放大，图标一放大就糊。
+                let native = crate::render::icon_native_size(hicon)
+                    .filter(|n| *n >= 8)
+                    .unwrap_or(icon_px);
+                // 注意：DrawIconEx 的**目标尺寸正好等于图标原生尺寸**时会走"直接贴掩码"
+                // 的分支，取回来是一块纯黑（alpha=255、RGB=0）。只要尺寸不同就会走
+                // 缩放绘制，颜色是对的——所以先放大抓一次，再由我们缩到目标尺寸。
+                let cap = (native * 4).clamp(icon_px.max(native + 1), 192);
+                match crate::render::capture_icon_rgba(hicon, cap) {
                     Some(rgba) => {
+                        let rgba = fit_icon(&rgba, cap, icon_px);
+                        let cov = coverage(&rgba);
+                        let mid = rgba.chunks_exact(4).nth((rgba.len() / 8).max(0)).map(|p| (p[0], p[1], p[2], p[3]));
+                        crate::tlog!(
+                            "[tray] {} native={native} cap={cap} px={icon_px} cov={cov:.2} mid={mid:?}",
+                            ic.tip
+                        );
                         if let Some(slot) = self.host_rgba.iter_mut().find(|(hwnd, uid, guid, _)| {
                             *hwnd == ic.hwnd && *uid == ic.uid && *guid == g
                         }) {
@@ -755,6 +782,10 @@ fn resize_premul(src: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<u8> {
                 }
             }
         }
+        // 放大后的低分辨率图标边缘会发虚：轻度锐化把细节找回来
+        if dw == dh {
+            sharpen_straight(&mut out, dw, 0.55);
+        }
         return out;
     }
 
@@ -791,6 +822,68 @@ fn resize_premul(src: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<u8> {
         }
     }
     out
+}
+
+/// 按目标边长重采样一张正方形图标：缩小走面积平均（不留锯齿），
+/// 放大走 Catmull-Rom + 锐化（16px 的托盘图标放到 40px 也不至于糊成一团）。
+fn fit_icon(rgba: &[u8], src: i32, px: i32) -> Vec<u8> {
+    if src <= 0 || px <= 0 || rgba.is_empty() || src == px {
+        return rgba.to_vec();
+    }
+    if src > px {
+        crate::render::resize_rgba(rgba, src, src, px, px)
+    } else {
+        resize_premul(rgba, src, src, px, px)
+    }
+}
+
+/// 轻度 unsharp mask（straight RGBA）。在预乘域里算，半透明边缘才不会出现白边；
+/// 只锐化 RGB，alpha 保持原样。
+fn sharpen_straight(buf: &mut [u8], px: i32, amount: f32) {
+    let n = px.max(1) as usize;
+    if buf.len() < n * n * 4 || amount <= 0.0 {
+        return;
+    }
+    // 预乘 + 3×3 高斯模糊（1 2 1 / 2 4 2 / 1 2 1，权重 16）
+    let at = |x: usize, y: usize| -> [f32; 4] {
+        let i = (y * n + x) * 4;
+        let a = buf[i + 3] as f32 / 255.0;
+        [
+            buf[i] as f32 * a,
+            buf[i + 1] as f32 * a,
+            buf[i + 2] as f32 * a,
+            a,
+        ]
+    };
+    let mut out = vec![0u8; n * n * 4];
+    const W: [[f32; 3]; 3] = [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]];
+    for y in 0..n {
+        for x in 0..n {
+            let p = at(x, y);
+            let mut blur = [0f32; 3];
+            for (dy, row) in W.iter().enumerate() {
+                for (dx, w) in row.iter().enumerate() {
+                    let sx = (x + dx).saturating_sub(1).min(n - 1);
+                    let sy = (y + dy).saturating_sub(1).min(n - 1);
+                    let s = at(sx, sy);
+                    for c in 0..3 {
+                        blur[c] += s[c] * w / 16.0;
+                    }
+                }
+            }
+            let i = (y * n + x) * 4;
+            let a = p[3];
+            if a <= 0.004 {
+                continue;
+            }
+            for c in 0..3 {
+                let v = (p[c] + (p[c] - blur[c]) * amount).clamp(0.0, a);
+                out[i + c] = (v / a).clamp(0.0, 255.0) as u8;
+            }
+            out[i + 3] = (a * 255.0).round() as u8;
+        }
+    }
+    buf.copy_from_slice(&out);
 }
 
 /// 图标里不透明像素的占比（0~1）。接近 0 = 抓到的是一帧"闪烁熄灭"的空白，

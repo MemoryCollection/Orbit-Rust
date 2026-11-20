@@ -141,6 +141,9 @@ pub struct WidgetItem {
     pub icon: String,
     pub icon_argb: u32,
     pub text: String,
+    /// 图标画法：0 = 用 `icon` 里的字形，1 = 信封，2 = 剪贴板
+    /// （1/2 是矢量绘制，见 `egui_soft::widget_icon`；`icon` 仅作布局占位标识）
+    pub icon_kind: u8,
 }
 
 fn to_u16(s: &str) -> Vec<u16> {
@@ -422,6 +425,47 @@ pub unsafe fn window_icon(hwnd: HWND) -> Option<HICON> {
         }
     }
     None
+}
+
+/// HICON 里那张位图的原始边长（正方取较大边）。拿不到返回 None。
+///
+/// 用途：先把图标按**原始尺寸**抓成像素，再用我们自己的重采样缩放到目标尺寸。
+/// 直接让 `DrawIconEx` 画到目标尺寸时，GDI 会用最快的插值放大 16px 的托盘图标，
+/// 放大后边缘发虚、颜色发灰——这正是"托盘图标放大后不清晰"的根因。
+pub fn icon_native_size(hicon: HICON) -> Option<i32> {
+    use windows::Win32::Graphics::Gdi::{GetObjectW, BITMAP, HGDIOBJ};
+    use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
+    unsafe {
+        let mut info = ICONINFO::default();
+        if GetIconInfo(hicon, &mut info).is_err() {
+            return None;
+        }
+        let measure = |hbmp: windows::Win32::Graphics::Gdi::HBITMAP| -> i32 {
+            if hbmp.is_invalid() {
+                return 0;
+            }
+            let mut bmp = BITMAP::default();
+            let n = GetObjectW(
+                HGDIOBJ(hbmp.0),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bmp as *mut _ as *mut core::ffi::c_void),
+            );
+            if n > 0 {
+                bmp.bmWidth.max(bmp.bmHeight)
+            } else {
+                0
+            }
+        };
+        // 彩色位图优先；单色图标只有 mask（尺寸同样有效）
+        let px = measure(info.hbmColor).max(measure(info.hbmMask));
+        if !info.hbmColor.is_invalid() {
+            let _ = DeleteObject(info.hbmColor);
+        }
+        if !info.hbmMask.is_invalid() {
+            let _ = DeleteObject(info.hbmMask);
+        }
+        (px > 0).then_some(px)
+    }
 }
 
 /// 把任意进程的 HICON 画进 32bpp DIB 并转成 straight-alpha RGBA（边长 = px）。

@@ -239,8 +239,10 @@ pub fn visible(side: Side) -> bool {
 /// 按一帧的布局摆好所有条：该显示的显示、该埋的埋、位置一条条从胶囊往外排。
 pub fn sync(f: &Frame) {
     let m = crate::window::primary_monitor().rcMonitor;
-    let gap = (cfg::WIDGET_BAR_GAP as f32 * f.scale).round() as i32;
-    let hh = (cfg::PILL_H * f.scale).ceil() as i32;
+    // 模块条与胶囊等高、同字号：胶囊大小设置也作用于这里
+    let s = (f.scale * crate::settings::pill_scale()).max(0.5);
+    let gap = (cfg::WIDGET_BAR_GAP as f32 * s).round() as i32;
+    let hh = (cfg::PILL_H * s).ceil() as i32;
     let (px, py, pw, _) = f.pill;
     let min_x = m.left + 6;
     let max_x = m.right - 6;
@@ -258,7 +260,7 @@ pub fn sync(f: &Frame) {
         let mut widths = Vec::with_capacity(list.len());
         for b in &list {
             let items: Vec<WidgetItem> = b.items.iter().map(|(_, it)| it.clone()).collect();
-            widths.push((crate::widgetbarview::bar_width(&items) * f.scale).ceil() as i32);
+            widths.push((crate::widgetbarview::bar_width(&items) * s).ceil() as i32);
         }
         let total: i32 = widths.iter().sum::<i32>() + gap * (list.len() as i32 - 1).max(0);
 
@@ -294,7 +296,7 @@ pub fn sync(f: &Frame) {
                 continue;
             }
             used[i - side.idx() * SLOTS] = true;
-            show(i, side, slot, b.items, f.scale, (xs[k], py, widths[k], hh), f.alpha);
+            show(i, side, slot, b.items, s, (xs[k], py, widths[k], hh), f.alpha);
         }
         for k in 0..SLOTS {
             if !used[k] {
