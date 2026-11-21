@@ -1,7 +1,20 @@
 //! 直接复用产品里的 `src/traymsg.rs` 跑一遍"找回调目标 + 转发"，用来验证真代码。
+//!
+//! 托盘排障常用模式（都按物理像素、per-monitor DPI aware）：
+//!   geom                  屏幕尺寸 + ORBIT_DOCK 窗口矩形
+//!   tray                  读 explorer 的 TRAYDATA：真任务栏里每个图标的回调目标
+//!   move/clickat <x> <y>  只移光标 / 移过去再点一下左键
+//!   rect <hwnd> <uid>     宿主上报的图标中心（= 应用认为图标在哪）
+//!   st [秒]               任务管理器窗口状态（visible / iconic / rect）
+//!   find <pid...>         这个进程注册过的托盘图标矩形
 
 #[macro_export]
 macro_rules! vlog {
+    ($($t:tt)*) => { println!($($t)*) };
+}
+
+#[macro_export]
+macro_rules! tlog {
     ($($t:tt)*) => { println!($($t)*) };
 }
 
@@ -11,7 +24,136 @@ mod traymsg;
 use windows::Win32::Foundation::RECT;
 
 fn main() {
+    // 让坐标口径和 Orbit（per-monitor DPI aware）一致：都按物理像素
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
     let a: Vec<String> = std::env::args().collect();
+    if a.get(1).map(|s| s.as_str()) == Some("geom") {
+        // geom：屏幕尺寸 + Dock 窗口矩形
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        unsafe {
+            let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            println!("屏幕 {sw}×{sh}");
+            if let Ok(h) = FindWindowW(w!("ORBIT_DOCK"), PCWSTR::null()) {
+                let mut r = RECT::default();
+                let _ = GetWindowRect(h, &mut r);
+                println!(
+                    "Dock hwnd={:#x} rect=({},{},{},{}) {}×{}",
+                    h.0 as usize, r.left, r.top, r.right, r.bottom,
+                    r.right - r.left, r.bottom - r.top
+                );
+            } else {
+                println!("没找到 ORBIT_DOCK");
+            }
+        }
+        return;
+    }
+    if a.get(1).map(|s| s.as_str()) == Some("move") {
+        // move <x> <y>：只把光标移过去（触发 Orbit 的悬停转发，日志里能看到图标中心）
+        let x: i32 = a[2].parse().unwrap();
+        let y: i32 = a[3].parse().unwrap();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y);
+        }
+        return;
+    }
+    if a.get(1).map(|s| s.as_str()) == Some("rect") {
+        // rect <hwnd> <uid>：宿主上报的图标中心（= Dock 上那个图标的位置）
+        let nh = usize::from_str_radix(a[2].trim_start_matches("0x"), 16).unwrap();
+        let uid: u32 = a[3].parse().unwrap();
+        let t = traymsg::Target {
+            pid: 0,
+            hwnd: windows::Win32::Foundation::HWND(nh as *mut core::ffi::c_void),
+            msg: 0,
+            uid,
+            ver: 0,
+        };
+        match traymsg::icon_center_of(t) {
+            Some((x, y)) => println!("{x} {y}"),
+            None => println!("none"),
+        }
+        return;
+    }
+    if a.get(1).map(|s| s.as_str()) == Some("clickat") {
+        // clickat <x> <y>：在屏幕坐标上真点一下左键（撤销后把光标放回原处）
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+        let x: i32 = a[2].parse().unwrap();
+        let y: i32 = a[3].parse().unwrap();
+        let mut old = POINT::default();
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetClassNameW, GetWindowRect, WindowFromPoint,
+            };
+            let _ = GetCursorPos(&mut old);
+            let _ = SetCursorPos(x, y);
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let under = WindowFromPoint(POINT { x, y });
+            let mut b = [0u16; 128];
+            let n = GetClassNameW(under, &mut b);
+            let mut r = windows::Win32::Foundation::RECT::default();
+            let _ = GetWindowRect(under, &mut r);
+            println!(
+                "该点下的窗口 {:#x} class={} rect=({},{},{},{})",
+                under.0 as usize,
+                String::from_utf16_lossy(&b[..n as usize]),
+                r.left, r.top, r.right, r.bottom
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        mouse_click();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        unsafe {
+            let _ = SetCursorPos(old.x, old.y);
+        }
+        println!("已点击 ({x},{y})");
+        return;
+    }
+    if a.get(1).map(|s| s.as_str()) == Some("st") {
+        // st：只打印任务管理器窗口状态（可跟一个"等待秒数"）
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        unsafe {
+            let wait: u64 = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let probe = |tag: &str| {
+                if let Ok(h) = FindWindowW(w!("TaskManagerWindow"), PCWSTR::null()) {
+                    let mut r = RECT::default();
+                    let _ = GetWindowRect(h, &mut r);
+                    println!(
+                        "{tag}: hwnd={:#x} visible={} iconic={} rect=({},{},{},{})",
+                        h.0 as usize,
+                        IsWindowVisible(h).as_bool(),
+                        IsIconic(h).as_bool(),
+                        r.left, r.top, r.right, r.bottom
+                    );
+                } else {
+                    println!("{tag}: 没找到 TaskManagerWindow");
+                }
+            };
+            probe("当前");
+            if wait > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+                probe("稍后");
+            }
+        }
+        return;
+    }
+    if a.get(1).map(|s| s.as_str()) == Some("tray") {
+        // 直接读 explorer 的 TRAYDATA：看真任务栏里每个图标的回调目标
+        for e in traymsg::tray_items() {
+            println!(
+                "hwnd={:#x} uid={:<12} msg={:#08x} ver={} tip={:?} exe={}",
+                e.hwnd.0 as usize, e.uid, e.msg, e.ver, e.tip, e.exe
+            );
+        }
+        return;
+    }
     if a.get(1).map(|s| s.as_str()) == Some("find") {
         for arg in &a[2..] {
             let pid: u32 = arg.parse().unwrap();
@@ -407,4 +549,30 @@ fn all_windows() -> std::collections::HashSet<String> {
         let _ = EnumWindows(Some(cb), LPARAM(&mut v as *mut _ as isize));
     }
     v.into_iter().collect()
+}
+
+/// 真点一次左键（全局输入，不受 UIPI 限制）
+fn mouse_click() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEINPUT,
+    };
+    for flag in [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP] {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: 0,
+                    dwFlags: flag,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe {
+            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+        }
+    }
 }

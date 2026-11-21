@@ -86,11 +86,41 @@ pub struct State {
     pub placements: Vec<Placement>,
     /// 图标表版本号，Dock 轮询时对比，变化才重建
     pub generation: u64,
+    /// 被过滤掉的"占位"注册（任务管理器刷新 CPU 时先 ADD 一条 tip=「任务管理器」的
+    /// 占位图标，稳定后才 MODIFY 成「CPU xx%」）。占位不显示，但**必须记住它的
+    /// 注册信息**：后续的 MODIFY 只带 tip/hIcon，`uCallbackMessage` 是 0，
+    /// 要是直接把 MODIFY 当新图标入库，消息号就成了 0 —— 点击投递的是 WM_NULL，
+    /// 表现就是"点 CPU 图标叫不出任务管理器"。
+    pending: Vec<Icon>,
 }
+
+impl State {
+    /// 记下一条占位注册（同 hwnd+uID 覆盖旧的）。只保留最近若干条：有的应用
+    /// （任务管理器）会一口气 ADD 十几条不同 uID 的占位，不封顶会一直涨。
+    fn pending_put(&mut self, icon: Icon) {
+        if let Some(i) = self.pending.iter_mut().find(|i| i.same(&icon)) {
+            *i = icon;
+            return;
+        }
+        if self.pending.len() >= PENDING_MAX {
+            self.pending.remove(0);
+        }
+        self.pending.push(icon);
+    }
+
+    /// 取走与这条 MODIFY 对应的占位注册（用来补消息号/协议版本/guid）
+    fn pending_take(&mut self, icon: &Icon) -> Option<Icon> {
+        let at = self.pending.iter().position(|i| i.same(icon))?;
+        Some(self.pending.remove(at))
+    }
+}
+
+/// 占位注册最多记多少条
+const PENDING_MAX: usize = 32;
 
 impl Default for State {
     fn default() -> Self {
-        Self { icons: Vec::new(), placements: Vec::new(), generation: 0 }
+        Self { icons: Vec::new(), placements: Vec::new(), generation: 0, pending: Vec::new() }
     }
 }
 
@@ -465,6 +495,16 @@ unsafe fn parse_shelltraydata(p: *mut c_void, cb: usize) -> Option<(u32, Icon)> 
     };
     let tip = wide_at(b, nid + 24, 128);
     let (pid, exe) = exe_of_hwnd(hwnd);
+    // 诊断（ORBIT_TRACE=1）：任务管理器的 CPU 图标（elevated 进程，注册序列特殊）
+    if crate::trace::verbose() && (tip.contains("任务管理") || tip.to_uppercase().starts_with("CPU")) {
+        let mut hex = String::new();
+        for i in 0..12 {
+            hex.push_str(&format!("{:08x} ", u32at(nid + i * 4)));
+        }
+        crate::vlog!(
+            "[trayhost] NIDRAW cb={cb} dm={dw_msg} nid_cb={cb_nid:#x} tip={tip} hwnd={hwnd:#x} uid={uid} flags={flags:#x} msg={msg:#x} ver={ver} pid={pid} exe={exe} | {hex}"
+        );
+    }
     let icon = Icon {
         hwnd, uid, guid, msg, ver, hicon, dim: false, tip, flags, state, exe, pid,
         seq: SEQ.fetch_add(1, Ordering::Relaxed),
@@ -518,6 +558,7 @@ fn apply((dm, icon): (u32, Icon)) {
     match dm {
         NIM_DELETE => {
             st.icons.retain(|i| !i.same(&icon));
+            st.pending.retain(|i| !i.same(&icon));
             st.generation += 1;
         }
         NIM_SETVERSION => {
@@ -528,16 +569,12 @@ fn apply((dm, icon): (u32, Icon)) {
             }
         }
         NIM_ADD | NIM_MODIFY => {
-            // 任务管理器刷新 CPU 图表时用新窗口 ADD 一个 tip=「任务管理器」的占位图标，
-            // 稳定后 MODIFY 成「CPU xx%」。占位不入库（用户要求最简策略），
-            // 等它换成正式名字后走下面「未匹配 MODIFY 补入库」路径进来。
-            let taskmgr_placeholder = icon.tip == "任务管理器";
-            if taskmgr_placeholder {
-                crate::tlog!(
-                    "[trayhost] 跳过任务管理器占位图标 dm={} hwnd={:#x} uid={}",
-                    dm, icon.hwnd, icon.uid
-                );
-            }
+            // 任务管理器刷新 CPU 图表时先 ADD 一条 tip=「任务管理器」的占位图标，
+            // 稳定后 MODIFY 成「CPU xx%」。占位不显示（用户要求最简策略），但**注册
+            // 信息必须留住**：随后那条 MODIFY 只带 tip/hIcon，`uCallbackMessage`
+            // 是 0。以前直接把它当新图标入库，消息号就成了 0 —— 点击投递的是
+            // WM_NULL，表现就是"左键点 CPU 图标叫不出任务管理器"（实测复现）。
+            let placeholder = is_placeholder(&icon);
             // 微信类图标的每次变更都记一行，用来实测"空白-图标"闪烁走的是哪条通道
             let is_msg = icon.exe.contains("weixin") || icon.exe.contains("wechat") || icon.tip.contains("微信");
             if is_msg {
@@ -547,6 +584,14 @@ fn apply((dm, icon): (u32, Icon)) {
                     icon.state, icon.tip, icon.hwnd, icon.guid
                 );
             }
+            if placeholder {
+                crate::vlog!(
+                    "[trayhost] 占位注册入暂存 dm={} hwnd={:#x} uid={} msg={:#x} v{}",
+                    dm, icon.hwnd, icon.uid, icon.msg, icon.ver
+                );
+                st.pending_put(icon);
+                return;
+            }
             if let Some(i) = st.icons.iter_mut().find(|i| i.same(&icon)) {
                 // MODIFY 只带 NIF_ICON 时才更新图标（hicon=0 = 灭帧，保留原图但记 dim）
                 if icon.flags & NIF_ICON != 0 {
@@ -555,7 +600,7 @@ fn apply((dm, icon): (u32, Icon)) {
                         i.hicon = icon.hicon;
                     }
                 }
-                if !icon.tip.is_empty() && !taskmgr_placeholder {
+                if !icon.tip.is_empty() {
                     i.tip = icon.tip;
                 }
                 if icon.msg >= 0x0400 {
@@ -573,7 +618,7 @@ fn apply((dm, icon): (u32, Icon)) {
                 i.pid = icon.pid;
                 i.seq = icon.seq;
                 st.generation += 1;
-            } else if dm == NIM_ADD && !taskmgr_placeholder {
+            } else if dm == NIM_ADD {
                 let (tip, hwnd, uid, msg, ver, guid) =
                     (icon.tip.clone(), icon.hwnd, icon.uid, icon.msg, icon.ver, icon.guid);
                 // 同一 exe 已经有一条（且没被 same() 匹配上）→ 记录 identity，
@@ -585,19 +630,35 @@ fn apply((dm, icon): (u32, Icon)) {
                         icon.exe, tip, hwnd, uid, guid, dup
                     );
                 }
+                st.pending_take(&icon); // 这条正式注册已经把占位信息用掉了
                 st.icons.push(icon);
                 st.generation += 1;
                 crate::vlog!("[trayhost] ADD {} hwnd={:#x} uid={} msg={:#x} v{} guid={:?}",
                     tip, hwnd, uid, msg, ver, guid);
-            } else if dm == NIM_MODIFY && !taskmgr_placeholder && !icon.tip.is_empty() {
-                // 未匹配上的 MODIFY：ADD 被拦掉（任务管理器占位）或漏掉的图标，
-                // 带着 tip 落库补进来。hicon/msg/ver/guid 都在 NOTIFYICONDATA 里，直接建。
-                let (tip, hwnd, uid, msg, ver, guid) =
-                    (icon.tip.clone(), icon.hwnd, icon.uid, icon.msg, icon.ver, icon.guid);
-                st.icons.push(icon);
+            } else if dm == NIM_MODIFY && !icon.tip.is_empty() {
+                // 未匹配上的 MODIFY：ADD 是占位（被过滤）或漏掉的图标。带着 tip 落库，
+                // 但消息号/协议版本/guid 得从占位那条注册里补回来——MODIFY 的载荷里
+                // 这几个字段是 0，直接建成图标就"点了没反应"。
+                let mut fresh = icon;
+                let mut fixed = None;
+                if let Some(p) = st.pending_take(&fresh) {
+                    if fresh.msg < 0x0400 && p.msg >= 0x0400 {
+                        fresh.msg = p.msg;
+                    }
+                    if fresh.ver == 0 {
+                        fresh.ver = p.ver;
+                    }
+                    if fresh.guid == GUID::default() {
+                        fresh.guid = p.guid;
+                    }
+                    fixed = Some(p.msg);
+                }
+                crate::tlog!(
+                    "[trayhost] MODIFY 补入库 {} hwnd={:#x} uid={} msg={:#x} v{}（占位补消息号 {:?}）",
+                    fresh.tip, fresh.hwnd, fresh.uid, fresh.msg, fresh.ver, fixed
+                );
+                st.icons.push(fresh);
                 st.generation += 1;
-                crate::vlog!("[trayhost] MODIFY 补入库 {} hwnd={:#x} uid={} msg={:#x} v{} guid={:?}",
-                    tip, hwnd, uid, msg, ver, guid);
             }
         }
         _ => {}
@@ -609,13 +670,19 @@ fn is_live(hwnd: u32) -> bool {
     hwnd != 0 && unsafe { IsWindow(HWND(hwnd as *mut c_void)).as_bool() }
 }
 
+/// 是不是"占位"注册：任务管理器在 CPU 图表刷新前先 ADD 一条 tip 为「任务管理器」
+/// 的图标，稳定后才 MODIFY 成「CPU xx%」。占位不显示，只用来存注册信息。
+fn is_placeholder(i: &Icon) -> bool {
+    i.tip == "任务管理器"
+}
+
 /// 清掉托管表里窗口已销毁的条目（幽灵托盘图标）。
-/// 任务管理器每次刷新 CPU 图表都会用新的通知窗口重新 ADD，旧窗口销毁时
-/// 不发 NIM_DELETE，不清理会堆出十几个「任务管理器」图标，其中只有最后
-/// 一条（tip 变成「CPU xx%」的那条）是活的。已持有表锁时用 _locked 版本。
+/// 任务管理器每次刷新 CPU 图表都会重新 ADD，旧窗口销毁时不发 NIM_DELETE，
+/// 不清理会堆出十几个同名图标。已持有表锁时用 _locked 版本。
 fn prune_dead_locked(st: &mut State) {
     let before = st.icons.len();
     st.icons.retain(|i| i.hwnd == 0 || is_live(i.hwnd));
+    st.pending.retain(|i| i.hwnd == 0 || is_live(i.hwnd));
     let gone = before - st.icons.len();
     if gone > 0 {
         st.generation += 1;

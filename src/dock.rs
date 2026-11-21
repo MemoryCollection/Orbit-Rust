@@ -417,6 +417,13 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         });
                     dock.last_lclick = Some(now);
                     let c = dock.tray_center(idx);
+                    // 任务管理器的 CPU 图标是 elevated 进程：回调消息投不进去、窗口
+                    // 也拉不动（详见 traymsg::wake_taskmgr），只能走"再启动一次"。
+                    let taskmgr = dock
+                        .tray_shown
+                        .get(idx)
+                        .and_then(|&real| dock.tray.items.get(real))
+                        .map_or(false, |it| traymsg::is_taskmgr(&it.exe, &it.name));
                     if let Some(t) = dock.tray_targets.get(&c).copied() {
                         crate::vlog!("[dock] 左键托盘#{idx}（回调消息{}）", if dbl { " 双击" } else { "" });
                         // 点击 = 悬停结束，应用要开真面板了：先吊销守位线程，别让它碰真 UI
@@ -430,6 +437,9 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     } else if let Some(&real) = dock.tray_shown.get(idx) {
                         crate::vlog!("[dock] 左键托盘 显示#{idx} → 实际#{real}（UIA）");
                         dock.tray.click(real, false);
+                    }
+                    if taskmgr {
+                        traymsg::wake_taskmgr();
                     }
                 } else if let Some(idx) = dock.index_at(x as f32, y as f32) {
                     dock.activate(idx);

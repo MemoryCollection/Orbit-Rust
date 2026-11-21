@@ -27,11 +27,11 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
-use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, NOTIFYICONIDENTIFIER};
+use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, ShellExecuteW, NOTIFYICONIDENTIFIER};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumThreadWindows, FindWindowExW, FindWindowW, GetClassNameW, GetWindowThreadProcessId,
-    SendMessageW, SendNotifyMessageW, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_RBUTTONDOWN, WM_RBUTTONUP,
+    SendMessageW, SendNotifyMessageW, SW_SHOWNORMAL, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 /// sizeof(NOTIFYICONDATAW)，x64
@@ -118,6 +118,13 @@ pub fn leave(t: &Target, center: (i32, i32)) {
 ///            （小米电脑管家实测：点击闪退、左右键都弹不出窗口，就是这个原因）。
 ///   v0-2  —— WM_LBUTTONDOWN + WM_LBUTTONUP；双击第二击 DBLCLK + UP（第一击不重放）。
 pub fn click(t: &Target, center: (i32, i32), dbl: bool) {
+    if t.msg == 0 || t.msg == u32::MAX {
+        // 消息号为 0 等于投 WM_NULL：点了什么都不发生。正常不该出现——真出现说明
+        // 图标注册信息没拿全（老版本「占位 ADD 被过滤 + MODIFY 补入库」就是这个坑，
+        // 任务管理器的 CPU 图标踩过），这里留痕方便定位。
+        crate::tlog!("[traymsg] 丢弃点击：回调消息号无效 msg={} hwnd={:#x}", t.msg, t.hwnd.0 as usize);
+        return;
+    }
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(t.pid);
     }
@@ -692,4 +699,40 @@ fn scan_chunk(b: &[u8], map: &HashMap<u64, (HWND, u32)>, pid: u32, icon: RECT) -
         i += 8;
     }
     None
+}
+
+// ---------- 任务管理器（elevated）专用唤醒 ----------
+//
+// 任务管理器清单里写的是 `requestedExecutionLevel level="highestAvailable"`，
+// 管理员账户下它以 High 完整性级别运行，而 Orbit 是 Medium。跨完整性级别实测：
+//   - 给它投私有消息（`uCallbackMessage`）会被 UIPI 静默丢弃，
+//     `PostMessage` 直接返回 `ACCESS_DENIED`；
+//   - `ShowWindow` / `ShowWindowAsync` / `SetForegroundWindow` 全都没有效果，
+//     最小化的窗口纹丝不动。
+// 唯一可靠的路径是**再启动一次 taskmgr.exe**：它是单实例，新进程会立刻自己退出，
+// 同时把已存在的那个实例的窗口显示到前台——和点开始菜单里的「任务管理器」完全一样。
+// 实测：收进托盘（iconic + 隐藏）的任务管理器，再启动一次就回来了。
+
+/// 这个托盘图标是不是任务管理器（隐藏到托盘时 tooltip 是「CPU xx%」）
+pub fn is_taskmgr(exe: &str, name: &str) -> bool {
+    let e = exe.to_ascii_lowercase();
+    if e.ends_with("\\taskmgr.exe") || e == "taskmgr.exe" {
+        return true;
+    }
+    name == "任务管理器" || name.to_ascii_uppercase().starts_with("CPU ")
+}
+
+/// 把任务管理器叫回来（跨完整性级别说明见上）
+pub fn wake_taskmgr() {
+    let r = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            w!("taskmgr.exe"),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    crate::tlog!("[traymsg] 唤起任务管理器 ShellExecute={} ok={}", r.0 as isize, r.0 as isize > 32);
 }
