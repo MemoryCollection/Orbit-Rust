@@ -23,6 +23,20 @@ pub fn pill_bg_effective() -> u32 {
     }
 }
 
+/// 考虑 Dock 独立透明度滑条之后的 Dock 底色。
+/// 与胶囊分开：dock_alpha 拉满强制实底；否则把主题底色的 alpha 按
+/// dock_alpha 比例压低（主题本来就半透明时叠加）。
+pub fn dock_bg_effective() -> u32 {
+    let bg = crate::theme::cur().pill_bg;
+    let a = crate::settings::dock_alpha();
+    if a >= 0.999 {
+        return opaque(bg);
+    }
+    let cur_a = (bg >> 24) & 0xFF;
+    let new_a = ((cur_a as f32) * a).round().clamp(0.0, 255.0) as u32;
+    (new_a << 24) | (bg & 0x00FF_FFFF)
+}
+
 /// 只把 alpha 字节提到 0xFF，RGB 原样保留
 pub fn opaque(c: u32) -> u32 {
     (0xFF << 24) | (c & 0x00FF_FFFF)
@@ -80,9 +94,9 @@ pub const WIDGET_ITEM_GAP: f32 = 4.0;
 pub const FLASH_WINDOW_MS: u64 = 2500;
 /// 天气目标城市（留空 = 按出口 IP 自动定位）
 pub const WEATHER_CITY: &str = "";
-/// 高德 Web 服务 key（留空则只用 Open-Meteo）。免费额度 5000 次/月，
-/// 每次刷新消耗 2 次（实况 + 预报），30 分钟一次约 2900 次/月。
-pub const AMAP_KEY: &str = "";
+// 高德 Web 服务 key 不在源码里：填在 `data/settings.txt` 的 `amap_key=` 一行
+// （设置页「顶部胶囊 → 天气」也能改）。留空则只用 Open-Meteo。
+// 免费额度 5000 次/月，每次刷新消耗 2 次（实况 + 预报），30 分钟一次约 2900 次/月。
 /// 天气刷新间隔（秒）
 pub const WEATHER_INTERVAL: u64 = 1800;
 
@@ -93,7 +107,11 @@ pub const SHOW_MAIL: bool = true;
 /// IMAP 服务器（QQ 邮箱）
 pub const MAIL_HOST: &str = "imap.qq.com";
 pub const MAIL_PORT: u16 = 993;
-/// 账号与授权码：首次运行会写入 <exe>/data/mail.txt，之后以该文件为准
+/// 账号与授权码的**占位默认值**，恒为空。
+///
+/// **不要在这里填真账号**：这是源码常量，一旦提交就进了 git 历史。
+/// 首次运行会用这两个空值生成 `<exe>/data/mail.txt`，请在那份文件里填
+/// （或直接用设置页「顶部胶囊 → 邮件」添加账号，写进 `data/settings.txt`）。
 pub const MAIL_USER: &str = "";
 pub const MAIL_PASS: &str = "";
 /// 拉取间隔（秒）
@@ -240,6 +258,10 @@ pub const TRAY_EMPTY_HOLD_MS: u128 = 1500;
 /// 回调消息号系统没有 API 可查，靠 `traymsg` 从目标进程内存里挖 `NOTIFYICONDATAW`，
 /// 结果按 exe 缓存进 `orbit.traycache`（每个程序只需扫一次）。
 pub const TRAY_FORWARD_HOVER: bool = true;
+/// 伪造托盘点击/悬停（traymsg）：向目标窗口投它注册时的回调消息。
+/// 对齐 Atrium 的「透明转发」后可关掉这条做 A/B：关闭时 Dock 托盘图标仍显示，
+/// 但点击/悬停不再伪造投消息（完全交给已转发的 Explorer 托盘处理）。
+pub const TRAY_FAKE_INPUT: bool = true;
 
 /// 悬停转发后，应用自己弹的预览小窗（微信那种卡片）会落在**旧托盘角**。
 /// 打开这个就把那个 tool window 摆到 Dock 正上方，并在它开着的时候一直守着别再漂回去。
@@ -267,7 +289,8 @@ pub const TIP_MAX_W: f32 = 260.0;
 // ---------- 音乐条（旋转封面 + 歌词）----------
 
 /// 歌词字号（逻辑单位；可由 settings.txt 的 lyric_size 覆盖）
-pub const LYRIC_FONT_SIZE: f32 = 14.0;
+/// 歌词字号默认与时间/日期字号一致（TIME_SIZE）
+pub const LYRIC_FONT_SIZE: f32 = TIME_SIZE;
 /// 音乐条左右内边距
 pub const LYRIC_PAD_X: f32 = 16.0;
 /// 音乐条与胶囊之间的间距（像素；用户要求左右距离再拉开一点，8 → 14）

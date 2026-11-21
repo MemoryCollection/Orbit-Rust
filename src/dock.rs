@@ -100,6 +100,9 @@ static TRAY_BY_PID: LazyLock<Mutex<HashMap<u32, traymsg::Raw>>> =
 /// 模拟左键点击某个 pid 的托盘图标（走图标注册的回调消息，不动光标）。
 /// 横幅点击跳转兜底：微信窗口收在托盘时用它把主窗口唤出来。
 pub fn click_tray_for_pid(pid: u32) {
+    if !settings::tray_fake_input() {
+        return; // 透明模式：不伪造托盘点击
+    }
     let raw = TRAY_BY_PID.lock().ok().and_then(|m| m.get(&pid).copied());
     let Some(raw) = raw else {
         crate::tlog!("[dock] 横幅兜底：没有 pid={pid} 的托盘回调目标");
@@ -416,7 +419,12 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         crate::vlog!("[dock] 左键托盘#{idx}（回调消息{}）", if dbl { " 双击" } else { "" });
                         // 点击 = 悬停结束，应用要开真面板了：先吊销守位线程，别让它碰真 UI
                         flyout::cancel(t.hwnd, t.pid);
-                        traymsg::click(&t, c, dbl);
+                        if settings::tray_fake_input() {
+                            traymsg::click(&t, c, dbl);
+                        } else if let Some(&real) = dock.tray_shown.get(idx) {
+                            // 透明模式：不伪造回调消息，退回 UIA 默认动作（让 Explorer 处理）
+                            dock.tray.click(real, false);
+                        }
                     } else if let Some(&real) = dock.tray_shown.get(idx) {
                         crate::vlog!("[dock] 左键托盘 显示#{idx} → 实际#{real}（UIA）");
                         dock.tray.click(real, false);
@@ -451,16 +459,21 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             crate::vlog!("[dock] 右键托盘#{idx}（回调消息）");
                             // 同左键：右键弹出的菜单也是应用的真 UI，悬停守位线程必须先停
                             flyout::cancel(t.hwnd, t.pid);
-                            // 但菜单本身会弹在注入坐标（= Dock 图标上），被 topmost 的
-                            // Dock 压住一角——改由菜单守位线程把它挪到 Dock 旁边
-                            if cfg::TRAY_RELOCATE_MENU {
-                                let mut cap = RECT::default();
-                                if GetWindowRect(hwnd, &mut cap).is_ok() {
-                                    let label = dock.flyout_label(idx);
-                                    flyout::watch_menu(t.pid, t.hwnd, cap, c, &label);
+                            if settings::tray_fake_input() {
+                                // 但菜单本身会弹在注入坐标（= Dock 图标上），被 topmost 的
+                                // Dock 压住一角——改由菜单守位线程把它挪到 Dock 旁边
+                                if cfg::TRAY_RELOCATE_MENU {
+                                    let mut cap = RECT::default();
+                                    if GetWindowRect(hwnd, &mut cap).is_ok() {
+                                        let label = dock.flyout_label(idx);
+                                        flyout::watch_menu(t.pid, t.hwnd, cap, c, &label);
+                                    }
                                 }
+                                traymsg::right_click(&t, c);
+                            } else if let Some(&real) = dock.tray_shown.get(idx) {
+                                // 透明模式：退回 UIA 真实坐标右键
+                                dock.tray.click(real, true);
                             }
-                            traymsg::right_click(&t, c);
                         }
                         None => {
                             // 还不知道回调消息号：先退回"移过去点一下"，同时把扫描排上
@@ -686,7 +699,12 @@ impl Dock {
     /// 走的是图标注册时的回调消息（wParam/lParam 按协议版本编码），**不动光标**，
     /// 也不用管任务栏是否可见——这也正是"悬停即弹卡片"能成立的前提。
     fn forward_hover(&mut self) {
-        if !cfg::TRAY_FORWARD_HOVER {
+        if !cfg::TRAY_FORWARD_HOVER || !settings::tray_fake_input() {
+            // 透明模式（伪造输入关闭）：不发悬停回调；清掉上一轮状态
+            if !settings::tray_fake_input() {
+                self.hover_sent = None;
+                self.last_hover_move = None;
+            }
             return;
         }
         let want = self.hover_center();

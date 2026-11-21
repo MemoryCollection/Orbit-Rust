@@ -154,10 +154,43 @@ static START_PINS: Mutex<Option<Vec<(String, String)>>> = Mutex::new(None);
 static AUTOSTART: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 退出守护：orbit 被强杀后由守护子进程重启 explorer 恢复任务栏（默认开）
 static GUARDIAN: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 伪造托盘点击/悬停（traymsg 回调消息投递）：关闭后完全交给已转发的 Explorer 托盘
+static TRAY_FAKE_INPUT: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 图标指定：键（托盘图标键 / `app:<exe>`）→ 取图标的 exe/.lnk 全路径。
 /// 有些程序注册的托盘 hIcon 只有 16px，放大到 Dock 尺寸必然糊，用户可以指定一个
 /// 图标清晰的 exe 顶替它。
 static ICON_OVER: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+// ---------- 通知 / 横幅 / 提示音（按来源独立配置）----------
+/// 通知通道：0 = 关，1 = Orbit 横幅，2 = Windows 系统通知。见 `NotifyChannel`
+static NOTIFY_WECHAT: AtomicU32 = AtomicU32::new(UNLOADED);
+static NOTIFY_TRAY: AtomicU32 = AtomicU32::new(UNLOADED);
+static NOTIFY_MAIL: AtomicU32 = AtomicU32::new(UNLOADED);
+static NOTIFY_CLIPBOARD: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 各来源横幅停留秒数（存「秒+1」避开 UNLOADED 哨兵，0 秒 = 常驻）
+static BANNER_WECHAT_SECS: AtomicU32 = AtomicU32::new(UNLOADED);
+static BANNER_MAIL_SECS: AtomicU32 = AtomicU32::new(UNLOADED);
+static BANNER_TRAY_SECS: AtomicU32 = AtomicU32::new(UNLOADED);
+static BANNER_CLIPBOARD_SECS: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 提示音模式：0 = 关，1 = 单次，2 = 循环 2 次，3 = 循环 3 次，4 = 直到消息消失。见 `SoundMode`
+static SOUND_MODE: AtomicU32 = AtomicU32::new(UNLOADED);
+
+// ---------- 邮件多账号 ----------
+/// 多账号列表：每个账号 `host|port|user|pass`，账号间用 `;` 分隔。
+/// 非空时优先于单账号 imap_* 键，mail.rs 会同时监听这里面所有账号。
+static MAIL_ACCOUNTS: Mutex<Vec<MailAccount>> = Mutex::new(Vec::new());
+/// 已测试连通的账号标识（`user@host`）列表，设置页打勾标记用，避免每次重测
+static MAIL_VERIFIED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+// ---------- 剪切板 / Dock / 开始菜单 ----------
+/// 剪切板模块常驻置顶文字（在面板顶部固定显示一条）
+static CLIPBOARD_PINNED_TEXT: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+/// Dock 透明度（f32 位型，0.2 ~ 1.0，独立于胶囊）
+static DOCK_ALPHA: AtomicU32 = AtomicU32::new(UNLOADED);
+/// Win 键接管开始菜单（0 = 未加载，1 = 关，2 = 开，默认开）
+static START_HOOK: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 开始菜单每行快捷方式数量（1 ~ 8，默认 4）
+static START_COLS: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 设置版本号：任何值变化（手改文件或设置页面改）都 +1，各窗口据此判断要不要重绘
 static VERSION: AtomicU64 = AtomicU64::new(1);
 /// 正在写盘：这时读文件可能拿到半成品，轮询先跳过
@@ -215,6 +248,154 @@ impl ModuleMode {
             ModuleMode::BarRight => "right",
             ModuleMode::Off => "off",
         }
+    }
+}
+
+/// 通知通道：某类消息来了走哪条路。
+/// Orbit 横幅 = 自绘分层横幅；Windows = 系统通知中心 Toast；Off = 不弹。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotifyChannel {
+    Off,
+    Orbit,
+    Windows,
+}
+
+impl NotifyChannel {
+    fn code(self) -> u32 {
+        match self {
+            NotifyChannel::Off => 1,
+            NotifyChannel::Orbit => 2,
+            NotifyChannel::Windows => 3,
+        }
+    }
+    fn from_code(c: u32) -> Self {
+        match c {
+            3 => NotifyChannel::Windows,
+            2 => NotifyChannel::Orbit,
+            _ => NotifyChannel::Off,
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "none" | "关" | "不通知" => Some(NotifyChannel::Off),
+            "orbit" | "banner" | "横幅" => Some(NotifyChannel::Orbit),
+            "windows" | "toast" | "系统" => Some(NotifyChannel::Windows),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotifyChannel::Off => "off",
+            NotifyChannel::Orbit => "orbit",
+            NotifyChannel::Windows => "windows",
+        }
+    }
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            NotifyChannel::Off => "不通知",
+            NotifyChannel::Orbit => "Orbit 横幅",
+            NotifyChannel::Windows => "Windows 通知",
+        }
+    }
+    #[allow(dead_code)]
+    pub const ALL: [NotifyChannel; 3] = [NotifyChannel::Off, NotifyChannel::Orbit, NotifyChannel::Windows];
+}
+
+/// 提示音模式：单次 / 循环 N 次 / 直到消息消失。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SoundMode {
+    Off,
+    Once,
+    Twice,
+    Thrice,
+    UntilDismiss,
+}
+
+impl SoundMode {
+    fn code(self) -> u32 {
+        match self {
+            SoundMode::Off => 1,
+            SoundMode::Once => 2,
+            SoundMode::Twice => 3,
+            SoundMode::Thrice => 4,
+            SoundMode::UntilDismiss => 5,
+        }
+    }
+    fn from_code(c: u32) -> Self {
+        match c {
+            2 => SoundMode::Once,
+            3 => SoundMode::Twice,
+            4 => SoundMode::Thrice,
+            5 => SoundMode::UntilDismiss,
+            _ => SoundMode::Off,
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "none" | "关" => Some(SoundMode::Off),
+            "once" | "single" | "单次" | "一声" => Some(SoundMode::Once),
+            "twice" | "2" | "两次" | "两声" => Some(SoundMode::Twice),
+            "thrice" | "3" | "三次" | "三声" => Some(SoundMode::Thrice),
+            "until" | "loop" | "直到消失" | "循环" => Some(SoundMode::UntilDismiss),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SoundMode::Off => "off",
+            SoundMode::Once => "once",
+            SoundMode::Twice => "twice",
+            SoundMode::Thrice => "thrice",
+            SoundMode::UntilDismiss => "until",
+        }
+    }
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            SoundMode::Off => "关闭",
+            SoundMode::Once => "单次",
+            SoundMode::Twice => "循环 2 次",
+            SoundMode::Thrice => "循环 3 次",
+            SoundMode::UntilDismiss => "直到消息消失",
+        }
+    }
+    #[allow(dead_code)]
+    pub const ALL: [SoundMode; 5] = [
+        SoundMode::Off, SoundMode::Once, SoundMode::Twice,
+        SoundMode::Thrice, SoundMode::UntilDismiss,
+    ];
+}
+
+/// 一个 IMAP 邮箱账号（设置页可保存多个，mail.rs 同时监听）。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MailAccount {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub pass: String,
+}
+
+impl MailAccount {
+    pub fn ident(&self) -> String {
+        format!("{}@{}", self.user, self.host)
+    }
+    /// 编码成 `host|port|user|pass`（字段里不允许出现 `|` 和 `;`）
+    fn encode(&self) -> String {
+        format!("{}|{}|{}|{}", self.host, self.port, self.user, self.pass)
+    }
+    fn parse(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.split('|').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        let port = parts[1].trim().parse::<u16>().ok()?;
+        Some(MailAccount {
+            host: parts[0].trim().to_string(),
+            port,
+            user: parts[2].trim().to_string(),
+            pass: parts[3].trim().to_string(),
+        })
     }
 }
 
@@ -607,14 +788,9 @@ pub fn set_weather_source(s: WeatherSource) {
     bump();
 }
 
-/// 高德 key（空 = 用编译期默认）
+/// 高德 key：只从 `settings.txt` 读（源码里不留真 key，避免进 git 历史）
 pub fn amap_key() -> String {
-    let v = AMAP_KEY.lock().map(|s| s.clone()).unwrap_or_default();
-    if v.is_empty() {
-        cfg::AMAP_KEY.to_string()
-    } else {
-        v
-    }
+    AMAP_KEY.lock().map(|s| s.clone()).unwrap_or_default()
 }
 
 pub fn set_amap_key(k: &str) {
@@ -651,6 +827,7 @@ pub fn mail_overrides() -> (Option<String>, Option<u16>, Option<String>, Option<
     (host, port, user, pass)
 }
 
+#[allow(dead_code)]
 pub fn set_mail_account(host: &str, port: u16, user: &str, pass: &str) {
     let cur = mail_overrides();
     let changed = (
@@ -921,6 +1098,7 @@ pub fn banner_secs() -> u32 {
 /// 设置横幅停留秒数（设置页输入框；0 = 不自动关闭，上限 3600）。
 /// 这一项**立即落盘**，不走「点应用才写盘」的草稿机制：文本框失焦/窗口失活
 /// 的时序会让草稿先丢弃，实测「改了又变回默认」。
+#[allow(dead_code)]
 pub fn set_banner_secs(secs: u32) {
     let secs = secs.min(3600);
     if secs == banner_secs() {
@@ -1113,9 +1291,10 @@ pub fn set_dock_pins(list: Vec<String>) {
 
 /// 开始菜单快捷方式默认项（用户没改过时的唯一一条）
 fn default_start_pins() -> Vec<(String, String)> {
+    // 默认带一个「管理员权限 CMD」：target 前缀 `@admin:` 表示用 ShellExecute(runas) 提权
     vec![(
-        "命令提示符".to_string(),
-        "C:\\Windows\\System32\\cmd.exe".to_string(),
+        "命令提示符(管理员)".to_string(),
+        "@admin:C:\\Windows\\System32\\cmd.exe".to_string(),
     )]
 }
 
@@ -1193,6 +1372,279 @@ pub fn set_guardian(on: bool) {
     GUARDIAN.store(bool_code(on), Ordering::Relaxed);
     save();
     bump();
+}
+
+/// 伪造托盘点击/悬停（traymsg 回调消息投递）。默认开；关掉做透明转发 A/B。
+pub fn tray_fake_input() -> bool {
+    match TRAY_FAKE_INPUT.load(Ordering::Relaxed) {
+        UNLOADED => cfg::TRAY_FAKE_INPUT,
+        c => c == 2,
+    }
+}
+
+#[allow(dead_code)]
+pub fn set_tray_fake_input(on: bool) {
+    if tray_fake_input() == on {
+        return;
+    }
+    TRAY_FAKE_INPUT.store(bool_code(on), Ordering::Relaxed);
+    save();
+    bump();
+}
+
+// ---------- 通知通道（每个消息源独立）----------
+
+/// 微信消息走哪条通知通道（默认 Orbit 横幅）
+pub fn notify_wechat() -> NotifyChannel {
+    NotifyChannel::from_code(match NOTIFY_WECHAT.load(Ordering::Relaxed) {
+        UNLOADED => NotifyChannel::Orbit.code(),
+        c => c,
+    })
+}
+pub fn set_notify_wechat(c: NotifyChannel) {
+    if notify_wechat() == c { return; }
+    NOTIFY_WECHAT.store(c.code(), Ordering::Relaxed);
+    save(); bump();
+}
+
+/// 托盘图标消息走哪条通知通道（默认 Orbit 横幅）
+pub fn notify_tray() -> NotifyChannel {
+    NotifyChannel::from_code(match NOTIFY_TRAY.load(Ordering::Relaxed) {
+        UNLOADED => NotifyChannel::Orbit.code(),
+        c => c,
+    })
+}
+pub fn set_notify_tray(c: NotifyChannel) {
+    if notify_tray() == c { return; }
+    NOTIFY_TRAY.store(c.code(), Ordering::Relaxed);
+    save(); bump();
+}
+
+/// 邮件新消息走哪条通知通道（默认 Orbit 横幅）
+pub fn notify_mail() -> NotifyChannel {
+    NotifyChannel::from_code(match NOTIFY_MAIL.load(Ordering::Relaxed) {
+        UNLOADED => NotifyChannel::Orbit.code(),
+        c => c,
+    })
+}
+pub fn set_notify_mail(c: NotifyChannel) {
+    if notify_mail() == c { return; }
+    NOTIFY_MAIL.store(c.code(), Ordering::Relaxed);
+    save(); bump();
+}
+
+/// 剪切板新条目走哪条通知通道（默认 Orbit 横幅）
+pub fn notify_clipboard() -> NotifyChannel {
+    NotifyChannel::from_code(match NOTIFY_CLIPBOARD.load(Ordering::Relaxed) {
+        UNLOADED => NotifyChannel::Orbit.code(),
+        c => c,
+    })
+}
+pub fn set_notify_clipboard(c: NotifyChannel) {
+    if notify_clipboard() == c { return; }
+    NOTIFY_CLIPBOARD.store(c.code(), Ordering::Relaxed);
+    save(); bump();
+}
+
+// ---------- 各来源横幅时长（0 = 常驻）----------
+
+fn banner_secs_from(a: &AtomicU32, default_secs: u32) -> u32 {
+    match a.load(Ordering::Relaxed) {
+        UNLOADED => default_secs,
+        v => v.saturating_sub(1).min(3600),
+    }
+}
+fn set_banner_secs_at(a: &AtomicU32, secs: u32) {
+    a.store(secs.min(3600) + 1, Ordering::Relaxed);
+    save(); bump();
+}
+
+pub fn banner_secs_wechat() -> u32 { banner_secs_from(&BANNER_WECHAT_SECS, 6) }
+pub fn set_banner_secs_wechat(s: u32) {
+    if banner_secs_wechat() == s { return; }
+    set_banner_secs_at(&BANNER_WECHAT_SECS, s);
+}
+pub fn banner_secs_mail() -> u32 { banner_secs_from(&BANNER_MAIL_SECS, 6) }
+pub fn set_banner_secs_mail(s: u32) {
+    if banner_secs_mail() == s { return; }
+    set_banner_secs_at(&BANNER_MAIL_SECS, s);
+}
+pub fn banner_secs_tray() -> u32 { banner_secs_from(&BANNER_TRAY_SECS, 6) }
+pub fn set_banner_secs_tray(s: u32) {
+    if banner_secs_tray() == s { return; }
+    set_banner_secs_at(&BANNER_TRAY_SECS, s);
+}
+pub fn banner_secs_clipboard() -> u32 { banner_secs_from(&BANNER_CLIPBOARD_SECS, 6) }
+pub fn set_banner_secs_clipboard(s: u32) {
+    if banner_secs_clipboard() == s { return; }
+    set_banner_secs_at(&BANNER_CLIPBOARD_SECS, s);
+}
+
+/// 按通知来源取横幅时长（供 banner.rs 调用）
+pub fn banner_secs_for(src: &str) -> u32 {
+    match src.to_lowercase().as_str() {
+        "wechat" | "微信" => banner_secs_wechat(),
+        "mail" | "邮件" => banner_secs_mail(),
+        "tray" | "托盘" => banner_secs_tray(),
+        "clipboard" | "剪切板" | "剪贴板" => banner_secs_clipboard(),
+        _ => banner_secs(),
+    }
+}
+
+/// 按通知来源取通道（供 banner.rs 分发）
+pub fn notify_channel_for(src: &str) -> NotifyChannel {
+    match src.to_lowercase().as_str() {
+        "wechat" | "微信" => notify_wechat(),
+        "mail" | "邮件" => notify_mail(),
+        "tray" | "托盘" => notify_tray(),
+        "clipboard" | "剪切板" | "剪贴板" => notify_clipboard(),
+        _ => NotifyChannel::Orbit,
+    }
+}
+
+// ---------- 提示音模式 ----------
+
+pub fn sound_mode() -> SoundMode {
+    SoundMode::from_code(match SOUND_MODE.load(Ordering::Relaxed) {
+        UNLOADED => SoundMode::Once.code(),
+        c => c,
+    })
+}
+pub fn set_sound_mode(m: SoundMode) {
+    if sound_mode() == m { return; }
+    SOUND_MODE.store(m.code(), Ordering::Relaxed);
+    save(); bump();
+}
+
+// ---------- 邮件多账号 ----------
+
+pub fn mail_accounts() -> Vec<MailAccount> {
+    MAIL_ACCOUNTS.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+/// 有效账号列表：多账号非空就用它，否则回落到单账号 imap_*（兼容旧配置）
+pub fn effective_mail_accounts() -> Vec<MailAccount> {
+    let multi = mail_accounts();
+    if !multi.is_empty() {
+        return multi;
+    }
+    let (h, p, u, w) = mail_overrides();
+    if let (Some(host), Some(user), Some(pass)) = (h, u, w) {
+        return vec![MailAccount {
+            host,
+            port: p.unwrap_or(cfg::MAIL_PORT),
+            user,
+            pass,
+        }];
+    }
+    Vec::new()
+}
+
+pub fn set_mail_accounts(list: Vec<MailAccount>) {
+    let mut clean: Vec<MailAccount> = Vec::new();
+    for a in list {
+        if a.host.trim().is_empty() || a.user.trim().is_empty() {
+            continue;
+        }
+        if !clean.iter().any(|x| x.ident() == a.ident()) {
+            clean.push(a);
+        }
+    }
+    let changed = MAIL_ACCOUNTS
+        .lock()
+        .map(|mut v| {
+            let diff = *v != clean;
+            if diff { *v = clean; }
+            diff
+        })
+        .unwrap_or(false);
+    if changed { save(); bump(); }
+}
+
+pub fn mail_verified() -> Vec<String> {
+    MAIL_VERIFIED.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+pub fn is_mail_verified(ident: &str) -> bool {
+    MAIL_VERIFIED
+        .lock()
+        .map(|v| v.iter().any(|s| s.eq_ignore_ascii_case(ident)))
+        .unwrap_or(false)
+}
+
+/// 标记账号连通状态；连通成功加入、失败移除
+pub fn set_mail_verified(ident: &str, ok: bool) {
+    let changed = MAIL_VERIFIED
+        .lock()
+        .map(|mut v| {
+            let exists = v.iter().position(|s| s.eq_ignore_ascii_case(ident));
+            match (ok, exists) {
+                (true, None) => { v.push(ident.to_string()); true }
+                (false, Some(i)) => { v.remove(i); true }
+                _ => false,
+            }
+        })
+        .unwrap_or(false);
+    if changed { save(); bump(); }
+}
+
+// ---------- 剪切板常驻文字 ----------
+
+pub fn clipboard_pinned_text() -> String {
+    CLIPBOARD_PINNED_TEXT.lock().map(|s| s.clone()).unwrap_or_default()
+}
+pub fn set_clipboard_pinned_text(s: String) {
+    let changed = CLIPBOARD_PINNED_TEXT
+        .lock()
+        .map(|mut v| {
+            let diff = *v != s;
+            if diff { *v = s; }
+            diff
+        })
+        .unwrap_or(false);
+    if changed { save(); bump(); }
+}
+
+// ---------- Dock 透明度 ----------
+
+pub fn dock_alpha() -> f32 {
+    match DOCK_ALPHA.load(Ordering::Relaxed) {
+        UNLOADED => 1.0,
+        v => f32::from_bits(v).clamp(ALPHA_MIN, ALPHA_MAX),
+    }
+}
+pub fn set_dock_alpha(v: f32) {
+    let v = v.clamp(ALPHA_MIN, ALPHA_MAX);
+    if (dock_alpha() - v).abs() < 1e-4 { return; }
+    DOCK_ALPHA.store(v.to_bits(), Ordering::Relaxed);
+    save(); bump();
+}
+
+// ---------- 开始菜单：Win 键接管 / 每行列数 ----------
+
+pub fn start_hook() -> bool {
+    match START_HOOK.load(Ordering::Relaxed) {
+        UNLOADED => true,
+        c => c == 2,
+    }
+}
+pub fn set_start_hook(on: bool) {
+    if start_hook() == on { return; }
+    START_HOOK.store(bool_code(on), Ordering::Relaxed);
+    save(); bump();
+}
+
+pub fn start_cols() -> usize {
+    match START_COLS.load(Ordering::Relaxed) {
+        UNLOADED => 4,
+        c => (c as usize).clamp(1, 8),
+    }
+}
+pub fn set_start_cols(n: usize) {
+    let n = n.clamp(1, 8);
+    if start_cols() == n { return; }
+    START_COLS.store(n as u32, Ordering::Relaxed);
+    save(); bump();
 }
 
 fn bump() {
@@ -1312,6 +1764,26 @@ fn save() {
     }
     vals.push(("autostart", on_off(autostart()).to_string()));
     vals.push(("guardian", on_off(guardian()).to_string()));
+    vals.push(("tray_fake_input", on_off(tray_fake_input()).to_string()));
+    // 通知通道（每个来源独立）
+    vals.push(("notify_wechat", notify_wechat().as_str().to_string()));
+    vals.push(("notify_tray", notify_tray().as_str().to_string()));
+    vals.push(("notify_mail", notify_mail().as_str().to_string()));
+    vals.push(("notify_clipboard", notify_clipboard().as_str().to_string()));
+    // 各来源横幅时长（0 = 常驻）
+    vals.push(("banner_wechat_secs", banner_secs_wechat().to_string()));
+    vals.push(("banner_mail_secs", banner_secs_mail().to_string()));
+    vals.push(("banner_tray_secs", banner_secs_tray().to_string()));
+    vals.push(("banner_clipboard_secs", banner_secs_clipboard().to_string()));
+    vals.push(("sound_mode", sound_mode().as_str().to_string()));
+    // 邮件多账号（`;` 分隔账号，每个 `host|port|user|pass`）
+    let accounts: Vec<String> = mail_accounts().iter().map(|a| a.encode()).collect();
+    vals.push(("mail_accounts", accounts.join(";")));
+    vals.push(("mail_verified", mail_verified().join(";")));
+    vals.push(("clipboard_pinned", clipboard_pinned_text()));
+    vals.push(("dock_alpha", trim_num(dock_alpha())));
+    vals.push(("start_hook", on_off(start_hook()).to_string()));
+    vals.push(("start_cols", start_cols().to_string()));
     let overs: Vec<String> = icon_overrides()
         .into_iter()
         .map(|(k, p)| format!("{k}|{p}"))
@@ -1429,6 +1901,21 @@ struct Snap {
     start_pins: Option<Vec<(String, String)>>,
     autostart: bool,
     guardian: bool,
+    notify_wechat: NotifyChannel,
+    notify_tray: NotifyChannel,
+    notify_mail: NotifyChannel,
+    notify_clipboard: NotifyChannel,
+    banner_wechat_secs: u32,
+    banner_mail_secs: u32,
+    banner_tray_secs: u32,
+    banner_clipboard_secs: u32,
+    sound_mode: SoundMode,
+    mail_accounts: Vec<MailAccount>,
+    mail_verified: Vec<String>,
+    clipboard_pinned: String,
+    dock_alpha: f32,
+    start_hook: bool,
+    start_cols: usize,
 }
 
 fn snapshot() -> Snap {
@@ -1459,6 +1946,21 @@ fn snapshot() -> Snap {
         start_pins: start_pins_custom(),
         autostart: autostart(),
         guardian: guardian(),
+        notify_wechat: notify_wechat(),
+        notify_tray: notify_tray(),
+        notify_mail: notify_mail(),
+        notify_clipboard: notify_clipboard(),
+        banner_wechat_secs: banner_secs_wechat(),
+        banner_mail_secs: banner_secs_mail(),
+        banner_tray_secs: banner_secs_tray(),
+        banner_clipboard_secs: banner_secs_clipboard(),
+        sound_mode: sound_mode(),
+        mail_accounts: mail_accounts(),
+        mail_verified: mail_verified(),
+        clipboard_pinned: clipboard_pinned_text(),
+        dock_alpha: dock_alpha(),
+        start_hook: start_hook(),
+        start_cols: start_cols(),
     }
 }
 
@@ -1581,7 +2083,7 @@ weather_text_scale=1.25
 # 音乐条位置：right（胶囊右侧，默认）/ left（左侧）/ bottom（下方）
 lyric_position=right
 # 歌词字号
-lyric_size=14
+lyric_size=20
 # 底部 Dock：show_tray / show_desktop_btn 仍可手改（1 = 显示，0 = 隐藏）；
 # 设置页里「返回桌面」在托盘图标列表的第一格开关，show_tray 不再提供开关（逐个隐藏用 hide_tray）
 show_tray=1
@@ -1598,12 +2100,45 @@ wechat_ignore=折叠的聊天
 font=misans
 # Dock 上要单独隐藏的托盘图标（分号分隔，键由设置页生成；清空 = 全部显示）
 hide_tray=
-# 开始菜单（Win 键弹出）快捷方式：`名称|程序路径`，分号分隔；删掉本行恢复默认「命令提示符」
-start_pins=命令提示符|C:\\Windows\\System32\\cmd.exe
+# 开始菜单（Win 键弹出）快捷方式：`名称|程序路径`，分号分隔；删掉本行恢复默认「命令提示符(管理员)」
+# 路径前缀 @admin: 表示以管理员权限启动（ShellExecute runas）
+start_pins=命令提示符(管理员)|@admin:C:\\Windows\\System32\\cmd.exe
 # 开机启动：写注册表 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run（1 = 开，默认）
 autostart=1
 # 退出守护：orbit 被强杀（任务栏没恢复）时由守护进程重启 explorer 恢复任务栏（1 = 开，默认）
 guardian=1
+# 伪造托盘点击/悬停（向目标窗口投它注册时的回调消息）。默认开；
+# 关掉后完全交给已转发给 Explorer 的托盘处理，用于透明转发 A/B 测试
+tray_fake_input=1
+# ===== 通知（每个消息源独立选择通道）=====
+# 通道：off=不通知 / orbit=Orbit 横幅 / windows=Windows 系统通知
+notify_wechat=orbit
+notify_tray=orbit
+notify_mail=orbit
+notify_clipboard=orbit
+# 各来源横幅停留秒数（0 = 不消失，常驻）
+banner_wechat_secs=6
+banner_mail_secs=6
+banner_tray_secs=6
+banner_clipboard_secs=6
+# 提示音模式：off=关 / once=单次 / twice=循环2次 / thrice=循环3次 / until=直到消息消失
+# （旧的 wechat_sound 仅作兼容，提示音实际由 sound_mode 决定）
+sound_mode=once
+# ===== 邮件多账号（同时监听）=====
+# 每个账号 host|port|user|pass，账号间用 ; 分隔；非空时优先于上面的 imap_* 单账号
+mail_accounts=
+# 已测试连通的账号（user@host，分号分隔），设置页标记用，避免每次重测
+mail_verified=
+# ===== 剪切板 =====
+# 剪切板面板常驻置顶文字（固定显示一条）
+clipboard_pinned=
+# Dock 透明度（0.2 ~ 1.0，独立于胶囊）
+dock_alpha=1.0
+# ===== 开始菜单 =====
+# Win 键接管开始菜单（1 = 接管，默认；0 = 交还系统）
+start_hook=1
+# 每行显示的快捷方式个数（1 ~ 8，默认 4）
+start_cols=4
 ";
 
 /// 文件不存在就写一份默认值；返回 true 表示是新建的
@@ -1646,7 +2181,7 @@ fn append_missing() {
         ("weather_source", "# 天气数据源：amap / open_meteo\nweather_source=amap\namap_key=\n"),
         ("imap_host", "# 邮箱 IMAP 账号（留空回落 data/mail.txt）\nimap_host=\nimap_port=\nimap_user=\nimap_pass=\n"),
         ("lyric_position", "# 音乐条位置：right（胶囊右侧，默认）/ left（左侧）/ bottom（下方）\nlyric_position=right\n"),
-        ("lyric_size", "# 歌词字号\nlyric_size=14\n"),
+        ("lyric_size", "# 歌词字号\nlyric_size=20\n"),
         ("weather_text_scale", "# 天气面板字号倍率：1.0 为基准\nweather_text_scale=1.25\n"),
         (
             "show_tray",
@@ -1659,9 +2194,39 @@ fn append_missing() {
         ("banner_secs", "# 右下角横幅每条停留秒数（0 = 不自动关闭，默认 6）\nbanner_secs=6\n"),
         ("lyric_lead", "# 歌词提前量（秒，默认 1；0 = 不提前；负值 = 延后；设置页按 0.1 秒调）\nlyric_lead=1\n"),
         ("font", "# 界面字体：misans = MiSans（随包分发，默认）；system = 系统字体\nfont=misans\n"),
-        ("start_pins", "# 开始菜单（Win 键弹出）快捷方式：`名称|程序路径`，分号分隔；删掉本行恢复默认\nstart_pins=命令提示符|C:\\Windows\\System32\\cmd.exe\n"),
+        ("start_pins", "# 开始菜单（Win 键弹出）快捷方式：`名称|程序路径`，@admin: 前缀提权；删掉本行恢复默认\nstart_pins=命令提示符(管理员)|@admin:C:\\Windows\\System32\\cmd.exe\n"),
         ("autostart", "# 开机启动（1 = 开，默认；写注册表 HKCU Run 键）\nautostart=1\n"),
         ("guardian", "# 退出守护：orbit 被强杀后由守护进程重启 explorer 恢复任务栏（1 = 开，默认）\nguardian=1\n"),
+        (
+            "tray_fake_input",
+            "# 伪造托盘点击/悬停（回调消息投递，1 = 开，默认）；关掉做透明转发 A/B\ntray_fake_input=1\n",
+        ),
+        (
+            "notify_wechat",
+            "# 通知通道（每个来源独立）：off / orbit（横幅）/ windows（系统通知）\n\
+             notify_wechat=orbit\nnotify_tray=orbit\nnotify_mail=orbit\nnotify_clipboard=orbit\n",
+        ),
+        (
+            "banner_wechat_secs",
+            "# 各来源横幅停留秒数（0 = 不消失）\n\
+             banner_wechat_secs=6\nbanner_mail_secs=6\nbanner_tray_secs=6\nbanner_clipboard_secs=6\n",
+        ),
+        (
+            "sound_mode",
+            "# 提示音模式：off / once / twice / thrice / until（直到消息消失）\nsound_mode=once\n",
+        ),
+        (
+            "mail_accounts",
+            "# 邮件多账号（host|port|user|pass，; 分隔；非空优先于 imap_*）\n\
+             mail_accounts=\nmail_verified=\n",
+        ),
+        ("clipboard_pinned", "# 剪切板面板常驻置顶文字\nclipboard_pinned=\n"),
+        ("dock_alpha", "# Dock 透明度（0.2 ~ 1.0，独立于胶囊）\ndock_alpha=1.0\n"),
+        (
+            "start_hook",
+            "# 开始菜单：Win 键接管（1 = 接管，默认）/ 每行个数（1 ~ 8）\n\
+             start_hook=1\nstart_cols=4\n",
+        ),
     ] {
         if !raw.contains(key) {
             add.push_str(line);
@@ -1703,6 +2268,7 @@ fn load() {
     let mut spins: Option<Vec<(String, String)>> = None;
     let mut auto = true;
     let mut guard_on = true;
+    let mut fake_input = cfg::TRAY_FAKE_INPUT;
     let mut alpha = 1.0f32;
     let mut pscale = 1.0f32;
     let mut iscale = 1.0f32;
@@ -1717,6 +2283,22 @@ fn load() {
     let mut iuser: Option<String> = None;
     let mut ipass: Option<String> = None;
     let mut order: Option<Vec<String>> = None;
+    // 新键：通知 / 横幅 / 提示音 / 多账号 / Dock / 开始菜单 / 剪切板
+    let mut nw = NotifyChannel::Orbit.code();
+    let mut nt = NotifyChannel::Orbit.code();
+    let mut nm = NotifyChannel::Orbit.code();
+    let mut nc = NotifyChannel::Orbit.code();
+    let mut bw = 6u32;
+    let mut bm = 6u32;
+    let mut bt = 6u32;
+    let mut bc = 6u32;
+    let mut sm = SoundMode::Once.code();
+    let mut mail_accs: Vec<MailAccount> = Vec::new();
+    let mut mail_ver: Vec<String> = Vec::new();
+    let mut clip_pin = String::new();
+    let mut dalpha = 1.0f32;
+    let mut shook = true;
+    let mut scols = 4usize;
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1816,6 +2398,11 @@ fn load() {
                     guard_on = b;
                 }
             }
+            "tray_fake_input" => {
+                if let Some(b) = parse_bool(v) {
+                    fake_input = b;
+                }
+            }
             "weather_text_scale" => {
                 if let Some(n) = parse_num(v) {
                     scale = n.clamp(SCALE_MIN, SCALE_MAX);
@@ -1869,6 +2456,53 @@ fn load() {
             }
             "font" => {
                 misans = !v.trim().eq_ignore_ascii_case("system");
+            }
+            "notify_wechat" => {
+                if let Some(c) = NotifyChannel::parse(v) { nw = c.code(); }
+            }
+            "notify_tray" => {
+                if let Some(c) = NotifyChannel::parse(v) { nt = c.code(); }
+            }
+            "notify_mail" => {
+                if let Some(c) = NotifyChannel::parse(v) { nm = c.code(); }
+            }
+            "notify_clipboard" => {
+                if let Some(c) = NotifyChannel::parse(v) { nc = c.code(); }
+            }
+            "banner_wechat_secs" => {
+                bw = v.trim().parse::<u32>().unwrap_or(6).min(3600);
+            }
+            "banner_mail_secs" => {
+                bm = v.trim().parse::<u32>().unwrap_or(6).min(3600);
+            }
+            "banner_tray_secs" => {
+                bt = v.trim().parse::<u32>().unwrap_or(6).min(3600);
+            }
+            "banner_clipboard_secs" => {
+                bc = v.trim().parse::<u32>().unwrap_or(6).min(3600);
+            }
+            "sound_mode" => {
+                if let Some(m) = SoundMode::parse(v) { sm = m.code(); }
+            }
+            "mail_accounts" => {
+                mail_accs = v.split(';').filter_map(MailAccount::parse).collect();
+            }
+            "mail_verified" => {
+                mail_ver = v
+                    .split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "clipboard_pinned" => clip_pin = v.to_string(),
+            "dock_alpha" => {
+                if let Some(n) = parse_num(v) { dalpha = n.clamp(ALPHA_MIN, ALPHA_MAX); }
+            }
+            "start_hook" => {
+                if let Some(b) = parse_bool(v) { shook = b; }
+            }
+            "start_cols" => {
+                if let Ok(n) = v.trim().parse::<usize>() { scols = n.clamp(1, 8); }
             }
             _ => {}
         }
@@ -1995,6 +2629,23 @@ fn load() {
     }
     AUTOSTART.store(bool_code(auto), Ordering::Relaxed);
     GUARDIAN.store(bool_code(guard_on), Ordering::Relaxed);
+    TRAY_FAKE_INPUT.store(bool_code(fake_input), Ordering::Relaxed);
+    // 新键
+    NOTIFY_WECHAT.store(nw, Ordering::Relaxed);
+    NOTIFY_TRAY.store(nt, Ordering::Relaxed);
+    NOTIFY_MAIL.store(nm, Ordering::Relaxed);
+    NOTIFY_CLIPBOARD.store(nc, Ordering::Relaxed);
+    BANNER_WECHAT_SECS.store(bw + 1, Ordering::Relaxed);
+    BANNER_MAIL_SECS.store(bm + 1, Ordering::Relaxed);
+    BANNER_TRAY_SECS.store(bt + 1, Ordering::Relaxed);
+    BANNER_CLIPBOARD_SECS.store(bc + 1, Ordering::Relaxed);
+    SOUND_MODE.store(sm, Ordering::Relaxed);
+    if let Ok(mut v) = MAIL_ACCOUNTS.lock() { *v = mail_accs; }
+    if let Ok(mut v) = MAIL_VERIFIED.lock() { *v = mail_ver; }
+    if let Ok(mut v) = CLIPBOARD_PINNED_TEXT.lock() { *v = clip_pin; }
+    DOCK_ALPHA.store(dalpha.to_bits(), Ordering::Relaxed);
+    START_HOOK.store(bool_code(shook), Ordering::Relaxed);
+    START_COLS.store(scols as u32, Ordering::Relaxed);
 }
 
 /// 布尔：1/0、true/false、on/off、开/关

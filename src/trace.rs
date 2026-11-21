@@ -9,12 +9,16 @@ use std::sync::{Mutex, OnceLock};
 static LOG: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 
 /// 打开（并清空）日志文件；在 main 最前面调用一次。
+/// 设置页子进程（`--settings-ui`）写独立的 `orbit-settings.log`，
+/// 否则会把主进程正在写的 orbit.log 清空。
 pub fn init() {
-    let path = std::env::current_exe()
+    let dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("orbit.log")))
-        .unwrap_or_else(|| std::path::PathBuf::from("orbit.log"));
-    let file = std::fs::File::create(path).ok();
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_default();
+    let is_child = std::env::args().any(|a| a == "--settings-ui");
+    let name = if is_child { "orbit-settings.log" } else { "orbit.log" };
+    let file = std::fs::File::create(dir.join(name)).ok();
     let _ = LOG.set(Mutex::new(file));
 }
 

@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,8 +36,11 @@ static LAST_PLAY: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// 正在排队的播放请求数（用来限制队列长度）
 static PENDING: AtomicU64 = AtomicU64::new(0);
-/// 播放队列：只有一个消费线程，保证每一声都完整播完
-static PLAY_TX: OnceLock<Sender<()>> = OnceLock::new();
+/// 播放队列：只有一个消费线程，保证每一声都完整播完。
+/// 载荷是这一声要重复的倍数（1 = 单次；>1 = 循环 N 次；u32::MAX = 直到 stop）。
+static PLAY_TX: OnceLock<Sender<u32>> = OnceLock::new();
+/// "直到消息消失"模式的停止标记：横幅消失时由调用方置位，worker 循环播放到它为真
+static UNTIL_STOP: AtomicBool = AtomicBool::new(false);
 
 /// 这个托盘图标是微信系的吗（按 tooltip 名 + exe 文件名判断，兜底与 Dock 去重同风格）
 pub fn is_wechat(name: &str, exe: &str) -> bool {
@@ -78,16 +81,47 @@ pub fn play_wechat(key: &str) {
 }
 
 /// 右下角横幅弹出时播放的提示音：**每弹一条就排一声**，不再做时间合并。
-/// 多条横幅同时到达时由播放线程逐条播完（后一声不会截断前一声）。
-/// 微信卡片是否响由 `wechat_sound` 设置决定，调用侧在 `silent` 里已判过。
+/// 是否响、响几遍由 `sound_mode` 设置决定（关 / 单次 / 2 次 / 3 次 / 直到消失）。
 pub fn play_banner() {
     enqueue("横幅");
 }
 
-/// 入队一声，真正播放交给单线程 worker（懒启动）
+/// 当前提示音是否开启。兼容旧键：settings.txt 没有 sound_mode 时按 wechat_sound。
+fn sound_on() -> bool {
+    !matches!(crate::settings::sound_mode(), crate::settings::SoundMode::Off)
+}
+
+/// 把 SoundMode 换成 worker 的重复次数（u32::MAX = 循环到 stop）
+fn repeat_count() -> u32 {
+    use crate::settings::SoundMode::*;
+    match crate::settings::sound_mode() {
+        Off => 0,
+        Once => 1,
+        Twice => 2,
+        Thrice => 3,
+        UntilDismiss => u32::MAX,
+    }
+}
+
+/// 横幅消失时调用：终止"直到消息消失"的循环播放
+pub fn stop_until_dismiss() {
+    UNTIL_STOP.store(true, Ordering::Relaxed);
+}
+
+/// 入队一声（按 sound_mode 决定是否真的播、播几遍），真正播放交给单线程 worker
 fn enqueue(tag: &str) {
+    if !sound_on() {
+        return;
+    }
+    let repeat = repeat_count();
+    if repeat == 0 {
+        return;
+    }
+    if repeat == u32::MAX {
+        UNTIL_STOP.store(false, Ordering::Relaxed);
+    }
     let tx = PLAY_TX.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<()>();
+        let (tx, rx) = mpsc::channel::<u32>();
         let spawned = std::thread::Builder::new()
             .name("orbit-notify".into())
             .spawn(move || worker(rx));
@@ -101,16 +135,17 @@ fn enqueue(tag: &str) {
         crate::tlog!("[notify] 提示音队列已满，丢弃一声（{tag}）");
         return;
     }
-    if tx.send(()).is_err() {
+    if tx.send(repeat).is_err() {
         PENDING.fetch_sub(1, Ordering::Relaxed);
         crate::tlog!("[notify] 播放线程不可用，丢弃一声（{tag}）");
         return;
     }
-    crate::tlog!("[notify] 提示音入队（{tag}）");
+    crate::tlog!("[notify] 提示音入队（{tag}，重复 {repeat}）");
 }
 
 /// 播放线程：打开一次 alias，之后每条请求 seek 回头再播，**等这一声播完**才处理下一条。
-fn worker(rx: Receiver<()>) {
+/// 载荷 repeat：有限值播放 N 遍；u32::MAX 循环播放直到 `UNTIL_STOP` 置位。
+fn worker(rx: Receiver<u32>) {
     unsafe {
         let p = sound_path();
         if !p.exists() {
@@ -131,27 +166,40 @@ fn worker(rx: Receiver<()>) {
         let deadline = len.saturating_add(1200).clamp(600, 10_000);
         crate::tlog!("[notify] 播放线程就绪，音频长度 {len}ms");
 
-        while rx.recv().is_ok() {
+        while let Ok(repeat) = rx.recv() {
             PENDING.fetch_sub(1, Ordering::Relaxed);
-            let _ = send(&format!("seek {ALIAS} to start"));
-            if send(&format!("play {ALIAS}")) != 0 {
-                crate::tlog!("[notify] MCI play 失败");
-                continue;
-            }
-            // 等这一声真正播完再放下一声：MCI 报 stopped 就立刻继续，
-            // 报 playing 就继续等（超时兜底 stop，避免卡死队列）
-            let t0 = Instant::now();
+            let until_stop = repeat == u32::MAX;
+            let mut played = 0u32;
             loop {
-                std::thread::sleep(Duration::from_millis(40));
-                if !query(&format!("status {ALIAS} mode"))
-                    .trim()
-                    .eq_ignore_ascii_case("playing")
-                {
+                let _ = send(&format!("seek {ALIAS} to start"));
+                if send(&format!("play {ALIAS}")) != 0 {
+                    crate::tlog!("[notify] MCI play 失败");
                     break;
                 }
-                if t0.elapsed().as_millis() as u64 > deadline {
-                    crate::tlog!("[notify] 播放超时，强制 stop");
-                    let _ = send(&format!("stop {ALIAS}"));
+                // 等这一声真正播完：MCI 报 stopped 就继续下一遍，
+                // 报 playing 就继续等（超时兜底 stop，避免卡死队列）
+                let t0 = Instant::now();
+                loop {
+                    std::thread::sleep(Duration::from_millis(40));
+                    if !query(&format!("status {ALIAS} mode"))
+                        .trim()
+                        .eq_ignore_ascii_case("playing")
+                    {
+                        break;
+                    }
+                    if t0.elapsed().as_millis() as u64 > deadline {
+                        let _ = send(&format!("stop {ALIAS}"));
+                        break;
+                    }
+                }
+                played += 1;
+                if until_stop {
+                    if UNTIL_STOP.load(Ordering::Relaxed) {
+                        let _ = send(&format!("stop {ALIAS}"));
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(300)); // 两声之间留点间隔
+                } else if played >= repeat {
                     break;
                 }
             }

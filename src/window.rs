@@ -163,6 +163,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     }
                     // settings.txt 被改过（手改）就热更新；设置页面改值走版本号
                     let file_changed = settings::reload_if_changed();
+                    // 设置页子进程开着时，顺手把托盘图标 / 微信实例状态刷新给它
+                    if crate::settingsui::is_open() {
+                        crate::settingsui::publish_runtime();
+                    }
                     let v = settings::version();
                     if file_changed || v != app.seen_settings {
                         app.seen_settings = v;
@@ -319,6 +323,11 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     app.reload_panel();
                 }
                 app.render();
+                LRESULT(0)
+            }
+            // 设置页子进程请求「手动拿一次微信 UIA」（跨进程）
+            m if m == crate::appmsg::WM_GRAB_UIA => {
+                crate::banner::request_grab();
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, w, l),
@@ -571,6 +580,9 @@ impl App {
     /// 并启动 flyout 守位线程把应用自己弹的预览卡片摆到**胶囊下方**——
     /// 胶囊贴着屏幕顶，卡片放上方会直接出屏。
     fn flash_hover_enter(&mut self, i: usize) {
+        if !settings::tray_fake_input() {
+            return; // 透明模式：不伪造悬停回调
+        }
         self.flash_hover_sent = Some(i);
         let Some(f) = self.flash.get(i) else { return };
         let Some(raw) = f.target else { return };
@@ -591,6 +603,10 @@ impl App {
 
     /// 闪烁图标悬停离开：补发 leave（Dock 同款）
     fn flash_hover_leave(&mut self) {
+        if !settings::tray_fake_input() {
+            self.flash_hover_sent = None;
+            return;
+        }
         let Some(i) = self.flash_hover_sent.take() else { return };
         if let Some(f) = self.flash.get(i) {
             if let Some(raw) = f.target {
@@ -958,12 +974,19 @@ impl App {
                 }
                 let n = self.clipboard.items.len();
                 let pinned = self.clipboard.items.iter().filter(|c| c.pinned).count();
-                let subtitle = if n == 0 {
-                    "暂无记录".into()
+                let base_sub = if n == 0 {
+                    "暂无记录".to_string()
                 } else if pinned > 0 {
                     format!("{n} 条 · {pinned} 条固定 · 点击复制")
                 } else {
                     format!("{n} 条 · 点击复制 · ☆ 固定")
+                };
+                // 常驻置顶文字（设置页可配）：拼在副标题里，始终可见
+                let pin_text = settings::clipboard_pinned_text();
+                let subtitle = if pin_text.is_empty() {
+                    base_sub
+                } else {
+                    format!("{pin_text}  ·  {base_sub}")
                 };
                 Content::List {
                     title: "剪贴板".into(),
@@ -989,9 +1012,15 @@ impl App {
                         pin: None,
                     });
                 }
+                // 账号名从设置里取（源码不再硬编码账号）；一个都没配就提示去设置
+                let who = settings::effective_mail_accounts()
+                    .first()
+                    .map(|a| a.user.clone())
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_else(|| "未配置邮箱".to_string());
                 let subtitle = match &self.mail.error {
-                    Some(e) => format!("{} · {e}", cfg::MAIL_USER),
-                    None => format!("{} · {} 封未读 · 点标题阅读", cfg::MAIL_USER, self.mail.unread()),
+                    Some(e) => format!("{who} · {e}"),
+                    None => format!("{who} · {} 封未读 · 点标题阅读", self.mail.unread()),
                 };
                 Content::List {
                     title: "邮箱".into(),

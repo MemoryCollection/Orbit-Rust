@@ -32,7 +32,16 @@ unsafe extern "system" fn tip_proc(
 /// 托盘托管句柄（整个进程生命周期内持有，退出时 stop 恢复真托盘）
 static TRAY_HOST: std::sync::Mutex<Option<crate::trayhost::Host>> = std::sync::Mutex::new(None);
 
-pub fn run(hide_taskbar: bool) {
+pub fn run(want_hide_taskbar: bool) {
+    // 对齐 Atrium：检测到第三方托盘宿主（RetroBar / ExplorerPatcher 等）就不争抢，
+    // 不隐藏任务栏、不接管托盘，退回 UIA 只读镜像——避免两个宿主抢 Shell_TrayWnd
+    // 导致图标丢失 / 程序错识别。
+    let third_party = crate::traydetect::third_party_host();
+    let hide_taskbar = want_hide_taskbar && third_party.is_none();
+    if want_hide_taskbar && third_party.is_some() {
+        crate::tlog!("[orbit] 第三方托盘宿主存在，本次以只读模式运行（保留原生任务栏）");
+    }
+
     // 任何 panic 退出前先恢复原生任务栏（默认 hook 被替换掉了）
     std::panic::set_hook(Box::new(|info| {
         if let Some(h) = TRAY_HOST.lock().unwrap().take() { h.stop(); }
@@ -57,7 +66,7 @@ pub fn run(hide_taskbar: bool) {
 
         // 托盘托管：假 Shell_TrayWnd + TaskbarCreated，让应用把图标注册到我们这里。
         // 图标来源不依赖 UIA 后，真任务栏是否透明都不影响镜像与悬停。
-        if cfg::TRAY_TAKEOVER && cfg::SHOW_TRAY {
+        if cfg::TRAY_TAKEOVER && cfg::SHOW_TRAY && third_party.is_none() {
             if let Some(host) = crate::trayhost::start() {
                 *TRAY_HOST.lock().unwrap() = Some(host);
             } else {
@@ -176,6 +185,7 @@ pub fn run(hide_taskbar: bool) {
         }
 
         // 正常退出（含 Ctrl+Alt+O 热键）时把系统任务栏还原
+        crate::settingsui::shutdown();
         if let Some(h) = TRAY_HOST.lock().unwrap().take() { h.stop(); }
         hide::restore_all();
         // 任务栏已恢复，留新鲜标记让守护子进程静默收场

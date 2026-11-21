@@ -108,7 +108,7 @@ impl Mail {
                                     "邮件",
                                     subject,
                                     &m.from,
-                                ));
+                                ).from_source("mail"));
                             }
                         }
                         if fresh.is_some() && fresh != old {
@@ -139,11 +139,33 @@ impl Mail {
         if self.rx.is_none() && Instant::now() >= self.next_at {
             let (tx, rx) = channel();
             std::thread::spawn(move || {
-                let out = match creds() {
-                    Some(c) => fetch(c),
-                    None => Err("未配置邮箱".into()),
-                };
-                let _ = tx.send(out);
+                // 同时监听多个账号：逐个拉取、合并。单账号失败不影响其它账号；
+                // 所有账号都失败才把错误报给界面。uid 加账号前缀避免跨账号撞号。
+                let accounts = crate::settings::effective_mail_accounts();
+                if accounts.is_empty() {
+                    let _ = tx.send(Err("未配置邮箱".into()));
+                    return;
+                }
+                let mut merged: Vec<MailItem> = Vec::new();
+                let mut last_err: Option<String> = None;
+                for a in accounts {
+                    let ident = a.ident();
+                    let account = (a.host, a.port, a.user, a.pass);
+                    match fetch(account) {
+                        Ok(items) => {
+                            for mut m in items {
+                                m.uid = format!("{ident}#{}", m.uid);
+                                merged.push(m);
+                            }
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                if merged.is_empty() {
+                    let _ = tx.send(Err(last_err.unwrap_or_else(|| "未收到邮件".into())));
+                } else {
+                    let _ = tx.send(Ok(merged));
+                }
             });
             self.rx = Some(rx);
         }

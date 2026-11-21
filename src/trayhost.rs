@@ -14,16 +14,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use windows::core::{w, GUID, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, IsWindow, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SendNotifyMessageW, SetWindowLongPtrW, SetWindowPos,
-    TranslateMessage, GWL_STYLE, HWND_BROADCAST, HWND_TOPMOST, SM_CXSCREEN, WNDCLASSW,
-    WM_COPYDATA, WM_DESTROY, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, FindWindowW, GetMessageW,
+    GetPropW, GetShellWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId,
+    IsWindow, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW,
+    SendNotifyMessageW, SetPropW, SetWindowLongPtrW, SetWindowPos, TranslateMessage, GWL_STYLE,
+    HWND_BROADCAST, HWND_TOPMOST, SMTO_ABORTIFHUNG, SM_CXSCREEN, WNDCLASSW, WM_COPYDATA,
+    WM_DESTROY, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
 };
 
 /// 一个被我们接管的托盘图标（从 NOTIFYICONDATA 抄过来的裸字段）。
@@ -125,6 +126,9 @@ static QUITTING: Mutex<bool> = Mutex::new(false);
 const WM_COPYDATA_APPBAR: usize = 0;
 const WM_COPYDATA_TRAY: usize = 1;
 const WM_COPYDATA_ICONRECT: usize = 3;
+/// ITaskbarList::TaskWnd() 向 Shell_TrayWnd 查询"任务切换窗口"的内部消息。
+/// 让它直接拿到真实 Explorer 任务栏句柄，避免 COM 初始化因假宿主失败。
+const TWM_GETTASKSWITCH: u32 = 0x0400 + 236;
 
 /// 启动托盘托管：创建假窗口 + 广播 TaskbarCreated + 起消息循环。
 /// 必须在主线程之外调用（消息循环会占用调用线程直到 stop）。
@@ -183,6 +187,9 @@ unsafe fn run(_state: Arc<Mutex<State>>, tx: std::sync::mpsc::Sender<usize>) {
     if let Ok(n) = hnotify {
         *NOTIFY_HWND.lock().unwrap() = n.0 as usize;
     }
+    // 关键兼容修复：复制真任务栏的 TaskbandHWND 属性，否则 ITaskbarList::HrInit
+    // 在调用方进程内直接返回 E_NOTIMPL，转发托盘消息也救不了。
+    adopt_taskband_prop(htray);
     let _ = tx.send(htray.0 as usize);
 
     // 守护线程（对齐 C# TrayMonitor_Tick）：确保 FindWindow("Shell_TrayWnd","")
@@ -235,6 +242,14 @@ unsafe fn guard_loop() {
         if style & WS_VISIBLE.0 as isize != 0 {
             let _ = SetWindowLongPtrW(h, GWL_STYLE, style & !(WS_VISIBLE.0 as isize));
         }
+        // Explorer 重启后 TaskbandHWND 会换值；这里跟着刷新，避免
+        // ITaskbarList::HrInit 拿到过期句柄。
+        let want = taskband_prop_value().map(|v| v.0 as usize).unwrap_or(0);
+        let current = GetPropW(h, w!("TaskbandHWND")).0 as usize;
+        if want != 0 && current != want {
+            let _ = SetPropW(h, w!("TaskbandHWND"), HANDLE(want as *mut c_void));
+            crate::vlog!("[trayhost] TaskbandHWND 刷新 → {want:#x}");
+        }
     }
 }
 
@@ -266,9 +281,32 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
     if msg == WM_DESTROY {
         return LRESULT(0);
     }
-    // 应用发的私有消息原样转给真任务栏（ManagedShell ForwardMsg 同样处理）
+    // 应用发的私有消息原样转给真任务栏（对齐 Atrium / ManagedShell ForwardMsg）。
+    // 关键：把 Explorer 的应答**回传**给调用方，而不是丢弃后回 DefWindowProc 的 0。
+    // ITaskbarList::HrInit 等握手会检查这个返回值，拿到 0 就报 E_NOTIMPL(0x80004001)。
+    if msg == TWM_GETTASKSWITCH {
+        // ITaskbarList::HrInit → TaskWnd() 会发这条消息。Windows 11 上转发给
+        // Explorer 会拿到 0，导致 HiBit 报 E_NOTIMPL 后空指针崩溃；直接回真任务栏句柄。
+        if let Some(n) = real_explorer_tray() {
+            crate::vlog!("[trayhost] TWM_GETTASKSWITCH → 真任务栏 {:#x}", n.0 as usize);
+            return LRESULT(n.0 as usize as isize);
+        }
+    }
     if msg >= 0x0400 {
-        forward_to_explorer(h, msg, w, l);
+        // ITaskbarList::HrInit 这类 COM 握手会向 Shell_TrayWnd 发 WM_USER 私有消息；
+        // 调试时把 WM_USER 区间打出来，便于确认我们有没有收到、有没有转发成功。
+        if (0x0400..0x0500).contains(&msg) {
+            crate::vlog!("[trayhost] wndproc WM_USER msg={msg:#x} w={:#x} l={:#x}", w.0, l.0);
+        }
+        if let Some(reply) = forward_to_explorer(h, msg, w, l) {
+            if (0x0400..0x0500).contains(&msg) {
+                crate::vlog!("[trayhost] WM_USER {msg:#x} → Explorer reply={reply:?}");
+            }
+            return reply;
+        }
+        if (0x0400..0x0500).contains(&msg) {
+            crate::vlog!("[trayhost] WM_USER {msg:#x} 未转发/无应答");
+        }
     }
     DefWindowProcW(h, msg, w, l)
 }
@@ -280,39 +318,88 @@ unsafe extern "system" fn notify_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM
     DefWindowProcW(h, msg, w, l)
 }
 
-/// 把不认识的消息转给真任务栏（`Shell_TrayWnd`，排除我们自己）。
+/// 找真正的 Explorer 任务栏窗口。
+///
+/// 对齐 Atrium「查找真实 Explorer 任务栏时跳过自己创建的进程窗口」：
+/// 不再只按 hwnd 排除假宿主，而是按 **PID** 排除本进程创建的任何同名窗口，
+/// 防止第三方宿主检测/多开时误把 Orbit 自己的窗口当成 Explorer。
+pub fn real_explorer_tray() -> Option<HWND> {
+    let me = std::process::id();
+    let mut cur = HWND::default();
+    unsafe {
+        loop {
+            let Ok(n) = FindWindowExW(HWND::default(), cur, w!("Shell_TrayWnd"), PCWSTR::null()) else {
+                break;
+            };
+            cur = n;
+            let mut pid = 0u32;
+            let _ = GetWindowThreadProcessId(n, Some(&mut pid));
+            if pid == me || pid == 0 {
+                continue; // 跳过本进程（假宿主）与拿不到 pid 的窗口
+            }
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// ITaskbarList::HrInit 的隐藏前置条件：Shell_TrayWnd 必须有 `TaskbandHWND` 窗口属性。
+/// 真 Explorer 任务栏天然带这个属性；我们的假宿主没有它，HiBitUninstaller 等程序
+/// 调 `CoCreateInstance(CLSID_TaskbarList).HrInit()` 会直接拿到 E_NOTIMPL(0x80004001)，
+/// 即使托盘消息全部转发也没用（这个检查发生在调用方进程内，不经过窗口消息）。
+///
+/// 这里把真任务栏的 `TaskbandHWND` 原样复制到假宿主；拿不到时退到 `GetShellWindow()`。
+unsafe fn taskband_prop_value() -> Option<HANDLE> {
+    if let Some(real) = real_explorer_tray() {
+        let v = GetPropW(real, w!("TaskbandHWND"));
+        if !v.0.is_null() {
+            return Some(v);
+        }
+    }
+    let shell = GetShellWindow();
+    if shell.0.is_null() {
+        None
+    } else {
+        Some(HANDLE(shell.0))
+    }
+}
+
+unsafe fn adopt_taskband_prop(own: HWND) {
+    let Some(v) = taskband_prop_value() else { return };
+    let _ = SetPropW(own, w!("TaskbandHWND"), v);
+    crate::vlog!("[trayhost] TaskbandHWND → {:#x}", v.0 as usize);
+}
+
+/// 把不认识的消息转给真任务栏（`Shell_TrayWnd`，按 PID 排除我们自己），并回传其应答。
 ///
 /// 三重防护（都是被实测栈溢出逼出来的）：
 ///   1. 注册消息（>= 0xC000，含 TaskbarCreated）不转发——它不是应用私有托盘消息，
 ///      转给 explorer 会引发重新注册风暴。
 ///   2. stop() 期间 FORWARD_ENABLED=false，广播 TaskbarCreated 时完全不转发。
 ///   3. FORWARDING CAS 重入保护 + SendMessageTimeout，打断 explorer 回发造成的递归。
-unsafe fn forward_to_explorer(_from: HWND, msg: u32, w: WPARAM, l: LPARAM) {
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, SendMessageTimeoutW, SMTO_ABORTIFHUNG};
+///
+/// 返回 Explorer 的应答（对齐 Atrium「调用转发后仍保留原来的消息和回调」）：
+/// ITaskbarList::HrInit 等 COM 握手靠这个返回值判定任务栏是否有效。
+unsafe fn forward_to_explorer(_from: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
     if msg >= 0xC000 || !FORWARD_ENABLED.load(Ordering::SeqCst) {
-        return; // 注册消息（TaskbarCreated 等）不该转发
+        return None; // 注册消息（TaskbarCreated 等）不该转发
     }
     if FORWARDING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        return;
+        return None;
     }
-    let own = *OWN_HWND.lock().unwrap();
-    let mut cur = HWND::default();
-    loop {
-        let Ok(n) = FindWindowExW(HWND::default(), cur, w!("Shell_TrayWnd"), PCWSTR::null()) else { break };
-        if n.0 as usize == own {
-            cur = n;
-            continue;
-        }
+    let mut answer = None;
+    if let Some(n) = real_explorer_tray() {
         let mut result: usize = 0;
-        let _ = SendMessageTimeoutW(
-            n, msg, w, l, SMTO_ABORTIFHUNG, 200, Some(&mut result),
-        );
-        break;
+        let ok = SendMessageTimeoutW(n, msg, w, l, SMTO_ABORTIFHUNG, 200, Some(&mut result));
+        if ok.0 != 0 {
+            answer = Some(LRESULT(result as isize));
+        }
     }
     FORWARDING.store(false, Ordering::SeqCst);
+    answer
 }
 
-unsafe fn on_copydata(_w: WPARAM, l: LPARAM) -> LRESULT {
+unsafe fn on_copydata(w: WPARAM, l: LPARAM) -> LRESULT {
     if l.0 == 0 {
         return LRESULT(0);
     }
@@ -322,16 +409,23 @@ unsafe fn on_copydata(_w: WPARAM, l: LPARAM) -> LRESULT {
     }
     match cd.dwData {
         WM_COPYDATA_TRAY => {
+            // 对齐 Atrium：复制图标、记录回调与身份；然后**原样转发**给 Explorer，
+            // 保证 Explorer 托盘里的图标保持完整。接收异常（解析失败）时也照样转发，
+            // 绝不吞掉图标。回传 Explorer 的应答，保留原来的消息和回调。
             if let Some(icon) = parse_shelltraydata(cd.lpData, cd.cbData as usize) {
                 apply(icon);
-                return LRESULT(1);
             }
+            let reply = forward_to_explorer(HWND::default(), WM_COPYDATA, w, l);
+            return reply.unwrap_or(LRESULT(1));
         }
         WM_COPYDATA_ICONRECT => {
+            // GetRect 查询由我们自己答（把 Dock 上图标矩形报给应用），不转发
             return answer_icon_rect(cd.lpData, cd.cbData as usize);
         }
         WM_COPYDATA_APPBAR => {
             // AppBar 消息：转发给真任务栏，我们自己不注册 AppBar
+            let reply = forward_to_explorer(HWND::default(), WM_COPYDATA, w, l);
+            return reply.unwrap_or(LRESULT(0));
         }
         _ => {}
     }

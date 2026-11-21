@@ -26,6 +26,7 @@ mod musicbar;
 mod musicbarview;
 mod net;
 mod notify;
+mod wintoast;
 mod panel;
 mod panelview;
 mod pillui;
@@ -38,6 +39,7 @@ mod widgetbarview;
 mod theme;
 mod trace;
 mod tray;
+mod traydetect;
 mod banner;
 mod wechatmsg;
 mod weather;
@@ -61,6 +63,13 @@ fn main() {
     if args.iter().any(|a| a == "--restore-taskbar") {
         hide::force_restore();
         tlog!("已恢复系统任务栏");
+        return;
+    }
+    // 设置页子进程：winit 不允许同一进程重建事件循环，所以设置页单独起一个进程，
+    // 关闭时进程整个退出 → GL 上下文、字体图集、UI 内存全部归还；再打开就是新进程。
+    // 必须在单实例互斥之前分支，否则会被当成"重复启动"直接退出。
+    if args.iter().any(|a| a == "--settings-ui") {
+        settingsui::run_child();
         return;
     }
     // 单实例互斥：已有 orbit 在跑就直接退出（守护子进程 / --restore-taskbar 不受影响）

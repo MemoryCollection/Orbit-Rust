@@ -24,8 +24,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, FindWindowW, GetAncestor, GetCursorPos, GetWindowRect, SetCursorPos,
-    WindowFromPoint, ASFW_ANY, GA_ROOT,
+    AllowSetForegroundWindow, FindWindowW, GetAncestor, GetCursorPos, GetWindowRect,
+    GetWindowThreadProcessId, SetCursorPos, WindowFromPoint, GA_ROOT,
 };
 
 use crate::appicon::IconCache;
@@ -477,8 +477,16 @@ impl TrayMirror {
     /// 应用会被前台的焦点锁挡住（表现为"点了没反应"）。
     pub fn click(&self, idx: usize, right: bool) {
         let Some(it) = self.items.get(idx) else { return };
-        unsafe {
-            let _ = AllowSetForegroundWindow(ASFW_ANY);
+        // 对齐 Atrium：点击前只授权当前核实的 shell PID，不向任意进程开放前台权限。
+        // 从真任务栏窗口反查 explorer 的 PID（排除我们自己的假宿主），只放行它。
+        if let Some(tb) = trayhost::real_explorer_tray() {
+            let mut shell_pid = 0u32;
+            unsafe {
+                let _ = GetWindowThreadProcessId(tb, Some(&mut shell_pid));
+                if shell_pid != 0 {
+                    let _ = AllowSetForegroundWindow(shell_pid);
+                }
+            }
         }
         if right {
             right_click(it.icon_rect);

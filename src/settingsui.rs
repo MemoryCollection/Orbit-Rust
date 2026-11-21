@@ -2,24 +2,28 @@
 //! 所有值都写回 `settings.rs`（= `<exe>/data/settings.txt`），改完立刻生效，
 //! 胶囊 / 模块条 / Dock 靠 `settings::version()` 感知变化后重绘。
 //!
-//! 布局：左 = 分组导航（顶部胶囊/Dock/音乐条/天气/邮箱账户/模块与托盘），
+//! 布局：左 = 分组导航（常规设置 / 顶部胶囊 / Dock / 开始菜单），
 //! 右 = 所选分组的详细设置（组内滚动）。窗口尺寸固定，打开时主屏居中。
-//! - 邮箱：内置常用服务器预设（QQ/163/Gmail/Outlook），选完只需填账号 + 授权码，
-//!   另有「测试连通」按钮（后台线程 IMAP LOGIN 实测）。
+//! - 邮箱：多账号管理，内置常用服务器预设（QQ/163/Gmail/Outlook），
+//!   「测试连通」通过后打 ✓ 标记并持久化
 //! - 模块芯片：拖动排序、点击循环 胶囊 → 左条 → 右条 → 隐藏
 //! - 托盘图标：两列开关，第 0 格固定是「返回桌面」，下面有「恢复」按钮
 //!
-//! 线程模型：eframe 线程**懒启动**——首次 `show()` 才起（eframe 渲染完第一帧后
-//! 会强制 `set_visible(true)`，启动就建窗会导致设置页开机弹出）。窗口建好后常驻，
-//! 之后靠 `QUEUE` + `egui::Context` 的 request_repaint 收发 显示/隐藏 命令；
-//! winit 事件循环需显式开 `with_any_thread`（见 `event_loop_builder` 钩子）。
+//! 线程模型：设置页跑在**独立子进程**（`orbit.exe --settings-ui`）里——
+//! winit 不允许同一进程重建事件循环，而"关闭即回收内存"必须让整个 eframe
+//! 退出，所以每次打开都起一个新进程，关窗（或主进程发 WM_CLOSE）就进程退出，
+//! GL 上下文 / 字体图集 / UI 内存全部归还。
+//!
+//! 托盘图标表和微信 UIA 实例只活在主进程里，所以主进程在设置页打开期间把这两项
+//! 写进 `data/settings-runtime.txt`（`publish_runtime`），子进程读快照；
+//! 「应用」「手动拿 UIA」这类动作由子进程 PostMessage 到主进程胶囊窗口完成。
+//!
 //! 设置页不在任务栏显示（`with_taskbar(false)`）。
 //!
 //! 打开方式：右键 Dock 空白处、右键胶囊、或 Ctrl+Alt+, （再按一次收起）。
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
@@ -42,30 +46,164 @@ const WIN_RADIUS: f32 = 10.0;
 /// 托盘列表里"返回桌面"开关的伪键
 const DESKTOP_KEY: &str = "__desktop__";
 
-// ---------- 主线程 ↔ eframe 线程 ----------
+// ---------- 主进程 ↔ 设置页子进程 ----------
+//
+// winit 不允许在同一个进程里重建事件循环（"EventLoop can't be recreated"），
+// 所以设置页跑在**独立子进程**里（`orbit.exe --settings-ui`）：
+// - 打开 = 起一个子进程；关闭 = 子进程整个退出，GL 上下文 / 字体图集 / UI 内存
+//   全部归还，内存曲线真正归零；
+// - 再打开就是全新进程，不存在事件循环复用问题。
 
-enum Cmd {
-    Show,
-    Hide,
+/// 设置页子进程句柄（None = 没开 / 已退出）
+static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+/// 子进程内：已请求关闭视口（这次 close 放行，不再重复 do_hide）
+static CLOSE_REQ: AtomicBool = AtomicBool::new(false);
+/// 本进程是不是设置页子进程
+static IS_CHILD: AtomicBool = AtomicBool::new(false);
+/// 子进程从主进程拿到的运行期快照（托盘图标 / 微信实例），只在子进程里用
+static RUNTIME: Mutex<Option<RuntimeSnap>> = Mutex::new(None);
+
+/// 主进程写给子进程的运行期快照。
+/// 托盘图标表和微信 UIA 实例都活在主进程里，设置页换成子进程后拿不到内存数据，
+/// 所以主进程在设置页打开期间把这两项写进 `data/settings-runtime.txt`，子进程读。
+#[derive(Default, Clone)]
+struct RuntimeSnap {
+    /// (icon_key, 显示名)
+    tray: Vec<(String, String)>,
+    /// (实例标签, 是否已拿到 UIA)
+    wechat: Vec<(String, bool)>,
 }
 
-static CTX: OnceLock<egui::Context> = OnceLock::new();
-static QUEUE: Mutex<VecDeque<Cmd>> = Mutex::new(VecDeque::new());
-static OPEN: AtomicBool = AtomicBool::new(false);
-/// eframe 线程是否已启动
-static SPAWNED: AtomicBool = AtomicBool::new(false);
+fn runtime_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("data").join("settings-runtime.txt")))
+        .unwrap_or_else(|| std::path::PathBuf::from("settings-runtime.txt"))
+}
 
-fn push(cmd: Cmd) {
-    if let Ok(mut q) = QUEUE.lock() {
-        q.push_back(cmd);
+/// 主进程调用：把托盘图标 / 微信实例状态写给设置页子进程。
+/// 内容没变就不写盘（每秒调用一次也不会有 I/O 压⼒）。
+pub fn publish_runtime() {
+    if IS_CHILD.load(Ordering::Relaxed) {
+        return;
     }
-    if let Some(ctx) = CTX.get() {
-        ctx.request_repaint();
+    let mut tray: Vec<(String, String)> = Vec::new();
+    if let Some(tab) = crate::trayhost::table() {
+        if let Ok(st) = tab.lock() {
+            for ic in st.icons.iter() {
+                let mut name = ic.tip.lines().next().unwrap_or("").trim().to_string();
+                if name.is_empty() {
+                    name = std::path::Path::new(&ic.exe)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                }
+                if name.is_empty() {
+                    name = "（无名称图标）".to_string();
+                }
+                tray.push((crate::tray::icon_key(Some(ic), &ic.exe, &ic.tip), short(&name, 10)));
+            }
+        }
+    }
+    let mut body = String::new();
+    for (k, n) in &tray {
+        body.push_str(&format!("T\t{k}\t{n}\n"));
+    }
+    for (label, got) in crate::wechatmsg::instances() {
+        body.push_str(&format!("W\t{label}\t{}\n", if got { 1 } else { 0 }));
+    }
+    let path = runtime_path();
+    if let Ok(old) = std::fs::read_to_string(&path) {
+        if old == body {
+            return;
+        }
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, body);
+}
+
+/// 子进程调用：读主进程写的运行期快照
+fn load_runtime() {
+    let mut snap = RuntimeSnap::default();
+    if let Ok(text) = std::fs::read_to_string(runtime_path()) {
+        for line in text.lines() {
+            let mut it = line.split('\t');
+            match (it.next(), it.next(), it.next()) {
+                (Some("T"), Some(k), Some(n)) => snap.tray.push((k.to_string(), n.to_string())),
+                (Some("W"), Some(label), Some(got)) => {
+                    snap.wechat.push((label.to_string(), got.trim() == "1"))
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Ok(mut g) = RUNTIME.lock() {
+        *g = Some(snap);
+    }
+}
+
+/// 子进程里读快照；主进程直接返回 None（走内存表）
+fn runtime_snap() -> Option<RuntimeSnap> {
+    if !IS_CHILD.load(Ordering::Relaxed) {
+        return None;
+    }
+    RUNTIME.lock().ok().and_then(|g| g.clone())
+}
+
+/// 微信 UIA 实例状态：子进程用主进程快照，主进程读内存
+fn wechat_instances() -> Vec<(String, bool)> {
+    match runtime_snap() {
+        Some(s) => s.wechat,
+        None => crate::wechatmsg::instances(),
+    }
+}
+
+/// 找主进程的胶囊窗口（类名 ORBIT_CAPSULE）
+fn parent_hwnd() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    unsafe {
+        let h = FindWindowW(windows::core::w!("ORBIT_CAPSULE"), PCWSTR::null()).ok()?;
+        if h.is_invalid() {
+            None
+        } else {
+            Some(h)
+        }
+    }
+}
+
+/// 给主进程胶囊窗口投一条消息（跨进程）
+fn post_to_parent(msg: u32) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+    if let Some(h) = parent_hwnd() {
+        unsafe {
+            let _ = PostMessageW(h, msg, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
 pub fn is_open() -> bool {
-    OPEN.load(Ordering::Relaxed)
+    let Ok(mut g) = CHILD.lock() else {
+        return false;
+    };
+    let Some(c) = g.as_mut() else {
+        return false;
+    };
+    // 子进程已退出（用户关掉窗口）就顺手清掉句柄
+    match c.try_wait() {
+        Ok(Some(_)) => {
+            *g = None;
+            false
+        }
+        Ok(None) => true,
+        Err(_) => {
+            *g = None;
+            false
+        }
+    }
 }
 
 /// 打开 / 收起（热键和右键都走这里）
@@ -78,40 +216,112 @@ pub fn toggle() {
 }
 
 pub fn hide() {
-    if SPAWNED.load(Ordering::Relaxed) {
-        push(Cmd::Hide);
+    let pid = {
+        let Ok(mut g) = CHILD.lock() else { return };
+        let Some(c) = g.as_mut() else { return };
+        match c.try_wait() {
+            Ok(Some(_)) => {
+                *g = None;
+                return;
+            }
+            _ => c.id(),
+        }
+    };
+    if !post_close(pid) {
+        // 窗口还没建出来（刚点开就关）：直接收掉进程，没什么可保存的
+        if let Ok(mut g) = CHILD.lock() {
+            if let Some(mut c) = g.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
     }
+    crate::tlog!("[settings] 已请求关闭设置页（pid={pid}）");
 }
 
 pub fn show() {
-    // 懒启动：eframe 渲染完第一帧后总会强制 set_visible(true)（epi_integration
-    // 的 post_rendering，无视 with_visible(false)），启动时就建窗会让设置页
-    // 开机弹出。所以等用户第一次打开设置才起线程；show 命令先进 QUEUE，
-    // 线程起来后第一帧 logic 就会消费掉。
-    if !SPAWNED.swap(true, Ordering::Relaxed) {
-        let _ = std::thread::Builder::new()
-            .name("settings-ui".into())
-            .spawn(run);
+    if is_open() {
+        return;
     }
-    push(Cmd::Show);
+    // 托盘图标 / 微信实例状态只有主进程有，先把快照写出去给子进程读
+    publish_runtime();
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            crate::tlog!("[settings] 取 exe 路径失败：{e}");
+            return;
+        }
+    };
+    match std::process::Command::new(exe).arg("--settings-ui").spawn() {
+        Ok(c) => {
+            crate::tlog!("[settings] 设置页子进程已启动 pid={}", c.id());
+            if let Ok(mut g) = CHILD.lock() {
+                *g = Some(c);
+            }
+        }
+        Err(e) => crate::tlog!("[settings] 设置页子进程启动失败：{e}"),
+    }
 }
 
-/// 设置被别处改了（手改文件）时立刻重画一下（平时 250ms 轮询也能兜底）
-pub fn sync() {
-    if is_open() {
-        if let Some(ctx) = CTX.get() {
-            ctx.request_repaint();
+/// 设置被别处改了（手改文件）：设置页是独立进程，自己 500ms 轮询重绘，这里不用管
+pub fn sync() {}
+
+/// 主进程退出前调用：别把设置页窗口留成孤儿
+pub fn shutdown() {
+    if let Ok(mut g) = CHILD.lock() {
+        if let Some(mut c) = g.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+            crate::tlog!("[settings] 退出时已结束设置页子进程");
         }
     }
 }
 
-/// `init` 现在什么都不做（保留入口兼容旧调用点）：eframe 线程改为首次
-/// `show()` 时才启动，避免程序运行后设置页第一时间弹出。
+/// 给指定 pid 的顶层窗口发 WM_CLOSE（让设置页走正常的"丢弃改动 + 退出"流程）。
+/// 返回 false 表示没找到窗口。
+fn post_close(pid: u32) -> bool {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
+    };
+
+    struct Ctx {
+        pid: u32,
+        hwnd: Option<HWND>,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, l: LPARAM) -> BOOL {
+        let c = &mut *(l.0 as *mut Ctx);
+        let mut owner = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut owner));
+        if owner == c.pid && IsWindowVisible(hwnd).as_bool() {
+            c.hwnd = Some(hwnd);
+            return false.into(); // 找到就停
+        }
+        true.into()
+    }
+
+    let mut c = Ctx { pid, hwnd: None };
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut c as *mut Ctx as isize));
+        if let Some(h) = c.hwnd {
+            return PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok();
+        }
+    }
+    false
+}
+
+/// `init` 保留入口兼容旧调用点：设置页改为子进程，主进程侧不需要预建任何东西
 pub fn init(_instance: windows::Win32::Foundation::HINSTANCE) {}
 
-fn run() {
+/// 设置页子进程入口：在本进程里跑 eframe，关窗即进程退出
+pub fn run_child() {
     use winit::platform::windows::EventLoopBuilderExtWindows as _;
+    IS_CHILD.store(true, Ordering::Relaxed);
+    load_runtime();
     let options = eframe::NativeOptions {
+        // 建窗前就算好居中位置（默认 false：窗口先出现在左上角，首帧再跳到中间，
+        // 看起来会"闪一下"）。eframe 会在 winit 建窗前用 with_position 落位。
+        centered: true,
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_visible(false)
@@ -121,24 +331,25 @@ fn run() {
             // Windows：不占任务栏（对齐旧版分层小窗的行为）
             .with_taskbar(false)
             .with_inner_size([WIN_W, WIN_H]),
-        // eframe 跑在后台线程：winit 默认禁止非主线程建事件循环，必须显式放开
+        // 允许在非主线程建事件循环（保留原行为，子进程里其实是主线程）
         event_loop_builder: Some(Box::new(|builder| {
             builder.with_any_thread(true);
         })),
         ..Default::default()
     };
+    CLOSE_REQ.store(false, Ordering::Relaxed);
     if let Err(e) = eframe::run_native(
         TITLE,
         options,
         Box::new(|cc| {
             install_fonts(&cc.egui_ctx);
             apply_style(&cc.egui_ctx);
-            let _ = CTX.set(cc.egui_ctx.clone());
             Ok(Box::new(SettingsApp::default()))
         }),
     ) {
         crate::tlog!("[settings] eframe 启动失败（设置页不可用）：{e}");
     }
+    crate::tlog!("[settings] 设置页子进程退出");
 }
 
 // ---------- 外观 ----------
@@ -173,13 +384,6 @@ fn ink_on(fill: u32) -> egui::Color32 {
 fn shade(c: u32, k: f32) -> u32 {
     let ch = |v: u32| ((v as f32 * k).round().clamp(0.0, 255.0)) as u32;
     (c & 0xFF00_0000) | (ch((c >> 16) & 0xFF) << 16) | (ch((c >> 8) & 0xFF) << 8) | ch(c & 0xFF)
-}
-
-/// 系统 DPI 缩放（物理像素 / 逻辑点）：定位时要用它换算
-fn ppp(ctx: &egui::Context) -> f32 {
-    ctx.input(|i| i.viewport().native_pixels_per_point)
-        .unwrap_or_else(|| ctx.pixels_per_point())
-        .max(0.5)
 }
 
 /// 字体：与其余窗口共用同一份定义（MiSans 优先，系统字体兜底）
@@ -226,34 +430,20 @@ fn apply_style(ctx: &egui::Context) {
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Group {
     #[default]
+    General,
     Pill,
     Dock,
     Start,
-    MusicBar,
-    Weather,
-    Mail,
-    Modules,
 }
 
 impl Group {
-    const ALL: [Group; 7] = [
-        Group::Pill,
-        Group::Dock,
-        Group::Start,
-        Group::MusicBar,
-        Group::Weather,
-        Group::Mail,
-        Group::Modules,
-    ];
+    const ALL: [Group; 4] = [Group::General, Group::Pill, Group::Dock, Group::Start];
     fn label(self) -> &'static str {
         match self {
+            Group::General => "常规设置",
             Group::Pill => "顶部胶囊",
             Group::Dock => "Dock",
-            Group::Start => "开始菜单/系统",
-            Group::MusicBar => "音乐条",
-            Group::Weather => "天气",
-            Group::Mail => "邮箱账户",
-            Group::Modules => "模块与托盘",
+            Group::Start => "开始菜单",
         }
     }
 }
@@ -294,6 +484,10 @@ struct SettingsApp {
     preview_theme: usize,
     /// 编辑会话中已应用预览的字体开关（字体改动需立即重建本窗图集）
     preview_misans: bool,
+    /// 正在编辑的邮箱账号下标（None = 没在编辑，只显示账号列表）
+    mail_edit: Option<usize>,
+    /// 「浏览程序…」添加开始菜单快捷方式时是否以管理员权限
+    pin_admin: bool,
 }
 
 #[derive(Default)]
@@ -301,6 +495,11 @@ struct Edits {
     clock: String,
     wechat_ignore: String,
     banner_secs: String,
+    banner_secs_wechat: String,
+    banner_secs_mail: String,
+    banner_secs_tray: String,
+    banner_secs_clipboard: String,
+    clipboard_pinned: String,
     amap: String,
     host: String,
     port: String,
@@ -309,35 +508,19 @@ struct Edits {
 }
 
 impl eframe::App for SettingsApp {
-    /// 窗口隐藏时 eframe 不跑 UI，只调这里：命令收发、关窗拦截、定时唤醒都在这做
+    /// 首帧可见前的清屏色：跟主题面板底色一致，消除"先白一下再显示"的闪屏
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        argb(cfg::cur().panel_bg).to_normalized_gamma_f32()
+    }
+
+    /// 隐藏时 eframe 也会定期醒一次：只处理关窗（关闭即进程退出）
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let cmds: Vec<Cmd> = QUEUE
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default();
-        for cmd in cmds {
-            match cmd {
-                Cmd::Show => {
-                    self.center(ctx);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    OPEN.store(true, Ordering::Relaxed);
-                    // 打开即进入编辑会话：改动先攒内存，点「应用」才落盘；
-                    // 同时刷新编辑框缓冲，避免上次关窗 discard 后残留旧值
-                    settings::begin_edit();
-                    self.load_edits();
-                }
-                Cmd::Hide => self.do_hide(ctx),
-            }
-        }
-        // Alt+F4 / 系统关窗：当作收起，不退出 eframe
-        if ctx.input(|i| i.viewport().close_requested()) {
+        // 窗口首次可见由 eframe 首帧渲染后自动完成（clear_color 已对齐面板底色）。
+        // 这里只管关窗：用户点关闭 / 主进程发 WM_CLOSE，都走「丢弃未应用改动 + 退出」。
+        if ctx.input(|i| i.viewport().close_requested()) && !CLOSE_REQ.load(Ordering::Relaxed) {
             self.do_hide(ctx);
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        // 命令与设置文件改动的轮询兜底（隐藏时也靠它醒）
-        let wake = if is_open() { 500 } else { 250 };
-        ctx.request_repaint_after(std::time::Duration::from_millis(wake));
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -345,6 +528,8 @@ impl eframe::App for SettingsApp {
         let ver = settings::version();
         let ver_changed = ver != self.seen_version;
         if self.seen_version == 0 {
+            // 子进程启动即进入编辑会话：改动先攒内存，点「应用」才落盘
+            settings::begin_edit();
             self.load_edits();
             self.preview_theme = settings::theme_index();
             self.preview_misans = settings::use_misans();
@@ -448,21 +633,14 @@ impl SettingsApp {
     fn do_hide(&mut self, ctx: &egui::Context) {
         // 关窗 = 放弃未应用改动，从文件恢复
         settings::discard_edit();
-        OPEN.store(false, Ordering::Relaxed);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        CLOSE_REQ.store(true, Ordering::Relaxed);
+        // 直接请求关闭视口：eframe 退出事件循环 → 进程退出、
+        // GL 上下文与全部 UI 内存随之归还（比常驻 hide 省几十 MB）
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    /// 主屏居中：显示器坐标是物理像素，`OuterPosition` 要逻辑点，按 DPI 换算
-    fn center(&self, ctx: &egui::Context) {
-        let mon = crate::window::primary_monitor().rcMonitor;
-        let k = ppp(ctx);
-        let x = (mon.left as f32 + ((mon.right - mon.left) as f32 - WIN_W * k) / 2.0) / k;
-        let y = ((mon.top as f32 + ((mon.bottom - mon.top) as f32 - WIN_H * k) / 2.0)
-            .max(mon.top as f32 + 6.0))
-            / k;
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
-    }
-
+    /// 主屏居中已由 `NativeOptions::centered` 在**建窗前**完成（见 run_child）：
+    /// 那里按 monitor 尺寸算好位置再建窗，不会出现"先出现在左上角再跳中间"的闪动。
     fn load_edits(&mut self) {
         self.edits.clock = settings::clock_format();
         self.edits.wechat_ignore = settings::wechat_ignore_text();
@@ -481,78 +659,80 @@ impl SettingsApp {
 
     fn detail(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
         match self.group {
+            Group::General => self.detail_general(ui, ver_changed),
             Group::Pill => self.detail_pill(ui, ver_changed),
             Group::Dock => self.detail_dock(ui),
             Group::Start => self.detail_start(ui),
-            Group::MusicBar => self.detail_music(ui),
-            Group::Weather => self.detail_weather(ui, ver_changed),
-            Group::Mail => self.detail_mail(ui, ver_changed),
-            Group::Modules => self.detail_modules(ui, ver_changed),
         }
     }
 
-    /// 开始菜单快捷方式 + 开机启动 + 退出守护
-    fn detail_start(&mut self, ui: &mut egui::Ui) {
-        section(ui, "开始菜单快捷方式");
+    /// 常规设置：主题 / 字体 / 系统（开机启动、退出守护）/ 通知接管与方式 / 横幅时长 / 提示音
+    fn detail_general(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+        section(ui, "外观");
+        // 外观主题：一排小色块，直接用主题自己的底色画，所见即所得
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            for (i, t) in crate::theme::ALL.iter().enumerate() {
+                let sel = i == settings::theme_index();
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(36.0, 26.0), egui::Sense::click());
+                let p = ui.painter();
+                // 先垫一块"模拟壁纸"：胶囊底都是半透明的，直接画在设置页背景上
+                // 会看不出差别（液态玻璃和深色玻璃会变成同一个灰），垫层中性色才真实
+                p.rect_filled(
+                    rect,
+                    egui::CornerRadius::same(7),
+                    egui::Color32::from_rgb(0x6E, 0x7C, 0x8A),
+                );
+                p.rect_filled(rect, egui::CornerRadius::same(7), argb(t.pill_bg));
+                // 画一条代表主文字的短横线：能直观看出该主题的对比度
+                let bar = egui::Rect::from_center_size(
+                    rect.center() - egui::vec2(4.0, 0.0),
+                    egui::vec2(13.0, 2.0),
+                );
+                p.rect_filled(bar, 1.0, argb(t.text));
+                p.rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(7),
+                    egui::Stroke::new(1.0, argb(t.dock_edge.max(0x22_00_00_00))),
+                    egui::StrokeKind::Inside,
+                );
+                if sel {
+                    p.rect_stroke(
+                        rect.expand(1.5),
+                        egui::CornerRadius::same(9),
+                        egui::Stroke::new(1.5, argb(t.accent)),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                if resp.clicked() {
+                    settings::set_theme_index(i);
+                }
+                resp.on_hover_text(t.name);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(cfg::cur().name)
+                    .size(12.5)
+                    .color(argb(cfg::cur().text_dim)),
+            );
+        });
+
+        ui.add_space(4.0);
+        section(ui, "界面字体");
+        if let Some(pick) = seg(
+            ui,
+            &["MiSans", "系统字体"],
+            if settings::use_misans() { 0 } else { 1 },
+        ) {
+            settings::set_use_misans(pick == 0);
+            crate::tlog!("[settings] 界面字体 → {}", if settings::use_misans() { "MiSans" } else { "系统字体" });
+        }
         ui.label(
-            egui::RichText::new("按 Win 键弹出开始菜单（再按一次收起）；上栏最多显示 8 个（一行 4 个）")
+            egui::RichText::new("MiSans 随程序目录分发（data/MiSans-Semibold.ttf，缺失时回落系统字体）；系统字体 = 微软雅黑等本机字体")
                 .size(11.5)
                 .weak(),
         );
-        let pins = settings::start_pins();
-        if pins.is_empty() {
-            ui.label(
-                egui::RichText::new("还没有快捷方式，点「浏览程序…」添加")
-                    .size(11.5)
-                    .weak(),
-            );
-        }
-        for (name, target) in &pins {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(egui::RichText::new(name.as_str()).size(12.5));
-                ui.label(
-                    egui::RichText::new(target.as_str())
-                        .size(11.0)
-                        .color(argb(cfg::cur().text_dim)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new("移除").small()).clicked() {
-                        let mut list: Vec<(String, String)> = settings::start_pins();
-                        list.retain(|(_, p)| !p.eq_ignore_ascii_case(target));
-                        settings::set_start_pins(list);
-                    }
-                });
-            });
-        }
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui.add(egui::Button::new("浏览程序…").small()).clicked() {
-                if let Some(path) = pick_program(false) {
-                    let mut list = settings::start_pins();
-                    if !list.iter().any(|(_, p)| p.eq_ignore_ascii_case(&path)) {
-                        let name = std::path::Path::new(&path)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| path.clone());
-                        list.push((name, path));
-                        settings::set_start_pins(list);
-                    }
-                }
-            }
-            if ui.add(egui::Button::new("恢复默认").small())
-                .on_hover_text("恢复为「命令提示符 (cmd)」一条")
-                .clicked()
-            {
-                settings::set_start_pins(vec![
-                    (
-                        "命令提示符".to_string(),
-                        "C:\\Windows\\System32\\cmd.exe".to_string(),
-                    ),
-                ]);
-            }
-        });
 
         ui.add_space(10.0);
         section(ui, "系统");
@@ -560,14 +740,7 @@ impl SettingsApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let on = settings::autostart();
-            let fill = if on { argb(0x66_3C_8D_FF) } else { argb(0x33_FF_FF_FF) };
-            let txt = egui::RichText::new(if on { "已开启" } else { "已关闭" })
-                .size(12.0)
-                .color(if on { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) });
-            if ui
-                .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(76.0, 24.0)))
-                .clicked()
-            {
+            if toggle_btn(ui, on, "开机启动") {
                 settings::set_autostart(!on);
                 // 注册表立即对齐（不走「应用」，开关即生效）
                 crate::guard::apply_autostart(settings::autostart());
@@ -587,14 +760,7 @@ impl SettingsApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let on = settings::guardian();
-            let fill = if on { argb(0x66_3C_8D_FF) } else { argb(0x33_FF_FF_FF) };
-            let txt = egui::RichText::new(if on { "已开启" } else { "已关闭" })
-                .size(12.0)
-                .color(if on { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) });
-            if ui
-                .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(76.0, 24.0)))
-                .clicked()
-            {
+            if toggle_btn(ui, on, "退出守护") {
                 settings::set_guardian(!on);
                 crate::tlog!(
                     "[settings] 退出守护 → {}",
@@ -602,7 +768,7 @@ impl SettingsApp {
                 );
             }
             ui.label(
-                egui::RichText::new("退出守护：orbit 被强杀（任务栏没恢复）时自动重启 explorer 拉回任务栏")
+                egui::RichText::new("orbit 被强杀（任务栏没恢复）时自动重启 explorer 拉回任务栏")
                     .size(11.5)
                     .weak(),
             );
@@ -612,6 +778,383 @@ impl SettingsApp {
                 .size(11.5)
                 .weak(),
         );
+
+        ui.add_space(10.0);
+        section(ui, "通知接管（微信）");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let on = settings::wechat_cards();
+            if toggle_btn(ui, on, "微信卡片") {
+                settings::set_wechat_cards(!on);
+                crate::tlog!(
+                    "[settings] 微信消息卡片 → {}",
+                    if settings::wechat_cards() { "开启" } else { "关闭" }
+                );
+            }
+            ui.label(
+                egui::RichText::new("新消息在屏幕右下角弹会话名+摘要小卡片（只读微信界面）")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(row_label("不弹白名单"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.wechat_ignore)
+                    .hint_text("可添加多个：标题之间用分号 ; 分隔"),
+            );
+            if r.lost_focus() {
+                let list: Vec<String> = self
+                    .edits
+                    .wechat_ignore
+                    .split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                settings::set_wechat_ignore(list);
+                self.edits.wechat_ignore = settings::wechat_ignore_text();
+                crate::tlog!("[settings] 微信卡片白名单 → {}", settings::wechat_ignore_text());
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.wechat_ignore = settings::wechat_ignore_text();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "可添加多个标题（分号分隔，完全匹配才跳过）；被跳过的标题会写进 orbit.log",
+            )
+            .size(11.5)
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("手动拿 UIA").size(12.0))
+                        .min_size(egui::vec2(96.0, 24.0)),
+                )
+                .clicked()
+            {
+                // 设置页是独立进程，抓 UIA 的动作必须让主进程做
+                if IS_CHILD.load(Ordering::Relaxed) {
+                    post_to_parent(crate::appmsg::WM_GRAB_UIA);
+                } else {
+                    crate::banner::request_grab();
+                }
+                crate::tlog!("[settings] 手动拿 UIA 已点击");
+            }
+            ui.label(
+                egui::RichText::new("先唤出微信窗口（支持多开）再点；拿到后右下角提示一次")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+
+        // 多开状态：每个微信实例是否已拿到 UIA 会话数据（按进程创建时间排序，
+        // 先开的在前，与 Dock 托盘里多开图标的顺序一致）
+        let insts = wechat_instances();
+        if !insts.is_empty() {
+            ui.add_space(6.0);
+            for (label, got) in &insts {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(egui::RichText::new(label.as_str()).size(12.0));
+                    ui.label(
+                        egui::RichText::new(if *got { "已拿到" } else { "未拿到" })
+                            .size(12.0)
+                            .color(if *got {
+                                argb(0xFF_2F_C6_6F)
+                            } else {
+                                argb(cfg::cur().text_dim)
+                            }),
+                    );
+                });
+            }
+            if insts.iter().any(|(_, g)| !*g) {
+                ui.label(
+                    egui::RichText::new("未拿到的实例：先显示一次它的主窗口，再点上面的按钮")
+                        .size(11.0)
+                        .weak(),
+                );
+            }
+        }
+
+        ui.add_space(10.0);
+        section(ui, "通知方式");
+        ui.label(
+            egui::RichText::new("每类消息各自选择弹在哪里：Orbit 横幅（右下角卡片）/ Windows 系统通知 / 不通知")
+                .size(11.5)
+                .weak(),
+        );
+        egui::Grid::new("g_notify_ch")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                for (name, ch) in [
+                    ("微信", settings::notify_wechat()),
+                    ("邮件", settings::notify_mail()),
+                    ("托盘闪烁", settings::notify_tray()),
+                    ("剪切板", settings::notify_clipboard()),
+                ] {
+                    ui.label(row_label(name));
+                    let idx = match ch {
+                        settings::NotifyChannel::Orbit => 0,
+                        settings::NotifyChannel::Windows => 1,
+                        settings::NotifyChannel::Off => 2,
+                    };
+                    if let Some(i) = seg(ui, &["Orbit 横幅", "Windows 通知", "不通知"], idx) {
+                        let c = match i {
+                            1 => settings::NotifyChannel::Windows,
+                            2 => settings::NotifyChannel::Off,
+                            _ => settings::NotifyChannel::Orbit,
+                        };
+                        match name {
+                            "微信" => settings::set_notify_wechat(c),
+                            "邮件" => settings::set_notify_mail(c),
+                            "托盘闪烁" => settings::set_notify_tray(c),
+                            _ => settings::set_notify_clipboard(c),
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+
+        ui.add_space(10.0);
+        section(ui, "横幅显示时长");
+        ui.label(
+            egui::RichText::new("每类横幅自动关闭的秒数；0 = 不自动关闭，点一下才收起")
+                .size(11.5)
+                .weak(),
+        );
+        egui::Grid::new("g_banner_secs")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                for (name, key) in [
+                    ("微信", 0u8),
+                    ("邮件", 1u8),
+                    ("托盘闪烁", 2u8),
+                    ("剪切板", 3u8),
+                ] {
+                    ui.label(row_label(name));
+                    let buf = match key {
+                        0 => &mut self.edits.banner_secs_wechat,
+                        1 => &mut self.edits.banner_secs_mail,
+                        2 => &mut self.edits.banner_secs_tray,
+                        _ => &mut self.edits.banner_secs_clipboard,
+                    };
+                    let cur = match key {
+                        0 => settings::banner_secs_wechat(),
+                        1 => settings::banner_secs_mail(),
+                        2 => settings::banner_secs_tray(),
+                        _ => settings::banner_secs_clipboard(),
+                    };
+                    let r = ui.add_sized([CTRL_W, 24.0], egui::TextEdit::singleline(buf).hint_text("6"));
+                    // 逐键提交：设置窗失活会直接收起，文本框来不及触发 lost_focus
+                    let parsed = buf.trim().parse::<u32>().ok();
+                    if r.changed() {
+                        if let Some(v) = parsed {
+                            match key {
+                                0 => settings::set_banner_secs_wechat(v),
+                                1 => settings::set_banner_secs_mail(v),
+                                2 => settings::set_banner_secs_tray(v),
+                                _ => settings::set_banner_secs_clipboard(v),
+                            }
+                        }
+                    }
+                    if r.lost_focus() {
+                        let v = parsed.unwrap_or(6);
+                        match key {
+                            0 => settings::set_banner_secs_wechat(v),
+                            1 => settings::set_banner_secs_mail(v),
+                            2 => settings::set_banner_secs_tray(v),
+                            _ => settings::set_banner_secs_clipboard(v),
+                        }
+                        *buf = cur.to_string();
+                    }
+                    ui.end_row();
+                }
+            });
+
+        ui.add_space(10.0);
+        section(ui, "提示音");
+        let mode = settings::sound_mode();
+        let idx = match mode {
+            settings::SoundMode::Off => 0,
+            settings::SoundMode::Once => 1,
+            settings::SoundMode::Twice => 2,
+            settings::SoundMode::Thrice => 3,
+            settings::SoundMode::UntilDismiss => 4,
+        };
+        if let Some(i) = seg(
+            ui,
+            &["关", "一声", "两声", "三声", "循环到横幅消失"],
+            idx,
+        ) {
+            let m = match i {
+                1 => settings::SoundMode::Once,
+                2 => settings::SoundMode::Twice,
+                3 => settings::SoundMode::Thrice,
+                4 => settings::SoundMode::UntilDismiss,
+                _ => settings::SoundMode::Off,
+            };
+            settings::set_sound_mode(m);
+            crate::tlog!("[settings] 提示音模式 → {m:?}");
+        }
+        ui.label(
+            egui::RichText::new("「循环到横幅消失」：横幅常驻期间提示音循环播放，横幅收起即停")
+                .size(11.5)
+                .weak(),
+        );
+    }
+
+    /// 开始菜单：Win 键接管 + 快捷方式（排序 / 每行数量 / 管理员启动）
+    fn detail_start(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Win 键接管");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let on = settings::start_hook();
+            if toggle_btn(ui, on, "接管 Win 键") {
+                settings::set_start_hook(!on);
+                crate::tlog!(
+                    "[settings] Win 键接管 → {}",
+                    if settings::start_hook() { "开启" } else { "关闭" }
+                );
+            }
+            ui.label(
+                egui::RichText::new("按下 Win 弹出 Orbit 开始菜单；关闭后 Win 键交还 Windows 系统开始菜单")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+
+        ui.add_space(10.0);
+        section(ui, "开始菜单快捷方式");
+        ui.label(
+            egui::RichText::new(format!(
+                "上栏每行 {} 个（最多两行）；可调整顺序。路径前加 @admin: 表示以管理员权限启动",
+                settings::start_cols()
+            ))
+            .size(11.5)
+            .weak(),
+        );
+        egui::Grid::new("g_start_cols")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(row_label("每行个数"));
+                let cols = settings::start_cols();
+                if let Some(d) = stepper(ui, &format!("{cols}"), cols > 1, cols < 8) {
+                    settings::set_start_cols((cols as i32 + d as i32).max(1) as usize);
+                }
+                ui.end_row();
+            });
+
+        let pins = settings::start_pins();
+        if pins.is_empty() {
+            ui.label(
+                egui::RichText::new("还没有快捷方式，点「浏览程序…」添加")
+                    .size(11.5)
+                    .weak(),
+            );
+        }
+        let n = pins.len();
+        for (i, (name, target)) in pins.iter().enumerate() {
+            let admin = target
+                .strip_prefix("@admin:")
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| target.clone());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    egui::RichText::new(format!("{}.", i + 1))
+                        .size(11.5)
+                        .color(argb(cfg::cur().text_dim)),
+                );
+                ui.label(egui::RichText::new(name.as_str()).size(12.5));
+                if target.starts_with("@admin:") {
+                    ui.label(
+                        egui::RichText::new("[管理员]")
+                            .size(11.0)
+                            .color(argb(cfg::cur().accent)),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(admin.as_str())
+                        .size(11.0)
+                        .color(argb(cfg::cur().text_dim)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("移除").small()).clicked() {
+                        let mut list: Vec<(String, String)> = settings::start_pins();
+                        list.remove(i);
+                        settings::set_start_pins(list);
+                    }
+                    if ui
+                        .add_enabled(i > 0, egui::Button::new("↑").small())
+                        .on_hover_text("上移")
+                        .clicked()
+                    {
+                        let mut list = settings::start_pins();
+                        list.swap(i - 1, i);
+                        settings::set_start_pins(list);
+                    }
+                    if ui
+                        .add_enabled(i + 1 < n, egui::Button::new("↓").small())
+                        .on_hover_text("下移")
+                        .clicked()
+                    {
+                        let mut list = settings::start_pins();
+                        list.swap(i, i + 1);
+                        settings::set_start_pins(list);
+                    }
+                });
+            });
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new("浏览程序…").small()).clicked() {
+                if let Some(path) = pick_program(false) {
+                    let target = if self.pin_admin {
+                        format!("@admin:{path}")
+                    } else {
+                        path.clone()
+                    };
+                    let mut list = settings::start_pins();
+                    if !list.iter().any(|(_, p)| p.eq_ignore_ascii_case(&target)) {
+                        let name = std::path::Path::new(&path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.clone());
+                        list.push((name, target));
+                        settings::set_start_pins(list);
+                    }
+                }
+            }
+            let mut admin = self.pin_admin;
+            if ui
+                .checkbox(&mut admin, "以管理员权限添加")
+                .on_hover_text("勾选后添加的快捷方式以管理员权限（UAC 提权）启动")
+                .changed()
+            {
+                self.pin_admin = admin;
+            }
+            if ui
+                .add(egui::Button::new("恢复默认").small())
+                .on_hover_text("恢复为「命令提示符（管理员）」一条")
+                .clicked()
+            {
+                settings::set_start_pins(vec![
+                    (
+                        "命令提示符(管理员)".to_string(),
+                        "@admin:C:\\Windows\\System32\\cmd.exe".to_string(),
+                    ),
+                ]);
+            }
+        });
     }
 
     fn detail_pill(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
@@ -620,96 +1163,6 @@ impl SettingsApp {
             .num_columns(2)
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
-                ui.label(row_label("时钟格式"));
-                ui.vertical(|ui| {
-                    let r = ui.add_sized(
-                        [CTRL_W, 24.0],
-                        egui::TextEdit::singleline(&mut self.edits.clock),
-                    );
-                    // 失焦才写盘（每键写文件会卡）；预览直接读本地缓冲，打字时照样实时
-                    if r.lost_focus() && self.edits.clock != settings::clock_format() {
-                        settings::set_clock_format(&self.edits.clock);
-                    }
-                    if ver_changed && !r.has_focus() {
-                        self.edits.clock = settings::clock_format();
-                    }
-                    // 占位符对照（对应 clock::format_time 支持的全部占位符）
-                    ui.label(
-                        egui::RichText::new(
-                            "%Y 年   %m 月   %d 日   %H 时   %M 分   %S 秒",
-                        )
-                        .size(10.5)
-                        .weak(),
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            "%y 两位年   %I 12时制   %p 上午/下午   %a %A 周几   %% 百分号",
-                        )
-                        .size(10.5)
-                        .weak(),
-                    );
-                });
-                ui.end_row();
-
-                ui.label(row_label("实时预览"));
-                ui.label(
-                    egui::RichText::new(clock::sample(&self.edits.clock))
-                        .size(13.0)
-                        .color(argb(cfg::cur().accent)),
-                );
-                ui.end_row();
-
-                // 外观主题：一排小色块，直接用主题自己的底色画，所见即所得
-                ui.label(row_label("外观"));
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 5.0;
-                    for (i, t) in crate::theme::ALL.iter().enumerate() {
-                        let sel = i == settings::theme_index();
-                        let (rect, resp) =
-                            ui.allocate_exact_size(egui::vec2(36.0, 26.0), egui::Sense::click());
-                        let p = ui.painter();
-                        // 先垫一块"模拟壁纸"：胶囊底都是半透明的，直接画在设置页背景上
-                        // 会看不出差别（液态玻璃和深色玻璃会变成同一个灰），垫层中性色才真实
-                        p.rect_filled(
-                            rect,
-                            egui::CornerRadius::same(7),
-                            egui::Color32::from_rgb(0x6E, 0x7C, 0x8A),
-                        );
-                        p.rect_filled(rect, egui::CornerRadius::same(7), argb(t.pill_bg));
-                        // 画一条代表主文字的短横线：能直观看出该主题的对比度
-                        let bar = egui::Rect::from_center_size(
-                            rect.center() - egui::vec2(4.0, 0.0),
-                            egui::vec2(13.0, 2.0),
-                        );
-                        p.rect_filled(bar, 1.0, argb(t.text));
-                        p.rect_stroke(
-                            rect,
-                            egui::CornerRadius::same(7),
-                            egui::Stroke::new(1.0, argb(t.dock_edge.max(0x22_00_00_00))),
-                            egui::StrokeKind::Inside,
-                        );
-                        if sel {
-                            p.rect_stroke(
-                                rect.expand(1.5),
-                                egui::CornerRadius::same(9),
-                                egui::Stroke::new(1.5, argb(t.accent)),
-                                egui::StrokeKind::Outside,
-                            );
-                        }
-                        if resp.clicked() {
-                            settings::set_theme_index(i);
-                        }
-                        resp.on_hover_text(t.name);
-                    }
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(cfg::cur().name)
-                            .size(12.5)
-                            .color(argb(cfg::cur().text_dim)),
-                    );
-                });
-                ui.end_row();
-
                 // 透明度：滑条（拖动时只做即时预览，松手才落盘）
                 let mut alpha = settings::pill_alpha();
                 ui.label(row_label("透明度"));
@@ -755,7 +1208,7 @@ impl SettingsApp {
                     PillAnchor::Island => 1,
                     PillAnchor::Bottom => 2,
                 };
-                if let Some(i) = seg(ui, &["悬浮", "吸顶刘海", "吸底"], shape) {
+                if let Some(i) = seg(ui, &["悬浮胶囊", "吸顶刘海", "吸底"], shape) {
                     settings::set_pill_anchor(match i {
                         1 => PillAnchor::Island,
                         2 => PillAnchor::Bottom,
@@ -796,7 +1249,443 @@ impl SettingsApp {
                     }
                 });
                 ui.end_row();
+
+                ui.label(row_label("时钟格式"));
+                ui.vertical(|ui| {
+                    let r = ui.add_sized(
+                        [CTRL_W, 24.0],
+                        egui::TextEdit::singleline(&mut self.edits.clock),
+                    );
+                    // 失焦才写盘（每键写文件会卡）；预览直接读本地缓冲，打字时照样实时
+                    if r.lost_focus() && self.edits.clock != settings::clock_format() {
+                        settings::set_clock_format(&self.edits.clock);
+                    }
+                    if ver_changed && !r.has_focus() {
+                        self.edits.clock = settings::clock_format();
+                    }
+                    // 占位符对照（对应 clock::format_time 支持的全部占位符）
+                    ui.label(
+                        egui::RichText::new(
+                            "%Y 年   %m 月   %d 日   %H 时   %M 分   %S 秒",
+                        )
+                        .size(10.5)
+                        .weak(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "%y 两位年   %I 12时制   %p 上午/下午   %a %A 周几   %% 百分号",
+                        )
+                        .size(10.5)
+                        .weak(),
+                    );
+                });
+                ui.end_row();
+
+                ui.label(row_label("实时预览"));
+                ui.label(
+                    egui::RichText::new(clock::sample(&self.edits.clock))
+                        .size(13.0)
+                        .color(argb(cfg::cur().accent)),
+                );
+                ui.end_row();
             });
+
+        ui.add_space(10.0);
+        section(ui, "时间与音乐条");
+        egui::Grid::new("g_pill_music")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(row_label("音乐条位置"));
+                let p = match settings::lyric_position() {
+                    LyricPos::Left => 0,
+                    LyricPos::Right => 1,
+                    LyricPos::Bottom => 2,
+                };
+                if let Some(i) = seg(ui, &["左", "右", "下"], p) {
+                    settings::set_lyric_position(match i {
+                        0 => LyricPos::Left,
+                        2 => LyricPos::Bottom,
+                        _ => LyricPos::Right,
+                    });
+                }
+                ui.end_row();
+
+                let size = settings::lyric_size();
+                ui.label(row_label("歌词字号"));
+                if let Some(d) = stepper(ui, &format!("{size:.0}"), size > 10.0, size < 26.0) {
+                    settings::set_lyric_size(size + d as f32);
+                }
+                ui.end_row();
+
+                let lead = settings::lyric_lead();
+                ui.label(row_label("歌词提前量"));
+                if let Some(d) = stepper(
+                    ui,
+                    &format!("{lead:+.1}s"),
+                    lead > -settings::LYRIC_LEAD_MAX + 0.05,
+                    lead < settings::LYRIC_LEAD_MAX - 0.05,
+                ) {
+                    // 0.1 秒一步；负值 = 歌词延后（提前量可以为负）
+                    settings::set_lyric_lead(lead + d as f32 * 0.1);
+                }
+                ui.end_row();
+            });
+        ui.label(
+            egui::RichText::new("歌词字号默认与时间日期字号一致（20）")
+                .size(11.5)
+                .weak(),
+        );
+
+        ui.add_space(10.0);
+        section(ui, "模块排序");
+        self.chips(ui);
+        ui.label(
+            egui::RichText::new("下拉选择位置：胶囊 / 左条 / 右条 / 隐藏；▲▼ 调整顺序")
+                .size(11.5)
+                .weak(),
+        );
+
+        ui.add_space(10.0);
+        section(ui, "天气");
+        egui::Grid::new("g_weather")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                let s = settings::weather_text_scale();
+                ui.label(row_label("字号倍率"));
+                if let Some(d) = stepper(ui, &format!("{s:.2}×"), s > 0.8 + 1e-3, s < 1.8 - 1e-3) {
+                    settings::set_weather_text_scale(s + d as f32 * 0.05);
+                }
+                ui.end_row();
+
+                ui.label(row_label("数据源"));
+                let ws = match settings::weather_source() {
+                    WeatherSource::Amap => 0,
+                    WeatherSource::OpenMeteo => 1,
+                };
+                if let Some(i) = seg(ui, &["高德", "Open-Meteo"], ws) {
+                    settings::set_weather_source(match i {
+                        1 => WeatherSource::OpenMeteo,
+                        _ => WeatherSource::Amap,
+                    });
+                }
+                ui.end_row();
+
+                ui.label(row_label("高德 Key"));
+                let r = ui.add_sized(
+                    [CTRL_W, 24.0],
+                    egui::TextEdit::singleline(&mut self.edits.amap),
+                );
+                if r.lost_focus() && self.edits.amap != settings::amap_key() {
+                    settings::set_amap_key(&self.edits.amap);
+                }
+                if ver_changed && !r.has_focus() {
+                    self.edits.amap = settings::amap_key();
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(10.0);
+        section(ui, "剪切板");
+        egui::Grid::new("g_clip")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(row_label("显示"));
+                let mode = settings::module_mode("clipboard");
+                let idx = match mode {
+                    settings::ModuleMode::Pill => 0,
+                    settings::ModuleMode::BarLeft => 1,
+                    settings::ModuleMode::BarRight => 2,
+                    settings::ModuleMode::Off => 3,
+                };
+                if let Some(i) = seg(ui, &["胶囊", "左条", "右条", "隐藏"], idx) {
+                    let m = match i {
+                        1 => settings::ModuleMode::BarLeft,
+                        2 => settings::ModuleMode::BarRight,
+                        3 => settings::ModuleMode::Off,
+                        _ => settings::ModuleMode::Pill,
+                    };
+                    settings::set_module_mode("clipboard", m);
+                }
+                ui.end_row();
+            });
+        ui.horizontal(|ui| {
+            ui.label(row_label("常驻文字"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.clipboard_pinned)
+                    .hint_text("固定显示在剪切板面板顶部，留空关闭"),
+            );
+            if r.lost_focus() && self.edits.clipboard_pinned != settings::clipboard_pinned_text() {
+                settings::set_clipboard_pinned_text(self.edits.clipboard_pinned.clone());
+                crate::tlog!("[settings] 剪切板常驻文字已更新");
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.clipboard_pinned = settings::clipboard_pinned_text();
+            }
+        });
+
+        ui.add_space(10.0);
+        self.mail_accounts_ui(ui, ver_changed);
+    }
+
+    /// 邮件：多账号管理（添加 / 编辑 / 移除 / 测试连通 / 连通标记持久化）
+    fn mail_accounts_ui(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+        section(ui, "邮件");
+        ui.label(
+            egui::RichText::new("可保存多个邮箱账号同时监听；连通测试通过后会打上 ✓ 标记并记住，不用每次重测")
+                .size(11.5)
+                .weak(),
+        );
+
+        let accounts = settings::mail_accounts();
+        let editing = self.mail_edit;
+
+        if let Some(idx) = editing {
+            // ---- 编辑某个账号 ----
+            // 服务器预设
+            let custom = !MAIL_PRESETS.iter().any(|(_, h, _)| *h == self.edits.host);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (name, host, port) in MAIL_PRESETS {
+                    let sel = self.edits.host == host;
+                    if ui
+                        .add(egui::Button::selectable(
+                            sel,
+                            egui::RichText::new(name).size(12.5).color(if sel {
+                                ink_on(cfg::cur().accent)
+                            } else {
+                                argb(cfg::cur().text_body)
+                            }),
+                        ))
+                        .clicked()
+                    {
+                        self.edits.host = host.to_string();
+                        self.edits.port = port.to_string();
+                    }
+                }
+                if ui
+                    .add(egui::Button::selectable(
+                        custom,
+                        egui::RichText::new("自定义").size(12.5).color(if custom {
+                            ink_on(cfg::cur().accent)
+                        } else {
+                            argb(cfg::cur().text_body)
+                        }),
+                    ))
+                    .clicked()
+                {
+                    if !custom {
+                        self.edits.host.clear();
+                        self.edits.port = cfg::MAIL_PORT.to_string();
+                    }
+                }
+            });
+
+            if custom {
+                egui::Grid::new("g_mail_srv")
+                    .num_columns(2)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label(row_label("服务器"));
+                        let r = ui.add_sized(
+                            [CTRL_W, 24.0],
+                            egui::TextEdit::singleline(&mut self.edits.host)
+                                .hint_text("imap.example.com"),
+                        );
+                        if r.lost_focus() {
+                            self.edits.port = self
+                                .edits
+                                .port
+                                .trim()
+                                .parse::<u16>()
+                                .map(|_| self.edits.port.clone())
+                                .unwrap_or(cfg::MAIL_PORT.to_string());
+                        }
+                        ui.end_row();
+
+                        ui.label(row_label("端口"));
+                        ui.add_sized([CTRL_W, 24.0], egui::TextEdit::singleline(&mut self.edits.port));
+                        ui.end_row();
+                    });
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}:{}（IMAPS，SSL 加密）",
+                        self.edits.host, self.edits.port
+                    ))
+                    .size(12.0)
+                    .weak(),
+                );
+            }
+
+            ui.add_space(4.0);
+            egui::Grid::new("g_mail_acc")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(row_label("账号"));
+                    ui.add_sized([CTRL_W, 24.0], egui::TextEdit::singleline(&mut self.edits.user));
+                    ui.end_row();
+
+                    ui.label(row_label("授权码"));
+                    ui.add_sized(
+                        [CTRL_W, 24.0],
+                        egui::TextEdit::singleline(&mut self.edits.pass).password(true),
+                    );
+                    ui.end_row();
+                });
+
+            ui.add_space(8.0);
+            let port: u16 = self.edits.port.trim().parse().unwrap_or(cfg::MAIL_PORT);
+            let st = self
+                .test
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or(TestState::Idle);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new("保存").small()).clicked() {
+                    let mut list = settings::mail_accounts();
+                    let new_acc = settings::MailAccount {
+                        host: self.edits.host.trim().to_string(),
+                        port,
+                        user: self.edits.user.trim().to_string(),
+                        pass: self.edits.pass.clone(),
+                    };
+                    if idx < list.len() {
+                        list[idx] = new_acc;
+                    } else {
+                        list.push(new_acc);
+                    }
+                    settings::set_mail_accounts(list);
+                    self.mail_edit = None;
+                    crate::tlog!("[settings] 邮箱账号已保存：{}", self.edits.user);
+                }
+                if ui.add(egui::Button::new("取消").small()).clicked() {
+                    self.mail_edit = None;
+                }
+                let (h, u, w) =
+                    (self.edits.host.clone(), self.edits.user.clone(), self.edits.pass.clone());
+                let running = matches!(st, TestState::Running);
+                if ui.add_enabled(!running, egui::Button::new("测试连通").small()).clicked() {
+                    if h.is_empty() || u.is_empty() || w.is_empty() {
+                        if let Ok(mut s) = self.test.lock() {
+                            *s = TestState::Fail("请先填写服务器、账号和授权码".into());
+                        }
+                    } else {
+                        if let Ok(mut s) = self.test.lock() {
+                            *s = TestState::Running;
+                        }
+                        let shared = self.test.clone();
+                        // IMAP 登录是秒级网络 I/O，放后台线程，UI 只轮询结果
+                        let acc = settings::MailAccount {
+                            host: h,
+                            port,
+                            user: u,
+                            pass: w,
+                        };
+                        std::thread::spawn(move || {
+                            let ident = acc.ident();
+                            let res = crate::mail::test_account(&(acc.host.clone(), acc.port, acc.user.clone(), acc.pass.clone()));
+                            let ok = res.is_ok();
+                            // 连通成功就打上 ✓ 标记并持久化，下次不用重测
+                            settings::set_mail_verified(&ident, ok);
+                            if let Ok(mut s) = shared.lock() {
+                                *s = match res {
+                                    Ok(_) => TestState::Ok("连接成功，已标记为已连通".to_string()),
+                                    Err(e) => TestState::Fail(e),
+                                };
+                            }
+                        });
+                    }
+                }
+                match &st {
+                    TestState::Idle => {}
+                    TestState::Running => {
+                        ui.label(egui::RichText::new("测试中…").size(12.5).weak());
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(300));
+                    }
+                    TestState::Ok(msg) => {
+                        ui.label(egui::RichText::new(format!("✓ {msg}")).size(12.5).color(egui::Color32::from_rgb(0x6E, 0xC2, 0x7A)));
+                    }
+                    TestState::Fail(msg) => {
+                        ui.label(egui::RichText::new(format!("✗ {msg}")).size(12.5).color(egui::Color32::from_rgb(0xE0, 0x6C, 0x6C)));
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new("提示：QQ/163 等邮箱需在网页版邮箱设置里开启 IMAP，并用「授权码」而非登录密码。")
+                    .size(11.5)
+                    .weak(),
+            );
+        } else {
+            // ---- 账号列表 ----
+            if accounts.is_empty() {
+                ui.label(
+                    egui::RichText::new("还没有邮箱账号，点「添加账号」开始")
+                        .size(11.5)
+                        .weak(),
+                );
+            }
+            for (i, a) in accounts.iter().enumerate() {
+                let verified = settings::is_mail_verified(&a.ident());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(egui::RichText::new(format!("{}. {}", i + 1, a.user)).size(12.5));
+                    ui.label(
+                        egui::RichText::new(format!("{}:{}", a.host, a.port))
+                            .size(11.0)
+                            .color(argb(cfg::cur().text_dim)),
+                    );
+                    ui.label(
+                        egui::RichText::new(if verified { "✓ 已连通" } else { "未验证" })
+                            .size(11.5)
+                            .color(if verified {
+                                argb(0xFF_2F_C6_6F)
+                            } else {
+                                argb(cfg::cur().text_dim)
+                            }),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new("移除").small()).clicked() {
+                            let mut list = settings::mail_accounts();
+                            let ident = list[i].ident();
+                            list.remove(i);
+                            settings::set_mail_accounts(list);
+                            settings::set_mail_verified(&ident, false);
+                        }
+                        if ui.add(egui::Button::new("编辑").small()).clicked() {
+                            self.edits.host = a.host.clone();
+                            self.edits.port = a.port.to_string();
+                            self.edits.user = a.user.clone();
+                            self.edits.pass = a.pass.clone();
+                            if let Ok(mut s) = self.test.lock() {
+                                *s = TestState::Idle;
+                            }
+                            self.mail_edit = Some(i);
+                        }
+                    });
+                });
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new("添加账号").small()).clicked() {
+                    self.edits.host = MAIL_PRESETS[0].1.to_string();
+                    self.edits.port = MAIL_PRESETS[0].2.to_string();
+                    self.edits.user.clear();
+                    self.edits.pass.clear();
+                    if let Ok(mut s) = self.test.lock() {
+                        *s = TestState::Idle;
+                    }
+                    self.mail_edit = Some(accounts.len());
+                }
+            });
+        }
+        let _ = (accounts.len(), ver_changed);
     }
 
     fn detail_dock(&mut self, ui: &mut egui::Ui) {
@@ -822,6 +1711,28 @@ impl SettingsApp {
                 }
                 ui.end_row();
 
+                // Dock 独立透明度（与顶部胶囊分开）
+                let mut alpha = settings::dock_alpha();
+                ui.label(row_label("透明度"));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.spacing_mut().slider_width = CTRL_W - 116.0;
+                    let r = ui.add(
+                        egui::Slider::new(&mut alpha, settings::ALPHA_MIN..=settings::ALPHA_MAX)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        settings::set_dock_alpha(alpha);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}%", settings::dock_alpha() * 100.0))
+                            .size(12.5)
+                            .monospace(),
+                    );
+                });
+                ui.end_row();
+
                 ui.label(row_label("图标大小"));
                 scale_row(
                     ui,
@@ -835,10 +1746,70 @@ impl SettingsApp {
                 ui.end_row();
             });
         ui.label(
-            egui::RichText::new("图标大小会连同 Dock 高度、槽位和托盘图标等比缩放；点「重置」回到默认尺寸。")
+            egui::RichText::new("图标大小会连同 Dock 高度、槽位和托盘图标等比缩放；点「重置」回到默认尺寸。圆角在「顶部胶囊 → 圆角」里统一调整。")
                 .size(11.5)
                 .weak(),
         );
+
+        ui.add_space(10.0);
+        section(ui, "托盘图标");
+        ui.label(
+            egui::RichText::new("点一下切换显示 / 隐藏；被隐藏的托盘图标会转发给系统托盘")
+                .size(11.5)
+                .weak(),
+        );
+        let mut entries: Vec<(String, String)> = vec![(DESKTOP_KEY.to_string(), "返回桌面".into())];
+        entries.extend(tray_entries());
+        let cell_w = (ui.available_width() - 10.0).min(300.0) / 2.0;
+        for chunk in entries.chunks(2) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                for (key, name) in chunk {
+                    let on = if key == DESKTOP_KEY {
+                        settings::show_desktop_btn()
+                    } else {
+                        !settings::tray_hidden(key)
+                    };
+                    let fill = if on {
+                        argb(0x66_3C_8D_FF)
+                    } else {
+                        argb(0x33_FF_FF_FF)
+                    };
+                    let txt =
+                        egui::RichText::new(name.as_str()).size(12.0).color(if on {
+                            egui::Color32::WHITE
+                        } else {
+                            argb(0x8C_FF_FF_FF)
+                        });
+                    if ui
+                        .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(cell_w, 24.0)))
+                        .clicked()
+                    {
+                        if key == DESKTOP_KEY {
+                            settings::set_show_desktop_btn(!settings::show_desktop_btn());
+                            crate::tlog!(
+                                "[settings] 返回桌面细长条 → {}",
+                                if settings::show_desktop_btn() { "显示" } else { "隐藏" }
+                            );
+                        } else {
+                            let now_hidden = !settings::tray_hidden(key);
+                            settings::set_tray_hidden(key, now_hidden);
+                            crate::tlog!(
+                                "[settings] 托盘图标 {key} → {}",
+                                if now_hidden { "隐藏" } else { "显示" }
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        if !settings::hidden_tray().is_empty() {
+            ui.add_space(6.0);
+            if ui.add(egui::Button::new("恢复全部显示").small()).clicked() {
+                settings::clear_hidden_tray();
+                crate::tlog!("[settings] 托盘隐藏列表清空");
+            }
+        }
 
         ui.add_space(10.0);
         self.pins(ui);
@@ -974,487 +1945,6 @@ impl SettingsApp {
         }
     }
 
-    fn detail_music(&mut self, ui: &mut egui::Ui) {
-        section(ui, "音乐条");
-        egui::Grid::new("g_lyric")
-            .num_columns(2)
-            .spacing([10.0, 8.0])
-            .show(ui, |ui| {
-                ui.label(row_label("位置"));
-                let p = match settings::lyric_position() {
-                    LyricPos::Left => 0,
-                    LyricPos::Right => 1,
-                    LyricPos::Bottom => 2,
-                };
-                if let Some(i) = seg(ui, &["左", "右", "下"], p) {
-                    settings::set_lyric_position(match i {
-                        0 => LyricPos::Left,
-                        2 => LyricPos::Bottom,
-                        _ => LyricPos::Right,
-                    });
-                }
-                ui.end_row();
-
-                let size = settings::lyric_size();
-                ui.label(row_label("歌词字号"));
-                if let Some(d) = stepper(ui, &format!("{size:.0}"), size > 10.0, size < 26.0) {
-                    settings::set_lyric_size(size + d as f32);
-                }
-                ui.end_row();
-
-                let lead = settings::lyric_lead();
-                ui.label(row_label("提前量"));
-                if let Some(d) = stepper(
-                    ui,
-                    &format!("{lead:+.1}s"),
-                    lead > -settings::LYRIC_LEAD_MAX + 0.05,
-                    lead < settings::LYRIC_LEAD_MAX - 0.05,
-                ) {
-                    // 0.1 秒一步；负值 = 歌词延后（提前量可以为负）
-                    settings::set_lyric_lead(lead + d as f32 * 0.1);
-                }
-                ui.end_row();
-            });
-    }
-
-    fn detail_weather(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
-        section(ui, "天气");
-        egui::Grid::new("g_weather")
-            .num_columns(2)
-            .spacing([10.0, 8.0])
-            .show(ui, |ui| {
-                let s = settings::weather_text_scale();
-                ui.label(row_label("字号倍率"));
-                if let Some(d) = stepper(ui, &format!("{s:.2}×"), s > 0.8 + 1e-3, s < 1.8 - 1e-3) {
-                    settings::set_weather_text_scale(s + d as f32 * 0.05);
-                }
-                ui.end_row();
-
-                ui.label(row_label("数据源"));
-                let ws = match settings::weather_source() {
-                    WeatherSource::Amap => 0,
-                    WeatherSource::OpenMeteo => 1,
-                };
-                if let Some(i) = seg(ui, &["高德", "Open-Meteo"], ws) {
-                    settings::set_weather_source(match i {
-                        1 => WeatherSource::OpenMeteo,
-                        _ => WeatherSource::Amap,
-                    });
-                }
-                ui.end_row();
-
-                ui.label(row_label("高德 Key"));
-                let r = ui.add_sized(
-                    [CTRL_W, 24.0],
-                    egui::TextEdit::singleline(&mut self.edits.amap),
-                );
-                if r.lost_focus() && self.edits.amap != settings::amap_key() {
-                    settings::set_amap_key(&self.edits.amap);
-                }
-                if ver_changed && !r.has_focus() {
-                    self.edits.amap = settings::amap_key();
-                }
-                ui.end_row();
-            });
-    }
-
-    fn detail_mail(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
-        section(ui, "服务器");
-        // 当前 host 命中预设就不显示 host/port 编辑框，只需填账号
-        let custom = !MAIL_PRESETS.iter().any(|(_, h, _)| *h == self.edits.host);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            for (name, host, port) in MAIL_PRESETS {
-                let sel = self.edits.host == host;
-                if ui
-                    .add(egui::Button::selectable(
-                        sel,
-                        egui::RichText::new(name).size(12.5).color(if sel {
-                            ink_on(cfg::cur().accent)
-                        } else {
-                            argb(cfg::cur().text_body)
-                        }),
-                    ))
-                    .clicked()
-                {
-                    self.edits.host = host.to_string();
-                    self.edits.port = port.to_string();
-                    self.commit_mail();
-                }
-            }
-            if ui
-                .add(egui::Button::selectable(
-                    custom,
-                    egui::RichText::new("自定义").size(12.5).color(if custom {
-                        ink_on(cfg::cur().accent)
-                    } else {
-                        argb(cfg::cur().text_body)
-                    }),
-                ))
-                .clicked()
-            {
-                // 切到"自定义"只展开编辑框，不改当前值
-                if !custom {
-                    self.edits.host.clear();
-                    self.edits.port = cfg::MAIL_PORT.to_string();
-                    self.commit_mail();
-                }
-            }
-        });
-
-        if custom {
-            egui::Grid::new("g_mail_srv")
-                .num_columns(2)
-                .spacing([10.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label(row_label("服务器"));
-                    let r = ui.add_sized(
-                        [CTRL_W, 24.0],
-                        egui::TextEdit::singleline(&mut self.edits.host).hint_text("imap.example.com"),
-                    );
-                    if r.lost_focus() {
-                        self.commit_mail();
-                    }
-                    ui.end_row();
-
-                    ui.label(row_label("端口"));
-                    let r = ui.add_sized(
-                        [CTRL_W, 24.0],
-                        egui::TextEdit::singleline(&mut self.edits.port),
-                    );
-                    if r.lost_focus() {
-                        self.commit_mail();
-                    }
-                    ui.end_row();
-                });
-        } else {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{}:{}（IMAPS，SSL 加密）",
-                    self.edits.host, self.edits.port
-                ))
-                .size(12.0)
-                .weak(),
-            );
-        }
-
-        ui.add_space(4.0);
-        section(ui, "账户");
-        egui::Grid::new("g_mail_acc")
-            .num_columns(2)
-            .spacing([10.0, 8.0])
-            .show(ui, |ui| {
-                ui.label(row_label("账号"));
-                let r = ui.add_sized(
-                    [CTRL_W, 24.0],
-                    egui::TextEdit::singleline(&mut self.edits.user),
-                );
-                if r.lost_focus() {
-                    self.commit_mail();
-                }
-                if ver_changed && !r.has_focus() {
-                    self.edits.user = settings::mail_overrides().2.unwrap_or_default();
-                }
-                ui.end_row();
-
-                ui.label(row_label("授权码"));
-                let r = ui.add_sized(
-                    [CTRL_W, 24.0],
-                    egui::TextEdit::singleline(&mut self.edits.pass).password(true),
-                );
-                if r.lost_focus() {
-                    self.commit_mail();
-                }
-                if ver_changed && !r.has_focus() {
-                    self.edits.pass = settings::mail_overrides().3.unwrap_or_default();
-                }
-                ui.end_row();
-            });
-
-        ui.add_space(8.0);
-        let port: u16 = self.edits.port.trim().parse().unwrap_or(cfg::MAIL_PORT);
-        let st = self
-            .test
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or(TestState::Idle);
-        ui.horizontal(|ui| {
-            let running = matches!(st, TestState::Running);
-            if ui.add_enabled(!running, egui::Button::new("测试连通")).clicked() {
-                let (h, u, w) =
-                    (self.edits.host.clone(), self.edits.user.clone(), self.edits.pass.clone());
-                if h.is_empty() || u.is_empty() || w.is_empty() {
-                    if let Ok(mut s) = self.test.lock() {
-                        *s = TestState::Fail("请先填写服务器、账号和授权码".into());
-                    }
-                } else {
-                    if let Ok(mut s) = self.test.lock() {
-                        *s = TestState::Running;
-                    }
-                    let shared = self.test.clone();
-                    // IMAP 登录是秒级网络 I/O，放后台线程，UI 只轮询结果
-                    std::thread::spawn(move || {
-                        let res = crate::mail::test_account(&(h, port, u, w))
-                            .map(|_| "连接成功，账号密码有效".to_string());
-                        if let Ok(mut s) = shared.lock() {
-                            *s = match res {
-                                Ok(msg) => TestState::Ok(msg),
-                                Err(e) => TestState::Fail(e),
-                            };
-                        }
-                    });
-                }
-            }
-            match &st {
-                TestState::Idle => {}
-                TestState::Running => {
-                    ui.label(egui::RichText::new("测试中…").size(12.5).weak());
-                    ui.ctx()
-                        .request_repaint_after(std::time::Duration::from_millis(300));
-                }
-                TestState::Ok(msg) => {
-                    ui.label(egui::RichText::new(format!("✓ {msg}")).size(12.5).color(egui::Color32::from_rgb(0x6E, 0xC2, 0x7A)));
-                }
-                TestState::Fail(msg) => {
-                    ui.label(egui::RichText::new(format!("✗ {msg}")).size(12.5).color(egui::Color32::from_rgb(0xE0, 0x6C, 0x6C)));
-                }
-            }
-        });
-        ui.label(
-            egui::RichText::new("提示：QQ/163 等邮箱需在网页版邮箱设置里开启 IMAP，并用「授权码」而非登录密码。")
-                .size(11.5)
-                .weak(),
-        );
-    }
-
-    fn detail_modules(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
-        section(ui, "界面字体");
-        if let Some(pick) = seg(
-            ui,
-            &["MiSans", "系统字体"],
-            if settings::use_misans() { 0 } else { 1 },
-        ) {
-            settings::set_use_misans(pick == 0);
-            crate::tlog!("[settings] 界面字体 → {}", if settings::use_misans() { "MiSans" } else { "系统字体" });
-        }
-        ui.label(
-            egui::RichText::new("MiSans 随程序目录分发（data/MiSans-Semibold.ttf，缺失时回落系统字体）；系统字体 = 微软雅黑等本机字体")
-                .size(11.5)
-                .weak(),
-        );
-
-        ui.add_space(10.0);
-        section(ui, "顶部胶囊模块");
-        self.chips(ui);
-        ui.label(
-            egui::RichText::new("下拉选择位置：胶囊 / 左条 / 右条 / 隐藏；▲▼ 调整顺序。邮件仅在新邮件/验证码时出现，无新邮件自动隐藏")
-                .size(11.5)
-                .weak(),
-        );
-
-        ui.add_space(10.0);
-        section(ui, "微信消息卡片");
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            let on = settings::wechat_cards();
-            let fill = if on {
-                argb(0x66_3C_8D_FF)
-            } else {
-                argb(0x33_FF_FF_FF)
-            };
-            let txt = egui::RichText::new(if on { "已开启" } else { "已关闭" })
-                .size(12.0)
-                .color(if on { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) });
-            if ui
-                .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(76.0, 24.0)))
-                .clicked()
-            {
-                settings::set_wechat_cards(!on);
-                crate::tlog!(
-                    "[settings] 微信消息卡片 → {}",
-                    if settings::wechat_cards() { "开启" } else { "关闭" }
-                );
-            }
-            ui.label(
-                egui::RichText::new("新消息在屏幕右下角弹会话名+摘要小卡片（只读微信界面）")
-                    .size(11.5)
-                    .weak(),
-            );
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(row_label("不弹白名单"));
-            let r = ui.add_sized(
-                [CTRL_W, 24.0],
-                egui::TextEdit::singleline(&mut self.edits.wechat_ignore)
-                    .hint_text("可添加多个：标题之间用分号 ; 分隔"),
-            );
-            if r.lost_focus() {
-                let list: Vec<String> = self
-                    .edits
-                    .wechat_ignore
-                    .split(';')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                settings::set_wechat_ignore(list);
-                self.edits.wechat_ignore = settings::wechat_ignore_text();
-                crate::tlog!("[settings] 微信卡片白名单 → {}", settings::wechat_ignore_text());
-            }
-            if ver_changed && !r.has_focus() {
-                self.edits.wechat_ignore = settings::wechat_ignore_text();
-            }
-        });
-        ui.label(
-            egui::RichText::new(
-                "可添加多个标题（分号分隔，完全匹配才跳过）；被跳过的标题会写进 orbit.log",
-            )
-            .size(11.5)
-            .weak(),
-        );
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(row_label("横幅秒数"));
-            let r = ui.add_sized(
-                [CTRL_W, 24.0],
-                egui::TextEdit::singleline(&mut self.edits.banner_secs).hint_text("6"),
-            );
-            // 逐键提交：设置窗失活会直接收起，文本框来不及触发 lost_focus，
-            // 只靠 lost_focus 提交会出现「改完又变回默认」
-            if r.changed() {
-                if let Ok(v) = self.edits.banner_secs.trim().parse::<u32>() {
-                    settings::set_banner_secs(v);
-                }
-            }
-            if r.lost_focus() {
-                let v: u32 = self.edits.banner_secs.trim().parse().unwrap_or(6);
-                settings::set_banner_secs(v);
-                self.edits.banner_secs = settings::banner_secs().to_string();
-                crate::tlog!("[settings] 横幅秒数 → {}", settings::banner_secs());
-            }
-            if ver_changed && !r.has_focus() {
-                self.edits.banner_secs = settings::banner_secs().to_string();
-            }
-        });
-        ui.label(
-            egui::RichText::new("每条横幅自动关闭的秒数；0 = 不自动关闭，点一下才收起")
-                .size(11.5)
-                .weak(),
-        );
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("手动拿 UIA").size(12.0))
-                        .min_size(egui::vec2(96.0, 24.0)),
-                )
-                .clicked()
-            {
-                crate::banner::request_grab();
-                crate::tlog!("[settings] 手动拿 UIA 已点击");
-            }
-            ui.label(
-                egui::RichText::new("先唤出微信窗口（支持多开）再点；拿到后右下角提示一次")
-                    .size(11.5)
-                    .weak(),
-            );
-        });
-
-        // 多开状态：每个微信实例是否已拿到 UIA 会话数据（按进程创建时间排序，
-        // 先开的在前，与 Dock 托盘里多开图标的顺序一致）
-        let insts = crate::wechatmsg::instances();
-        if !insts.is_empty() {
-            ui.add_space(6.0);
-            for (label, got) in &insts {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.label(egui::RichText::new(label.as_str()).size(12.0));
-                    ui.label(
-                        egui::RichText::new(if *got { "已拿到" } else { "未拿到" })
-                            .size(12.0)
-                            .color(if *got {
-                                argb(0xFF_2F_C6_6F)
-                            } else {
-                                argb(cfg::cur().text_dim)
-                            }),
-                    );
-                });
-            }
-            if insts.iter().any(|(_, g)| !*g) {
-                ui.label(
-                    egui::RichText::new("未拿到的实例：先显示一次它的主窗口，再点上面的按钮")
-                        .size(11.0)
-                        .weak(),
-                );
-            }
-        }
-
-        ui.add_space(10.0);
-        section(ui, "托盘图标");
-        let mut entries: Vec<(String, String)> = vec![(DESKTOP_KEY.to_string(), "返回桌面".into())];
-        entries.extend(tray_entries());
-        let cell_w = (ui.available_width() - 10.0).min(300.0) / 2.0;
-        for chunk in entries.chunks(2) {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                for (key, name) in chunk {
-                    let on = if key == DESKTOP_KEY {
-                        settings::show_desktop_btn()
-                    } else {
-                        !settings::tray_hidden(key)
-                    };
-                    let fill = if on {
-                        argb(0x66_3C_8D_FF)
-                    } else {
-                        argb(0x33_FF_FF_FF)
-                    };
-                    let txt =
-                        egui::RichText::new(name.as_str()).size(12.0).color(if on {
-                            egui::Color32::WHITE
-                        } else {
-                            argb(0x8C_FF_FF_FF)
-                        });
-                    if ui
-                        .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(cell_w, 24.0)))
-                        .clicked()
-                    {
-                        if key == DESKTOP_KEY {
-                            settings::set_show_desktop_btn(!settings::show_desktop_btn());
-                            crate::tlog!(
-                                "[settings] 返回桌面细长条 → {}",
-                                if settings::show_desktop_btn() { "显示" } else { "隐藏" }
-                            );
-                        } else {
-                            let now_hidden = !settings::tray_hidden(key);
-                            settings::set_tray_hidden(key, now_hidden);
-                            crate::tlog!(
-                                "[settings] 托盘图标 {key} → {}",
-                                if now_hidden { "隐藏" } else { "显示" }
-                            );
-                        }
-                    }
-                }
-            });
-        }
-        if !settings::hidden_tray().is_empty() {
-            ui.add_space(6.0);
-            if ui.add(egui::Button::new("恢复全部显示").small()).clicked() {
-                settings::clear_hidden_tray();
-                crate::tlog!("[settings] 托盘隐藏列表清空");
-            }
-        }
-    }
-
-    /// 邮箱字段：任一变化都按"当前值组合"整体提交（对齐旧版 commit_edit）
-    fn commit_mail(&mut self) {
-        let port: u16 = self.edits.port.trim().parse().unwrap_or(cfg::MAIL_PORT);
-        settings::set_mail_account(
-            &self.edits.host.clone(),
-            port,
-            &self.edits.user.clone(),
-            &self.edits.pass.clone(),
-        );
-    }
 
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
@@ -1468,6 +1958,8 @@ impl SettingsApp {
                     if ui.add(egui::Button::new("还原").small()).clicked() {
                         settings::discard_edit();
                         self.load_edits();
+                        crate::appmsg::notify_applied();
+                        post_to_parent(crate::appmsg::WM_SETTINGS_APPLIED);
                         crate::tlog!("[settings] 已还原未应用的改动");
                     }
                 });
@@ -1485,6 +1977,8 @@ impl SettingsApp {
                     .clicked()
                 {
                     settings::commit_edit();
+                    // 主进程（胶囊/Dock/天气卡片）收到就立刻重绘，不用等 500ms 轮询
+                    post_to_parent(crate::appmsg::WM_SETTINGS_APPLIED);
                     crate::tlog!("[settings] 已应用改动");
                 }
             });
@@ -1617,6 +2111,16 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
     p.line_segment([c + egui::vec2(-s, -s), c + egui::vec2(s, s)], stroke);
     p.line_segment([c + egui::vec2(s, -s), c + egui::vec2(-s, s)], stroke);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 开/关按钮：返回 true 表示这次点击把它切成了另一个状态
+fn toggle_btn(ui: &mut egui::Ui, on: bool, label: &str) -> bool {
+    let fill = if on { argb(0x66_3C_8D_FF) } else { argb(0x33_FF_FF_FF) };
+    let txt = egui::RichText::new(if on { "已开启" } else { "已关闭" })
+        .size(12.0)
+        .color(if on { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) });
+    let r = ui.add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(76.0, 24.0)));
+    r.clicked() && { let _ = label; true }
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -1811,6 +2315,10 @@ fn module_label(name: &str) -> &'static str {
 
 /// 当前注册着的托盘图标（(稳定键, 显示名)），顺序与 Dock 上一致。
 fn tray_entries() -> Vec<(String, String)> {
+    // 子进程拿不到主进程的托盘表，用启动时读到的快照
+    if let Some(s) = runtime_snap() {
+        return s.tray;
+    }
     use crate::tray::icon_key;
     let Some(tab) = crate::trayhost::table() else { return Vec::new() };
     let icons = match tab.lock() {

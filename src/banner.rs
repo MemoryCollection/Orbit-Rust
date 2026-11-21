@@ -64,6 +64,9 @@ pub struct BannerNotice {
     /// 托盘闪烁来源标记（Dock 的图标 key）：闪烁触发的横幅带着它，
     /// 图标不闪了整条随之收起；普通横幅为 None
     pub flash_key: Option<String>,
+    /// 消息来源：wechat / mail / tray / clipboard / other。
+    /// 用于按来源选通知通道（Orbit 横幅 / Windows 通知 / 关）和横幅时长。
+    pub source: &'static str,
 }
 
 impl BannerNotice {
@@ -78,10 +81,17 @@ impl BannerNotice {
             pid: 0,
             secs: None,
             flash_key: None,
+            source: "other",
         }
     }
 
-    /// 覆盖这条横幅的停留秒数（0 = 常驻不自动关；缺省用全局「横幅秒数」）
+    /// 指定消息来源（用于按来源选通知通道与横幅时长）
+    pub fn from_source(mut self, source: &'static str) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// 覆盖这条横幅的停留秒数（0 = 常驻不自动关；缺省用该来源的「横幅秒数」）
     pub fn with_secs(mut self, secs: u32) -> Self {
         self.secs = Some(secs);
         self
@@ -98,6 +108,7 @@ impl BannerNotice {
             pid,
             secs: None,
             flash_key: None,
+            source: "wechat",
         }
     }
 }
@@ -196,8 +207,31 @@ fn hwnd() -> HWND {
     HWND(BANNER_HWND.load(Ordering::Relaxed) as *mut _)
 }
 
-/// 任意线程调用：弹一条右下角横幅（每次弹出都会播提示音）
+/// 任意线程调用：按来源的通知通道分发——Windows 通知转给系统，Off 丢弃，
+/// Orbit 横幅继续走自绘。每次弹出按 sound_mode 播提示音。
 pub fn show(notice: BannerNotice) {
+    use crate::settings::NotifyChannel;
+    match settings::notify_channel_for(notice.source) {
+        NotifyChannel::Off => return,
+        NotifyChannel::Windows => {
+            let title = if notice.badge.is_empty() {
+                notice.tag.clone()
+            } else {
+                format!("{} · {}", notice.tag, notice.badge)
+            };
+            let body = if notice.sub.is_empty() {
+                notice.main.clone()
+            } else {
+                format!("{}\n{}", notice.main, notice.sub)
+            };
+            crate::wintoast::show(&title, &body);
+            if !notice.silent {
+                crate::notify::play_banner();
+            }
+            return;
+        }
+        NotifyChannel::Orbit => {}
+    }
     let h = hwnd();
     let raw = Box::into_raw(Box::new(notice));
     unsafe {
@@ -270,6 +304,7 @@ pub fn on_flash_card(key: &str, at: Instant, pid: u32, name: &str) {
     let account = if name.is_empty() { "微信" } else { name };
     let mut notice = BannerNotice::wechat(account, "有新消息", 0, pid);
     notice.flash_key = Some(key.to_string());
+    notice.source = "tray"; // 托盘图标监管触发的兜底横幅，走托盘通知通道
     notice.secs = Some(0); // 常驻，随闪烁停止收起（flash_tick）
     // UIA 关着（默认模式）：Dock 侧按闪烁逐次播放提示音，横幅静音避免响两遍；
     // UIA 开着（兜底场景，实例不可读）：没有其它声音来源，横幅自己按 wechat_sound 响
@@ -358,8 +393,10 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                         }
                     }
                     // 新横幅追加到队尾（屏幕下方），旧的留在上面，不替换当前显示内容。
-                    // 停留秒数：模块自己给的优先，否则用全局「横幅秒数」
-                    let secs = notice.secs.unwrap_or(settings::banner_secs());
+                    // 停留秒数：模块自己给的优先，否则用该来源的「横幅秒数」（0 = 常驻）
+                    let secs = notice
+                        .secs
+                        .unwrap_or_else(|| settings::banner_secs_for(notice.source));
                     c.cards.push_back(Card {
                         notice: *notice,
                         at: Instant::now(),
@@ -388,6 +425,8 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                         c.hovered = false;
                         if c.cards.is_empty() {
                             let _ = ShowWindow(h, SW_HIDE);
+                            // "直到消息消失"提示音：横幅全没了就停
+                            crate::notify::stop_until_dismiss();
                         } else {
                             c.place(h);
                             c.render(h);
@@ -422,6 +461,8 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                         c.hovered = false;
                         if c.cards.is_empty() {
                             let _ = ShowWindow(h, SW_HIDE);
+                            // "直到消息消失"提示音：横幅全没了就停
+                            crate::notify::stop_until_dismiss();
                         } else {
                             c.place(h);
                             c.render(h);

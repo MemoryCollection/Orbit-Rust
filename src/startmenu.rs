@@ -73,10 +73,11 @@ const PAD: f32 = 16.0;
 const TILE: f32 = 88.0;
 /// 格子间距
 const TILE_GAP: f32 = 12.0;
-/// 一行几个
-const COLS: usize = 4;
-/// 最多显示几个（两行）
-const MAX_TILES: usize = 8;
+/// 最多显示行数（每行数量 × 2）
+const MAX_ROWS: usize = 2;
+fn max_tiles() -> usize {
+    crate::settings::start_cols().clamp(1, 8) * MAX_ROWS
+}
 /// 上栏与下栏之间的间隔（含分隔线）
 const GRID_BAR_GAP: f32 = 12.0;
 /// 下栏按钮条高度
@@ -269,7 +270,8 @@ unsafe extern "system" fn key_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                         let bare = was != 0 && !WIN_COMBO.load(Ordering::Relaxed);
                         // 先放行：抬起事件必须真实送达，修饰位才能正常复位
                         let ret = CallNextHookEx(None, code, w, l);
-                        if bare {
+                        // Win 键接管关闭时：不吞、不弹，完全交给系统开始菜单
+                        if bare && crate::settings::start_hook() {
                             send_dummy_key();
                             let _ = PostMessageW(hwnd(), WM_START_TOGGLE, WPARAM(0), LPARAM(0));
                         }
@@ -506,18 +508,28 @@ fn open_windows_settings() {
 
 /// 启动一个快捷方式（exe / .lnk 都交给 ShellExecuteW）
 fn launch(target: &str) {
-    let mut file: Vec<u16> = target.encode_utf16().collect();
+    // `@admin:` 前缀 = 以管理员权限启动（ShellExecute 的 runas 动词，会弹 UAC）
+    let (verb, path) = match target.strip_prefix("@admin:") {
+        Some(p) => (w!("runas"), p),
+        None => (w!("open"), target),
+    };
+    let mut file: Vec<u16> = path.encode_utf16().collect();
     file.push(0);
     unsafe {
         let _ = windows::Win32::UI::Shell::ShellExecuteW(
             HWND::default(),
-            w!("open"),
+            verb,
             PCWSTR(file.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
     }
+}
+
+/// 取图标用的真实路径（剥离 @admin: 前缀）
+fn icon_path(target: &str) -> &str {
+    target.strip_prefix("@admin:").unwrap_or(target)
 }
 
 impl Menu {
@@ -528,12 +540,12 @@ impl Menu {
     /// 打开时刷新数据：重读快捷方式列表，缺图标的补上
     fn reload(&mut self) {
         let mut pins = crate::settings::start_pins();
-        pins.truncate(MAX_TILES);
+        pins.truncate(max_tiles());
         for (_, target) in &pins {
             if self.icons.contains_key(target) {
                 continue;
             }
-            let rgba = crate::dock::large_icon_of_path(std::path::Path::new(target), 64);
+            let rgba = crate::dock::large_icon_of_path(std::path::Path::new(icon_path(target)), 64);
             if !rgba.is_empty() {
                 self.icons.insert(target.clone(), rgba);
             }
@@ -546,17 +558,23 @@ impl Menu {
 
     /// 计算逻辑布局（格子 / 按钮 / 窗口逻辑高度）
     fn layout(&mut self) {
-        let n = self.pins.len();
-        let rows = ((n + COLS - 1) / COLS).max(1);
-        let grid_h = (rows as f32) * TILE + (rows.saturating_sub(1)) as f32 * TILE_GAP;
+        let cols = crate::settings::start_cols().max(1);
+        // 每行数量可配：tile 宽度按菜单宽度均分，高度随宽度等比缩放，
+        // 保证列数变了也能整齐铺满、窗口宽度不变（点击命中用同一组 tiles）
+        let tile_w = ((MENU_W - PAD * 2.0 - (cols as f32 - 1.0) * TILE_GAP) / cols as f32)
+            .max(48.0);
+        let tile_h = tile_w; // 保持正方形格子
+        let n = self.pins.len().min(max_tiles());
+        let rows = ((n + cols - 1) / cols).max(1);
+        let grid_h = (rows as f32) * tile_h + (rows.saturating_sub(1)) as f32 * TILE_GAP;
         self.menu_h = PAD + grid_h + GRID_BAR_GAP + 1.0 + GRID_BAR_GAP + BAR_H;
 
         let mut tiles = Vec::new();
         for (i, _) in self.pins.iter().enumerate() {
-            let (col, row) = (i % COLS, i / COLS);
-            let x = PAD + col as f32 * (TILE + TILE_GAP);
-            let y = PAD + row as f32 * (TILE + TILE_GAP);
-            tiles.push([x, y, TILE, TILE]);
+            let (col, row) = (i % cols, i / cols);
+            let x = PAD + col as f32 * (tile_w + TILE_GAP);
+            let y = PAD + row as f32 * (tile_h + TILE_GAP);
+            tiles.push([x, y, tile_w, tile_h]);
         }
         let bar_y = self.menu_h - BAR_H;
         let bw = MENU_W / 3.0;
@@ -714,8 +732,9 @@ fn paint(
                 p.rect_filled(rect, egui::CornerRadius::same(10), argb(t.hover));
             }
             let cx = rect.center().x;
-            let icon_center = egui::pos2(cx, rect.min.y + 34.0);
-            let icon_side = 42.0;
+            let k = rect.height() / TILE; // 相对默认 88 高的缩放，列数变化时图标/文字等比
+            let icon_center = egui::pos2(cx, rect.min.y + 34.0 * k);
+            let icon_side = 42.0 * k.min(1.2);
             if let Some(rgba) = icons.get(target) {
                 let px = ((rgba.len() / 4) as f32).sqrt().round().max(1.0) as usize;
                 if px * px * 4 <= rgba.len() {
@@ -743,9 +762,9 @@ fn paint(
                     argb(t.text),
                 );
             }
-            let label = ellipsize(soft, name, TILE - 6.0, 12.0);
+            let label = ellipsize(soft, name, rect.width() - 6.0, 12.0);
             p.text(
-                egui::pos2(cx, rect.min.y + 64.0),
+                egui::pos2(cx, rect.min.y + 64.0 * k),
                 egui::Align2::CENTER_CENTER,
                 &label,
                 egui::FontId::proportional(12.0),

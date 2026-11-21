@@ -16,6 +16,10 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 /// 设置页提交 / 还原后投递：收到方立即按新版本重绘。
 pub const WM_SETTINGS_APPLIED: u32 = WM_APP + 0x72;
 
+/// 设置页（独立子进程）请求主进程「手动拿一次微信 UIA」。
+/// 跨进程投递到胶囊窗口，主进程收到后走正常抓取流程。
+pub const WM_GRAB_UIA: u32 = WM_APP + 0x73;
+
 /// 胶囊主窗口 HWND（raw isize 存，避免跨线程持有 HWND）
 static PILL_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Dock 窗口 HWND

@@ -8,7 +8,7 @@
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, glass_board, SoftBackend};
+use crate::egui_soft::{argb, glass_board_with, SoftBackend};
 
 /// Dock 一帧的绘制输出（与原 render::DockRender 同语义，rgba 改为预乘域）。
 pub struct DockPainted {
@@ -227,7 +227,7 @@ impl DockView {
                 let cr = egui::CornerRadius::same(radius.round() as u8);
                 // 底色 + 内描边（描边内移到 shrink(1.5)，羽化不出窗——
                 // 画在 shrink(0.5) 时会往壁纸溢一圈白边）
-                glass_board(&p, board, cr);
+                glass_board_with(&p, board, cr, cfg::dock_bg_effective());
                 // 迎光面的细反光：水平条画在上缘，竖排条画在左缘；两端内缩掉圆角，
                 // 免得直角的亮线从圆角里探出去
                 if vertical {

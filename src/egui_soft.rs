@@ -11,7 +11,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 use eframe::egui;
 use eframe::egui::epaint;
@@ -590,7 +593,12 @@ pub fn widget_icon(p: &egui::Painter, center: egui::Pos2, cell: f32, kind: u8, c
 /// 叠到壁纸上就是"Dock 外圈一圈没裁干净的白边"（用户实测）。
 /// 玻璃面的立体感靠底色本身的透明度和霓虹内发光，不再靠亮边。
 pub fn glass_board(p: &egui::Painter, board: egui::Rect, cr: egui::CornerRadius) {
-    p.rect_filled(board, cr, argb(cfg::pill_bg_effective()));
+    glass_board_with(p, board, cr, cfg::pill_bg_effective());
+}
+
+/// 与 glass_board 相同，但底色由调用方指定（Dock 用独立的透明度滑条）
+pub fn glass_board_with(p: &egui::Painter, board: egui::Rect, cr: egui::CornerRadius, bg: u32) {
+    p.rect_filled(board, cr, argb(bg));
     if cfg::cur().glow {
         glow_edges(p, board, cr, cfg::cur().dock_edge);
     }
@@ -690,6 +698,59 @@ pub fn divider(p: &egui::Painter, x: f32, fh: f32) {
     );
 }
 
+// ---------- 字体字节全局缓存 ----------
+
+/// 同一字体文件按「路径 + 大小 + 修改时间」缓存一份 `Arc<FontData>`。
+/// 8 个 SoftBackend 与设置页共享同一份字体字节，避免每个 egui Context 各读一遍几十 MB 的字体文件。
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FontCacheKey {
+    path: PathBuf,
+    len: u64,
+    modified_ns: u128,
+}
+
+static FONT_DATA_CACHE: OnceLock<Mutex<HashMap<FontCacheKey, Arc<egui::FontData>>>> = OnceLock::new();
+
+fn font_cache_key(path: &Path) -> Option<FontCacheKey> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let modified_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(FontCacheKey { path: path.to_path_buf(), len: meta.len(), modified_ns })
+}
+
+/// 读取字体字节；命中缓存时只克隆 `Arc`，不复制字体数据。
+/// 元数据拿不到时不入缓存，保持原来的直接读取行为。
+fn shared_font_data(path: &Path) -> Option<Arc<egui::FontData>> {
+    let Some(key) = font_cache_key(path) else {
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        return Some(Arc::new(egui::FontData::from_owned(bytes)));
+    };
+
+    let cache = FONT_DATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // 持锁读文件：即使设置页线程与主线程同时构建字体，也只读一次磁盘。
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(data) = cache.get(&key) {
+        return Some(data.clone());
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let data = Arc::new(egui::FontData::from_owned(bytes));
+    cache.insert(key, data.clone());
+    Some(data)
+}
+
 /// MiSans 字体文件名（随发布包放在 `<exe>/data/`，**不打进 exe**：
 /// 运行时从磁盘加载，找不到就回落系统字体）。
 const MISANS_FONT_FILE: &str = "MiSans-Semibold.ttf";
@@ -717,8 +778,8 @@ pub fn clock_font(size: f32) -> egui::FontId {
 
 /// 依次找：发布目录 data/ → exe 同目录 → 开发期仓库 assets/fonts → 当前目录 assets/fonts。
 /// 找不到 / 读失败都返回 None，调用方回落默认字体（= 系统字体效果）。
-fn load_font_file(name: &str) -> Option<(Vec<u8>, std::path::PathBuf)> {
-    let mut cands: Vec<std::path::PathBuf> = vec![crate::store::path(name)];
+fn load_font_file(name: &str) -> Option<Arc<egui::FontData>> {
+    let mut cands: Vec<PathBuf> = vec![crate::store::path(name)];
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -728,12 +789,10 @@ fn load_font_file(name: &str) -> Option<(Vec<u8>, std::path::PathBuf)> {
         cands.push(dir.join("../../assets/fonts").join(name));
         cands.push(dir.join("../assets/fonts").join(name));
     }
-    cands.push(std::path::PathBuf::from("assets/fonts").join(name));
+    cands.push(PathBuf::from("assets/fonts").join(name));
     for p in cands {
-        if let Ok(bytes) = std::fs::read(&p) {
-            if !bytes.is_empty() {
-                return Some((bytes, p));
-            }
+        if let Some(data) = shared_font_data(&p) {
+            return Some(data);
         }
     }
     None
@@ -763,11 +822,8 @@ pub fn build_font_definitions() -> egui::FontDefinitions {
         // MiSans 从磁盘加载（不打进 exe）：正文够清晰，标题/强调也用同一款。
         // 发布包里放在 <exe>/data/MiSans-Semibold.ttf；文件缺失时回落系统字体。
         match load_font_file(MISANS_FONT_FILE) {
-            Some((bytes, _path)) => {
-                fonts.font_data.insert(
-                    "misans".into(),
-                    std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-                );
+            Some(data) => {
+                fonts.font_data.insert("misans".into(), data);
                 // 插到最前面：MiSans 命中绝大多数中英文，系统字体只补它缺的字形
                 for fam in fonts.families.values_mut() {
                     fam.insert(0, "misans".into());
@@ -798,11 +854,9 @@ pub fn build_font_definitions() -> egui::FontDefinitions {
     ];
     let mut loaded_cjk = Vec::new();
     for (i, path) in candidates.iter().enumerate() {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Some(data) = shared_font_data(Path::new(path)) {
             let name = format!("soft_cjk{i}");
-            fonts
-                .font_data
-                .insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            fonts.font_data.insert(name.clone(), data);
             fonts.families.entry(egui::FontFamily::Proportional).or_default().push(name.clone());
             loaded_cjk.push(name);
         }
@@ -811,10 +865,8 @@ pub fn build_font_definitions() -> egui::FontDefinitions {
     // 系统字体模式下直接用微软雅黑 Bold，避免标题变成"假粗"（仅颜色加深）。
     let mut has_soft_bold = false;
     if !use_misans {
-        if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/msyhbd.ttc") {
-            fonts
-                .font_data
-                .insert("soft_bold".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        if let Some(data) = shared_font_data(Path::new("C:/Windows/Fonts/msyhbd.ttc")) {
+            fonts.font_data.insert("soft_bold".into(), data);
             has_soft_bold = true;
         }
     }
@@ -828,4 +880,19 @@ pub fn build_font_definitions() -> egui::FontDefinitions {
     bold_family.extend(loaded_cjk);
 
     fonts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_font_data_reuses_same_arc() {
+        let path = std::env::temp_dir().join(format!("orbit-font-cache-test-{}.ttf", std::process::id()));
+        std::fs::write(&path, b"fake font bytes").unwrap();
+        let a = shared_font_data(&path).unwrap();
+        let b = shared_font_data(&path).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let _ = std::fs::remove_file(path);
+    }
 }

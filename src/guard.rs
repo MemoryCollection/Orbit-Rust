@@ -126,12 +126,123 @@ pub fn spawn_guardian() {
         .ok();
 }
 
-/// 守护子进程入口：等父进程退出，异常退出时恢复任务栏并重启 explorer。
+/// 守护子进程：父进程无响应时的"保险丝"。
+///
+/// 对齐 Atrium「守护进程约每 4 秒检查宿主健康状况；主进程无响应，就把 Explorer
+/// 任务栏重新排到宿主之前」：
+///   - 每 4s 用 `SendMessageTimeout` 探一下父进程的主窗口。窗口消失或 600ms 不应答
+///     就算父进程失去响应（卡死 / 宿主线程被挂），此时把真任务栏抬到假宿主之前，
+///     让系统托盘重新可点、图标注册回到 Explorer；
+///   - 父进程一旦恢复响应，把自己的假宿主重新抬回最前（guard_loop 会持续做，这里
+///     只补一次），不干扰 orbit 的正常接管；
+///   - 父进程退出仍走原来的 marker 判定，异常退出则恢复任务栏并重启 explorer。
+const HEALTH_POLL_MS: u32 = 4_000;
+const PROBE_TIMEOUT_MS: u32 = 600;
+
+/// 给父进程主窗口发 WM_NULL 探活：能应答说明父进程消息循环还活着。
+unsafe fn parent_alive(parent: u32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, SendMessageTimeoutW, SMTO_ABORTIFHUNG};
+    use windows::core::PCWSTR;
+    let mut cur = windows::Win32::Foundation::HWND::default();
+    loop {
+        let Ok(h) = FindWindowExW(
+            windows::Win32::Foundation::HWND::default(),
+            cur,
+            windows::core::w!("ORBIT_CAPSULE"),
+            PCWSTR::null(),
+        ) else {
+            break;
+        };
+        cur = h;
+        let mut pid = 0u32;
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid != parent {
+            continue;
+        }
+        let mut result: usize = 0;
+        let ok = SendMessageTimeoutW(
+            h,
+            windows::Win32::UI::WindowsAndMessaging::WM_NULL,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            PROBE_TIMEOUT_MS,
+            Some(&mut result),
+        );
+        return ok.0 != 0;
+    }
+    false
+}
+
+/// 父进程无响应时把真任务栏抬到假宿主之前；恢复后把假宿主抬回最前。
+unsafe fn health_tick(parent: u32, alive: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, HWND_TOPMOST, SetWindowPos, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE};
+    use windows::core::{w, PCWSTR};
+    let mut cur = windows::Win32::Foundation::HWND::default();
+    loop {
+        let Ok(h) = FindWindowExW(
+            windows::Win32::Foundation::HWND::default(),
+            cur,
+            w!("Shell_TrayWnd"),
+            PCWSTR::null(),
+        ) else {
+            break;
+        };
+        cur = h;
+        let mut pid = 0u32;
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(h, Some(&mut pid));
+        if alive {
+            // 父进程恢复：把假宿主（pid==parent）抬回去
+            if pid == parent {
+                let _ = SetWindowPos(
+                    h, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        } else if pid != parent && pid != 0 {
+            // 父进程卡死：把 Explorer 真任务栏抬到最前
+            let mut base = exe_base(pid);
+            if base == "explorer.exe" {
+                let _ = SetWindowPos(
+                    h, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+                crate::tlog!("[guard] 父进程无响应，已把 Explorer 任务栏抬到宿主之前");
+                base.clear();
+            }
+        }
+    }
+}
+
+fn exe_base(pid: u32) -> String {
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let Ok(proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return String::new();
+        };
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            proc,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        ).is_ok();
+        let _ = CloseHandle(proc);
+        if !ok || len == 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..len as usize])
+            .rsplit(['\\', '/']).next().unwrap_or("").to_lowercase()
+    }
+}
+
+/// 守护子进程入口：盯住父进程退出，并每 4s 做一次健康巡检。
 /// 此进程不建任何窗口，跑完即退。
 pub fn run_guardian(parent: u32) {
     unsafe {
         use windows::Win32::System::Threading::{
-            OpenProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
+            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
             PROCESS_SYNCHRONIZE,
         };
         crate::tlog!("[guard] 守护子进程就绪，盯住父进程 pid={parent}");
@@ -143,12 +254,29 @@ pub fn run_guardian(parent: u32) {
             crate::tlog!("[guard] 打不开父进程句柄，守护退出");
             return;
         };
-        let wait = WaitForSingleObject(h, INFINITE);
-        let _ = CloseHandle(h);
-        if wait != windows::Win32::Foundation::WAIT_OBJECT_0 {
+        let mut was_alive = true;
+        loop {
+            let wait = WaitForSingleObject(h, HEALTH_POLL_MS);
+            if wait == windows::Win32::Foundation::WAIT_OBJECT_0 {
+                break; // 父进程退出
+            }
+            if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
+                let alive = parent_alive(parent);
+                if alive != was_alive {
+                    crate::tlog!(
+                        "[guard] 健康巡检：父进程{}响应",
+                        if alive { "恢复" } else { "无" }
+                    );
+                    health_tick(parent, alive);
+                    was_alive = alive;
+                }
+                continue;
+            }
             crate::tlog!("[guard] 等待父进程失败，守护退出");
+            let _ = CloseHandle(h);
             return;
         }
+        let _ = CloseHandle(h);
         // 父进程正常退出前会写新鲜标记（任务栏已由父进程自己恢复），不用管
         if marker_fresh() {
             crate::tlog!("[guard] 父进程正常退出（任务栏已恢复），守护退出");
