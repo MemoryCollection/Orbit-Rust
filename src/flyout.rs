@@ -121,11 +121,11 @@ impl Drop for ClaimGuard {
 /// 用户开始悬停某个托盘图标了：按需要启动一个后台线程去盯它的悬停弹窗。
 ///
 /// `pid` 是图标宿主窗口所属进程，`icon_hwnd` 是图标自己的窗口句柄（用来分组 generation），
-/// `capsule` 是宿主条（Dock 或胶囊）的屏幕矩形，`anchor_x` 是悬停的托盘图标中心的
-/// 屏幕 x（弹窗水平居中于它，而不是屏幕正中间；用图标中心而不是实时光标，鼠标在图标里
-/// 微动时卡片不会左右跟着滑）。`below` = 弹窗摆到条的**下方**（顶部胶囊用：
-/// 它贴着屏幕顶，卡片放上方会出屏）；false = 条上方（Dock 默认）。
-pub fn watch(pid: u32, icon_hwnd: HWND, capsule: RECT, anchor_x: i32, label: &str, below: bool) {
+/// `anchor` 是悬停的托盘图标中心的屏幕坐标（弹窗跟它对齐，而不是屏幕正中间；
+/// 用图标中心而不是实时光标，鼠标在图标里微动时卡片不会左右/上下跟着滑）。
+/// `below` = 弹窗摆到条的**下方**（顶部胶囊用：它贴着屏幕顶，卡片放上方会出屏）；
+/// false = 条上方（Dock 默认）。竖排 Dock 左右锚时改为贴 Dock 内侧、垂直居中于图标。
+pub fn watch(pid: u32, icon_hwnd: HWND, capsule: RECT, anchor: (i32, i32), label: &str, below: bool) {
     if pid == 0 {
         return;
     }
@@ -163,11 +163,11 @@ pub fn watch(pid: u32, icon_hwnd: HWND, capsule: RECT, anchor_x: i32, label: &st
     let watch_id = WATCH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let label = label.to_string();
     crate::tlog!(
-        "[flyout] watch#{watch_id} pid={pid} icon={:#x} stem={stem} gen={generation} anchor_x={anchor_x} below={below}",
-        key
+        "[flyout] watch#{watch_id} pid={pid} icon={:#x} stem={stem} gen={generation} anchor=({},{}) below={below}",
+        key, anchor.0, anchor.1
     );
     _ACTIVE.store(true, Ordering::Relaxed);
-    std::thread::spawn(move || run(pid, key, stem, capsule, anchor_x, watch_id, generation, label, below));
+    std::thread::spawn(move || run(pid, key, stem, capsule, anchor, watch_id, generation, label, below));
 }
 
 /// 用户点击了某个托盘图标：悬停结束，应用接下来打开的是**真正的面板/主窗口**。
@@ -189,7 +189,7 @@ fn run(
     key: usize,
     stem: String,
     capsule: RECT,
-    anchor_x: i32,
+    anchor: (i32, i32),
     watch_id: u64,
     generation: usize,
     label: String,
@@ -207,7 +207,7 @@ fn run(
             return;
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
-        if let Some(h) = try_find(pid, &stem, capsule, anchor_x, watch_id, &mut names, below) {
+        if let Some(h) = try_find(pid, &stem, capsule, anchor, watch_id, &mut names, below) {
             found = h;
             claim(h, watch_id);
             break;
@@ -236,7 +236,7 @@ fn run(
                     return;
                 }
                 release(found);
-                if let Some(h) = try_find(pid, &stem, capsule, anchor_x, watch_id, &mut names, below) {
+                if let Some(h) = try_find(pid, &stem, capsule, anchor, watch_id, &mut names, below) {
                     found = h;
                     claim(h, watch_id);
                     rebuild_until = Instant::now() + Duration::from_millis(REBUILD_GRACE_MS);
@@ -259,7 +259,7 @@ fn run(
             if w <= 0 || h <= 0 {
                 return;
             }
-            let (x, y) = target_point(w, h, capsule, anchor_x, below);
+            let (x, y) = target_point(w, h, capsule, anchor, below);
             if (cur.left - x).abs() <= DRIFT && (cur.top - y).abs() <= DRIFT {
                 if !reported && nudges > 0 {
                     crate::vlog!("[flyout] {label} 的悬停弹窗已移到 Dock 上方 ({x},{y}) {w}x{h}");
@@ -301,7 +301,7 @@ fn try_find(
     pid: u32,
     stem: &str,
     capsule: RECT,
-    anchor_x: i32,
+    anchor: (i32, i32),
     watch_id: u64,
     names: &mut HashMap<u32, String>,
     below: bool,
@@ -310,7 +310,7 @@ fn try_find(
         pid: u32,
         stem: &'a str,
         capsule: RECT,
-        anchor_x: i32,
+        anchor: (i32, i32),
         watch_id: u64,
         below: bool,
         best: HWND,
@@ -370,7 +370,7 @@ fn try_find(
             if claimed_by_other(h, ctx.watch_id) {
                 return BOOL(1);
             }
-            let (x, y) = target_point(w, hh, ctx.capsule, ctx.anchor_x, ctx.below);
+            let (x, y) = target_point(w, hh, ctx.capsule, ctx.anchor, ctx.below);
             if (r.left - x).abs() <= DRIFT && (r.top - y).abs() <= DRIFT {
                 return BOOL(1); // 已经摆好了
             }
@@ -404,7 +404,7 @@ fn try_find(
         pid,
         stem,
         capsule,
-        anchor_x,
+        anchor,
         watch_id,
         below,
         best: HWND::default(),
@@ -421,46 +421,55 @@ fn try_find(
     }
 }
 
-/// 弹窗该摆在哪：水平居中于悬停时的鼠标 x（`anchor_x`），`below` = 上沿贴条下沿 + GAP
-/// （顶部胶囊），否则下沿贴条上沿 - GAP（Dock 默认）。均夹在工作区内。
-fn target_point(w: i32, h: i32, capsule: RECT, anchor_x: i32, below: bool) -> (i32, i32) {
-    // 鼠标可能停得太靠边：先按 anchor 居中，超出工作区再夹回来
-    let anchor_x = anchor_x.clamp(capsule.left, capsule.right);
-    let mut x = anchor_x - w / 2;
-    let mut y = if below {
-        capsule.bottom + GAP
-    } else {
-        capsule.top - h - GAP
-    };
+/// 弹窗该摆在哪。
+/// - 横排（底部/顶部 Dock、胶囊）：水平居中于图标，垂直贴条的上/下沿；
+/// - 竖排（左/右锚 Dock）：贴 Dock 内侧（右锚→左边、左锚→右边），垂直居中于图标。
+///   `below` 仍决定"往屏幕内侧放"的方向（顶部胶囊 = 下方，其余 = 上方；
+///   竖排时胶囊不可能出现，统一按左右内侧处理）。
+/// 均夹在工作区内。
+fn target_point(w: i32, h: i32, capsule: RECT, anchor: (i32, i32), below: bool) -> (i32, i32) {
+    let cap_w = capsule.right - capsule.left;
+    let cap_h = capsule.bottom - capsule.top;
+    let vertical = cap_h > cap_w;
     unsafe {
         let mon = MonitorFromPoint(
-            windows::Win32::Foundation::POINT {
-                x: anchor_x,
-                y: if below { capsule.bottom } else { capsule.top },
-            },
+            windows::Win32::Foundation::POINT { x: anchor.0, y: anchor.1 },
             MONITOR_DEFAULTTONEAREST,
         );
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        if !mon.is_invalid() && GetMonitorInfoW(mon, &mut info).as_bool() {
-            let work = info.rcWork;
-            if x < work.left + GAP {
-                x = work.left + GAP;
-            }
-            if x + w > work.right - GAP {
-                x = work.right - GAP - w;
-            }
-            if y < work.top + GAP {
-                y = work.top + GAP;
-            }
-            if below && y + h > work.bottom - GAP {
-                y = work.bottom - GAP - h;
-            }
+        if mon.is_invalid() || !GetMonitorInfoW(mon, &mut info).as_bool() {
+            return (anchor.0 - w / 2, anchor.1 - h / 2);
         }
+        let work = info.rcWork;
+        let (mut x, mut y);
+        if vertical {
+            // 左右锚：卡片贴 Dock 内侧，中心对齐到图标中心（离鼠标最近的位置）
+            let right_docked = (capsule.left + capsule.right) / 2 >= (work.left + work.right) / 2;
+            x = if right_docked { capsule.left - w - GAP } else { capsule.right + GAP };
+            y = anchor.1 - h / 2;
+        } else {
+            // 横排：水平跟图标，垂直贴条边
+            let ax = anchor.0.clamp(capsule.left, capsule.right);
+            x = ax - w / 2;
+            y = if below { capsule.bottom + GAP } else { capsule.top - h - GAP };
+        }
+        if x < work.left + GAP {
+            x = work.left + GAP;
+        }
+        if x + w > work.right - GAP {
+            x = work.right - GAP - w;
+        }
+        if y < work.top + GAP {
+            y = work.top + GAP;
+        }
+        if y + h > work.bottom - GAP {
+            y = work.bottom - GAP - h;
+        }
+        (x, y)
     }
-    (x, y)
 }
 
 /// 进程 exe 的文件名（不含扩展名、小写）

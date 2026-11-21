@@ -7,8 +7,10 @@
 //! 闪烁是 250ms 亮/灭交替，调用侧只认"从没在闪变在闪"的那一下，这里再加
 //! 最小间隔保护，一轮提醒最多响一声。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::PCWSTR;
@@ -22,7 +24,10 @@ const MIN_GAP_MS: u64 = 3000;
 /// MCI alias（进程内唯一）
 const ALIAS: &str = "orbit_notify";
 
-static LAST_PLAY: AtomicU64 = AtomicU64::new(0);
+/// 每个图标 key 各自的上次播放时刻：微信双开时两个图标各算各的一轮提醒，
+/// 全局节流会把第二个实例的提醒吞掉（用户实测）
+static LAST_PLAY: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// alias 状态：0 = 还没试过 / 1 = 已打开 / 2 = 打不开（不再重试）
 static OPENED: AtomicU64 = AtomicU64::new(0);
 
@@ -42,16 +47,25 @@ fn sound_path() -> PathBuf {
     crate::store::path("wechat_notify.mp3")
 }
 
-/// 播放提示音。调用侧已在"图标开始闪"的那一刻触发，这里再加间隔保护。
-pub fn play_wechat() {
+/// 播放提示音。调用侧已在"图标开始闪"的那一刻触发，这里按图标 key 再加
+/// 间隔保护——同一个实例的一轮提醒最多响一声，双开的两个实例互不干扰。
+pub fn play_wechat(key: &str) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    if now.saturating_sub(LAST_PLAY.load(Ordering::Relaxed)) < MIN_GAP_MS {
-        return;
+    {
+        let Ok(mut last) = LAST_PLAY.lock() else { return };
+        // 顺手清掉过期项，免得 map 无限长（图标 key 有限，其实涨不起来）
+        last.retain(|_, t| now.saturating_sub(*t) < MIN_GAP_MS * 2);
+        if let Some(prev) = last.get(key) {
+            if now.saturating_sub(*prev) < MIN_GAP_MS {
+                return;
+            }
+        }
+        last.insert(key.to_string(), now);
     }
-    LAST_PLAY.store(now, Ordering::Relaxed);
+    crate::tlog!("[notify] 提示音触发 key={key}");
     std::thread::spawn(|| unsafe {
         if OPENED.load(Ordering::Relaxed) == 2 {
             return; // 之前就没打开成功（缺解码器之类），别反复试

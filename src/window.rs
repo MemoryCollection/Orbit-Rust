@@ -621,7 +621,7 @@ impl App {
             right: self.pos.0 + self.pill.0,
             bottom: self.pos.1 + self.pill.1,
         };
-        crate::flyout::watch(t.pid, t.hwnd, cap, cx, &f.name, true);
+        crate::flyout::watch(t.pid, t.hwnd, cap, (cx, cy), &f.name, true);
     }
 
     /// 闪烁图标悬停离开：补发 leave（Dock 同款）

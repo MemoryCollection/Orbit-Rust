@@ -289,9 +289,9 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             WM_MOUSEMOVE => {
                 let x = (l.0 & 0xFFFF) as u16 as i16 as i32;
                 let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-                // 记录光标位置（逻辑点）：波浪放大跟着光标走
+                // 记录光标位置：命中用物理像素，波浪放大用逻辑点（和 paint 同坐标系）
                 let (fx, fy) = (x as f32, y as f32);
-                let k = dock.scale.max(0.5);
+                let k = (dock.scale * crate::settings::icon_scale().clamp(0.5, 2.0)).max(0.5);
                 let new_mouse = Some((fx / k, fy / k));
                 let mouse_moved = new_mouse != dock.mouse;
                 dock.mouse = new_mouse;
@@ -340,7 +340,9 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             WM_MOUSELEAVE => {
                 dock.mouse_tracked = false;
-                dock.mouse = None;
+                // 波浪放大跟着这个坐标走，必须清掉并重绘；哪怕光标停在 Dock 空白处
+                // （悬停目标本来就是 None），不重绘的话放大的图标会冻结在原位
+                let had_mouse = dock.mouse.take().is_some();
                 dock.hide_tip();
                 // 注意不能写成 `a.take().is_some() || b.take().is_some()`：
                 // 短路后第二个 take 不会执行，托盘悬停状态会卡住
@@ -349,7 +351,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let had_desk = std::mem::replace(&mut dock.hovered_desktop, false);
                 // 先清悬停态再转发：否则 forward_hover 会以为还停着，不发 leave
                 dock.forward_hover();
-                if had_app || had_tray || had_desk {
+                if had_app || had_tray || had_desk || had_mouse {
                     dock.render();
                 }
                 LRESULT(0)
@@ -683,9 +685,9 @@ impl Dock {
         // 锚点用图标中心（鼠标正停在这个图标上），不用实时光标：悬停会被反复重发，
         // 用光标的话鼠标在图标里微动一下卡片就跟着左右滑。
         // Dock 靠上时卡片改摆到 Dock **下方**（上面出屏）。
-        let anchor_x = self.tray_center(idx).0;
+        let anchor = self.tray_center(idx);
         let below = settings::dock_anchor() == crate::settings::DockAnchor::Top;
-        flyout::watch(t.pid, t.hwnd, cap, anchor_x, &label, below);
+        flyout::watch(t.pid, t.hwnd, cap, anchor, &label, below);
     }
 
     /// 当前悬停的托盘图标中心（屏幕坐标）
@@ -970,12 +972,12 @@ impl Dock {
     fn publish_flash(&mut self) {
         let now = Instant::now();
         // 微信提示音：拿"上一轮快照里在闪的键"对比，图标从"没在闪"变"在闪"
-        // 的那一下响一声（一轮提醒只响一次；亮灭交替不会反复触发）
+        // 的那一下响一声。按 key 逐个判断——微信双开两个图标各算各的提醒。
         let was_flashing: HashSet<String> = FLASH_SET
             .lock()
             .map(|v| v.iter().map(|f| f.key.clone()).collect())
             .unwrap_or_default();
-        let mut wx_new = false;
+        let mut wx_new_keys: Vec<String> = Vec::new();
         let mut snap: Vec<FlashIcon> = Vec::new();
         if settings::show_tray() {
             for &i in &self.tray_shown {
@@ -987,10 +989,9 @@ impl Dock {
                 let key = it.key();
                 if settings::wechat_sound()
                     && !was_flashing.contains(&key)
-                    && !wx_new
                     && notify::is_wechat(&it.name, &it.exe)
                 {
-                    wx_new = true;
+                    wx_new_keys.push(key.clone());
                 }
                 let px = ((it.rgba.len() / 4) as f32).sqrt().round() as i32;
                 snap.push(FlashIcon {
@@ -1003,8 +1004,8 @@ impl Dock {
                 });
             }
         }
-        if wx_new {
-            notify::play_wechat();
+        for key in wx_new_keys {
+            notify::play_wechat(&key);
         }
         let sig: Vec<(String, bool)> = snap.iter().map(|f| (f.key.clone(), f.dim)).collect();
         let mut changed = true;
