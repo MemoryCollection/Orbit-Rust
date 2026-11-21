@@ -594,19 +594,11 @@ impl Menu {
         let hh = (self.menu_h * k).round() as i32;
         self.size = (w, hh);
         let mon = crate::window::primary_monitor();
-        // Dock 在底部：菜单从 Dock 上沿再往上一点弹出（对齐横幅的抬升算法）
-        let dock_h = if cfg::SHOW_DOCK
-            && crate::settings::dock_anchor() == crate::settings::DockAnchor::Bottom
-        {
-            (cfg::DOCK_H * crate::settings::icon_scale()).round() as i32
-                + cfg::DOCK_BOTTOM_MARGIN
-                + 8
-        } else {
-            10
-        };
+        // 菜单在屏幕上水平、垂直都居中（不再贴 Dock 上沿）
         let x = mon.rcMonitor.left
             + ((mon.rcMonitor.right - mon.rcMonitor.left - w) / 2).max(0);
-        let y = (mon.rcMonitor.bottom - dock_h - hh - 6).max(mon.rcMonitor.top + 8);
+        let y = mon.rcMonitor.top
+            + ((mon.rcMonitor.bottom - mon.rcMonitor.top - hh) / 2).max(8);
         unsafe {
             let _ = SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE);
         }
