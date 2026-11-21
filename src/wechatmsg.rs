@@ -135,6 +135,19 @@ pub fn instances() -> Vec<(String, bool)> {
     v
 }
 
+/// 该 pid 在多开实例里的标签（「微信1」/「微信2」，按进程创建时间序）。
+/// 单开（只有一个实例）返回 None——单开没必要标，横幅少一段噪音。
+/// 横幅弹出频率低，不缓存；找 pid 排序每次最多几十个进程，开销可忽略。
+pub fn instance_tag(pid: u32) -> Option<String> {
+    let mut procs: Vec<(u32, u64)> = wechat_processes()
+        .into_iter()
+        .map(|p| (p, proc_start(p)))
+        .collect();
+    procs.sort_by_key(|(_, t)| *t);
+    let idx = procs.iter().position(|(p, _)| *p == pid)?;
+    (procs.len() > 1).then(|| format!("微信{}", idx + 1))
+}
+
 #[derive(Clone, Default)]
 struct Row {
     chat: String,

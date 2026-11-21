@@ -10,8 +10,9 @@ use std::ptr::null_mut;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits, GetObjectW,
+    ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
+    BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP,
 };
 use windows::Win32::Graphics::GdiPlus::{
     BitmapData, FontStyleBold, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput,
@@ -485,6 +486,31 @@ pub fn icon_native_size(hicon: HICON) -> Option<i32> {
     }
 }
 
+/// premultiplied BGRA（DIB 内存序）→ straight-alpha RGBA。
+/// HICON 绘制出的 DIB 和 `IShellItemImageFactory` 给的位图都是这个格式，共用一套拆包。
+fn bgra_to_rgba(bytes: &[u8]) -> Vec<u8> {
+    let mut rgba = vec![0u8; bytes.len()];
+    for (i, px) in bytes.chunks_exact(4).enumerate() {
+        let (b, g, r_, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
+        let (j0, j1, j2, j3) = (i * 4, i * 4 + 1, i * 4 + 2, i * 4 + 3);
+        if a == 0 {
+            continue;
+        }
+        if a == 255 {
+            rgba[j0] = r_ as u8;
+            rgba[j1] = g as u8;
+            rgba[j2] = b as u8;
+            rgba[j3] = 255;
+        } else {
+            rgba[j0] = ((r_ * 255 + a / 2) / a) as u8;
+            rgba[j1] = ((g * 255 + a / 2) / a) as u8;
+            rgba[j2] = ((b * 255 + a / 2) / a) as u8;
+            rgba[j3] = a as u8;
+        }
+    }
+    rgba
+}
+
 /// 把任意进程的 HICON 画进 32bpp DIB 并转成 straight-alpha RGBA（边长 = px）。
 /// HICON 是跨进程共享的 USER 对象，可直接在自己进程绘制。
 pub fn capture_icon_rgba(hicon: HICON, px: i32) -> Option<Vec<u8>> {
@@ -512,39 +538,72 @@ pub fn capture_icon_rgba(hicon: HICON, px: i32) -> Option<Vec<u8>> {
         let _ = SelectObject(mem, old);
         let mut out = None;
         if ok && !bits.is_null() {
-            let slice = std::slice::from_raw_parts(bits as *const u32, (px * px) as usize);
-            let mut rgba = vec![0u8; (px * px * 4) as usize];
-            for (i, v) in slice.iter().enumerate() {
-                let a = (v >> 24) & 0xFF;
-                // DIB 内存序是 BGRA，读成 u32 后：A<<24 | R<<16 | G<<8 | B
-                let r_ = (v >> 16) & 0xFF;
-                let g_ = (v >> 8) & 0xFF;
-                let b = v & 0xFF;
-                let (j0, j1, j2, j3) = (i * 4, i * 4 + 1, i * 4 + 2, i * 4 + 3);
-                if a == 0 {
-                    rgba[j0] = 0;
-                    rgba[j1] = 0;
-                    rgba[j2] = 0;
-                    rgba[j3] = 0;
-                } else if a == 255 {
-                    rgba[j0] = r_ as u8;
-                    rgba[j1] = g_ as u8;
-                    rgba[j2] = b as u8;
-                    rgba[j3] = 255;
-                } else {
-                    // premultiplied BGRA → straight RGBA
-                    rgba[j0] = ((r_ * 255 + a / 2) / a) as u8;
-                    rgba[j1] = ((g_ * 255 + a / 2) / a) as u8;
-                    rgba[j2] = ((b * 255 + a / 2) / a) as u8;
-                    rgba[j3] = a as u8;
-                }
-            }
-            out = Some(rgba);
+            let bytes = std::slice::from_raw_parts(bits as *const u8, (px * px * 4) as usize);
+            out = Some(bgra_to_rgba(bytes));
         }
         let _ = DeleteObject(hbmp);
         let _ = DeleteDC(mem);
         ReleaseDC(HWND::default(), hdc);
         out
+    }
+}
+
+/// 读一张 32bpp 位图（`IShellItemImageFactory::GetImage` 给的应用图标就是 HBITMAP），
+/// 转成 straight-alpha RGBA 并缩到边长 px。读完就地释放位图，调用方不用管生命周期。
+///
+/// 位图实际尺寸要问 `GetObjectW`：`SIIGBF_BIGGERSIZEOK` 允许外壳返回比请求更大的图
+/// （经常是 256px），照着请求尺寸硬读只会读到左上角一块。
+pub fn bitmap_rgba(hbm: HBITMAP, px: i32) -> Option<Vec<u8>> {
+    if px <= 0 || hbm.is_invalid() {
+        return None;
+    }
+    unsafe {
+        let mut bm = BITMAP::default();
+        let got = GetObjectW(
+            hbm,
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut BITMAP as *mut core::ffi::c_void),
+        );
+        let (w, h) = (bm.bmWidth, bm.bmHeight);
+        if got == 0 || w <= 0 || h <= 0 {
+            let _ = DeleteObject(hbm);
+            return None;
+        }
+        let hdc = GetDC(HWND::default());
+        let mem = CreateCompatibleDC(hdc);
+        let old = SelectObject(mem, hbm);
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0,
+            ..Default::default()
+        };
+        let mut bytes = vec![0u8; (w * h * 4) as usize];
+        let lines = GetDIBits(
+            mem,
+            hbm,
+            0,
+            h as u32,
+            Some(bytes.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        let _ = SelectObject(mem, old);
+        let _ = DeleteDC(mem);
+        ReleaseDC(HWND::default(), hdc);
+        let _ = DeleteObject(hbm);
+        if lines == 0 {
+            return None;
+        }
+        let rgba = bgra_to_rgba(&bytes);
+        if w == px && h == px {
+            return Some(rgba);
+        }
+        Some(resize_rgba(&rgba, w, h, px, px))
     }
 }
 

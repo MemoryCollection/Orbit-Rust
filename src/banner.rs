@@ -97,11 +97,27 @@ impl BannerNotice {
         self
     }
 
-    /// 微信新消息卡片。响不响由 `wechat_sound` 设置决定（和托盘闪烁音二选一）
+    /// 微信新消息卡片。响不响由 `wechat_sound` 设置决定（和托盘闪烁音二选一）。
+    /// UIA 抓到的信息尽量都上横幅：
+    /// - `main`：会话名
+    /// - `sub`：摘要（非空才填；空则兜底 "新消息"）
+    /// - `badge`：未读数（≥1 都显示，不只 >1）+ 多开时的实例标签（微信1/微信2）
+    /// - `pid`：点击横幅跳回对应实例
     pub fn wechat(chat: &str, summary: &str, unread: i32, pid: u32) -> Self {
+        let mut badge = String::new();
+        if unread > 0 {
+            badge = format!("{unread} 条消息");
+        }
+        if let Some(inst) = crate::wechatmsg::instance_tag(pid) {
+            if badge.is_empty() {
+                badge = inst;
+            } else {
+                badge = format!("{badge} · {inst}");
+            }
+        }
         Self {
             tag: "微信".to_string(),
-            badge: if unread > 1 { format!("{unread} 条消息") } else { String::new() },
+            badge,
             main: chat.to_string(),
             sub: if summary.is_empty() { "新消息".to_string() } else { summary.to_string() },
             silent: !settings::wechat_sound(),

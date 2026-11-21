@@ -43,9 +43,6 @@ pub struct Theme {
     // ---- 底部 Dock ----
     pub dock_edge: u32,
     pub dock_glow: u32,
-    /// Dock 图标的衬底（浅色主题下彩色图标直接压在浅底上会发脏，垫一层白圆角）
-    /// `0` = 不画
-    pub icon_backing: u32,
 
     // ---- 悬停提示条 ----
     pub tip_bg: u32,
@@ -88,7 +85,6 @@ pub const CALM_LIGHT: Theme = Theme {
     accent: 0xFF_B0_7A_4E,
     dock_edge: 0x18_3A_36_30,
     dock_glow: 0x08_FF_FF_FF,
-    icon_backing: 0xF2_FF_FF_FF,
     tip_bg: 0xF8_FB_F9_F5,
     tip_text: 0xFF_3A_36_30,
     pin: 0xFF_B0_7A_4E,
@@ -119,7 +115,6 @@ pub const CALM_DARK: Theme = Theme {
     accent: 0xFF_D0_9A_6E,
     dock_edge: 0x20_E8_E2_D6,
     dock_glow: 0x0C_FF_FF_FF,
-    icon_backing: 0,
     tip_bg: 0xF2_26_28_24,
     tip_text: 0xFF_E8_E2_D6,
     pin: 0xFF_D0_9A_6E,
@@ -155,7 +150,6 @@ pub const GLASS2_DARK: Theme = Theme {
     accent: 0xFF_6E_A8_FF,
     dock_edge: 0x40_FF_FF_FF,
     dock_glow: 0x18_FF_FF_FF,
-    icon_backing: 0,
     tip_bg: 0xF2_20_22_2A,
     tip_text: 0xFF_F4_F6_F8,
     pin: 0xFF_FF_D5_4F,
@@ -186,7 +180,6 @@ pub const GLASS2_LIGHT: Theme = Theme {
     accent: 0xFF_2F_6B_E0,
     dock_edge: 0x26_00_00_00,
     dock_glow: 0x0C_FF_FF_FF,
-    icon_backing: 0xE8_FF_FF_FF,
     tip_bg: 0xF4_FF_FF_FF,
     tip_text: 0xFF_1C_1E_22,
     pin: 0xFF_C7_7A_00,
@@ -222,7 +215,6 @@ pub const M3_DARK: Theme = Theme {
     accent: 0xFF_C8_BE_F0,
     dock_edge: 0x1C_E6_E1_E9,
     dock_glow: 0x10_FF_FF_FF,
-    icon_backing: 0,
     tip_bg: 0xF4_21_1E_29,
     tip_text: 0xFF_E6_E1_E9,
     pin: 0xFF_EF_B8_C8,
@@ -253,7 +245,6 @@ pub const M3_LIGHT: Theme = Theme {
     accent: 0xFF_67_4F_A8,
     dock_edge: 0x16_1D_1B_20,
     dock_glow: 0x08_FF_FF_FF,
-    icon_backing: 0xF0_FF_FF_FF,
     tip_bg: 0xF8_FE_FB_FF,
     tip_text: 0xFF_1D_1B_20,
     pin: 0xFF_8F_4A_66,

@@ -4,29 +4,32 @@
 //! 移出胶囊，常驻桌面右上角直接显示实况摘要（标题 / 图标+温度 / 天气·城市 /
 //! 湿度·风力）。数据由主 App 的 `weather.tick()` 拿到快照后通过 `update()` 推送。
 //!
-//! - 窗口：`WS_EX_LAYERED|TOOLWINDOW|NOACTIVATE`（**不置顶**），`HTTRANSPARENT`
-//!   让鼠标穿透；每次显示都压到 z 序最底（`HWND_BOTTOM`），所以它只贴在桌面上，
-//!   任何普通窗口都会盖住它——不会浮在所有窗口上面挡视线。
+//! - 窗口创建后 `SetParent` 挂进桌面壁纸层（Progman 0x052C 拆出的 WorkerW）：
+//!   它就是桌面的一部分，Win+D / 「返回桌面」再也收不走；卡片在壁纸之上、
+//!   桌面图标之下。`HTTRANSPARENT` 让鼠标穿透，不挡桌面点击。
 //! - 透明背景靠分层窗口逐像素 alpha（不画底板），只画字形。
 //! - 配色自适应壁纸：沿卡片四周取屏幕像素算平均亮度，深壁纸用浅色字、浅壁纸用
 //!   深色字，并给文字加一层反差色的淡描影，混合色壁纸也能读。
 //! - 主题 / 字体切换：监听 `WM_SETTINGS_APPLIED` 立即重绘；壁纸明暗每 2s 复检一次。
 //! - 显隐：由天气模块的「隐藏」档控制（`module_mode("weather") == Off`），关闭即隐藏。
+//! - 高度按内容量出（详情折行 / 字号倍率大时窗口自动撑高），宽度固定 CARD_W。
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClassNameW, GetWindowLongPtrW, IsIconic, IsWindowVisible,
-    RegisterClassW, RegisterWindowMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WindowFromPoint, CREATESTRUCTW, GWLP_USERDATA, HMENU, HTTRANSPARENT, HWND_BOTTOM,
+    CreateWindowExW, DefWindowProcW, EnumChildWindows, EnumWindows, FindWindowW, GA_PARENT,
+    GetAncestor, GetClassNameW, GetDesktopWindow, GetWindow, GetWindowLongPtrW, GWL_STYLE,
+    GW_HWNDNEXT, IsIconic, IsWindowVisible, RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW,
+    SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, SMTO_NORMAL, WindowFromPoint,
+    CREATESTRUCTW, GWLP_USERDATA, HMENU, HTTRANSPARENT, HWND_BOTTOM,
     SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_CREATE, WM_NCHITTEST,
-    WM_TIMER, WM_WINDOWPOSCHANGED, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
-    WNDCLASSW,
+    WM_TIMER, WM_WINDOWPOSCHANGED, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP, WNDCLASSW,
 };
 
 use eframe::egui;
@@ -49,7 +52,8 @@ static TASKBAR_CREATED: AtomicIsize = AtomicIsize::new(0);
 const TIMER_BG: usize = 1;
 /// 复检间隔：壁纸换成浅/深色（或换幻灯片）后最多 2s 跟上
 const BG_CHECK_MS: u32 = 2000;
-/// 显隐自检定时器：Win+D（显示桌面）会把卡片一起最小化，这里负责恢复
+/// 显隐自检定时器：Explorer 重启会把卡片从桌面层甩回顶层（父窗口重建），
+/// 这里负责重新挂回桌面层；顺带兜底恢复被收起的窗口
 const TIMER_VIS: usize = 2;
 /// 自检间隔：按下 Win+D 后最多 500ms 卡片回到桌面层
 const VIS_CHECK_MS: u32 = 500;
@@ -76,11 +80,14 @@ const CARD_MARGIN: f32 = 32.0;
 struct Card {
     view: SoftBackend,
     size: (i32, i32),
+    /// 窗口左上角的**屏幕**坐标（探壁纸亮度用）
     pos: (i32, i32),
     /// 壁纸偏深 → 文字用浅色
     dark_bg: bool,
     /// 是否已成功探到壁纸明暗（没探到时用主题默认深色字）
     probed: bool,
+    /// 已挂进桌面壁纸层（WorkerW / Progman 的子窗口）
+    embedded: bool,
 }
 
 pub fn init(instance: HINSTANCE) {
@@ -98,6 +105,7 @@ pub fn init(instance: HINSTANCE) {
             pos: (0, 0),
             dark_bg: false,
             probed: false,
+            embedded: false,
         }));
         match CreateWindowExW(
             // 注意：没有 WS_EX_TOPMOST —— 卡片只属于桌面层
@@ -250,18 +258,25 @@ impl Card {
         self.probe_bg();
         self.render(h);
         let _ = unsafe { ShowWindow(h, SW_SHOWNOACTIVATE) };
-        // ShowWindow 可能把窗口抬到前面，再压回桌面层一次
-        self.push_bottom(h);
     }
 
-    /// 每 500ms 自检显隐：Win+D（显示桌面）会把本卡片一起最小化，用户要的是
-    /// 「天气常驻桌面、不被 Win+D 收走」，所以检测到被收起（最小化或隐藏，且
-    /// 开关不是隐藏档）就恢复显示并压回桌面层。返回桌面后卡片最多 500ms 回来。
+    /// 每 500ms 自检：Explorer 重启会重建桌面窗口，跨进程子窗口被甩回顶层，
+    /// 检测到没挂在桌面层就重新挂回去；顺带兜底恢复被收起的窗口。
     fn recheck_vis(&mut self, h: HWND) {
         let off = settings::module_mode("weather") == ModuleMode::Off;
         let has = VIEW.lock().map(|g| g.is_some()).unwrap_or(false);
         if off || !has {
             return; // 开关关着 / 没数据时的隐藏是主动行为，不去拉起来
+        }
+        if !self.embedded_ok(h) {
+            self.embedded = false;
+        }
+        if !self.embedded {
+            // place 里的 ensure_embedded 会重新挂并按新坐标系重摆
+            self.place(h);
+            self.probe_bg();
+            self.render(h);
+            crate::tlog!("[weathercard] 已重新挂回桌面层");
         }
         let visible = unsafe { IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() };
         if visible {
@@ -270,7 +285,6 @@ impl Card {
         self.place(h);
         let _ = unsafe { ShowWindow(h, SW_SHOWNOACTIVATE) };
         self.push_bottom(h);
-        crate::tlog!("[weathercard] 被显示桌面（Win+D）收起，已恢复显示");
     }
 
     /// 每 2s 复检壁纸明暗：幻灯片/换壁纸后文字色自动跟着切，只有变化时才重绘
@@ -336,9 +350,14 @@ impl Card {
     fn place(&mut self, h: HWND) {
         // 窗口物理尺寸 = 逻辑尺寸 × DPI × 天气字号倍率 k（字号在绘制里也乘 k）
         let dpi = scale(h);
-        let s = dpi * settings::weather_text_scale();
+        let k = settings::weather_text_scale();
+        let s = dpi * k;
         let w = (CARD_W * s).round() as i32;
-        let hh = (CARD_H * s).round() as i32;
+        // 高度按当前内容量出来：详情折行 / 字号放大时窗口自动撑高（不再裁字）
+        let hh = match VIEW.lock().ok().and_then(|g| g.clone()) {
+            Some(v) => (card_height(&mut self.view, &v, k) * s).ceil() as i32,
+            None => (CARD_H * s).round() as i32,
+        };
         self.size = (w, hh);
         let mi = crate::window::primary_monitor();
         // 用工作区（有任务栏时不会被遮），没有工作区信息就退回整屏
@@ -348,13 +367,42 @@ impl Card {
             mi.rcMonitor
         };
         let m = (CARD_MARGIN * dpi).round() as i32;
-        let x = (rc.right - w - m).max(rc.left + m / 2);
-        let y = rc.top + m;
-        self.pos = (x, y);
-        // 不置顶：压到 z 序最底，普通窗口都能盖住它
+        let sx = (rc.right - w - m).max(rc.left + m / 2);
+        let sy = rc.top + m;
+        self.pos = (sx, sy);
+        // 挂进桌面层（WorkerW 子窗口）；挂进去后坐标是父窗口客户区坐标
+        self.ensure_embedded(h);
+        let (x, y) = if self.embedded {
+            (sx - mi.rcMonitor.left, sy - mi.rcMonitor.top)
+        } else {
+            (sx, sy)
+        };
+        // 不置顶：压到 z 序最底（子窗口则压到壁纸层所有子窗口的最底）
         unsafe {
             let _ = SetWindowPos(h, HWND_BOTTOM, x, y, w, hh, SWP_NOACTIVATE);
         }
+    }
+
+    /// 卡片当前是否挂在桌面层（WorkerW / Progman 的子窗口）。
+    /// 父窗口是桌面根窗口 = 顶层窗口 / 父窗口已失效（Explorer 重启甩回来了）。
+    fn embedded_ok(&self, h: HWND) -> bool {
+        unsafe {
+            let parent = GetAncestor(h, GA_PARENT);
+            if parent == GetDesktopWindow() {
+                return false;
+            }
+            let cls = class_name(parent);
+            cls == "WorkerW" || cls == "Progman"
+        }
+    }
+
+    /// 确保卡片挂进桌面壁纸层；成功后 `self.embedded = true`。
+    fn ensure_embedded(&mut self, h: HWND) {
+        if self.embedded && self.embedded_ok(h) {
+            return;
+        }
+        self.embedded = embed_desktop(h);
+        crate::vlog!("[weathercard] 挂桌面层 embedded={}", self.embedded);
     }
 
     fn push_bottom(&self, h: HWND) {
@@ -388,13 +436,87 @@ unsafe fn desktop_at(x: i32, y: i32) -> bool {
     if h.is_invalid() {
         return true;
     }
-    let mut buf = [0u16; 64];
-    let n = GetClassNameW(h, &mut buf);
-    if n <= 0 {
-        return true;
+    let cls = class_name(h);
+    cls.is_empty() || cls == "Progman" || cls == "WorkerW" || cls == "ORBIT_WEATHER_CARD"
+}
+
+/// 读窗口类名（失败返回空串）
+fn class_name(h: HWND) -> String {
+    if h.is_invalid() {
+        return String::new();
     }
-    let cls = String::from_utf16_lossy(&buf[..n as usize]);
-    matches!(cls.as_str(), "Progman" | "WorkerW" | "ORBIT_WEATHER_CARD" | "")
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(h, &mut buf) };
+    if n <= 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+}
+
+/// 把卡片挂进桌面壁纸层（WorkerW）：SetParent 之后它就是桌面的**子窗口**，
+/// Win+D / 「返回桌面」只作用顶层窗口，再也收不走它——卡片成为桌面的一部分
+/// （壁纸之上、桌面图标之下，鼠标穿透不挡桌面点击）。
+///
+/// 做法：给 Progman 发 `0x052C` 让它拆出一张独立的壁纸 WorkerW
+/// （图标层 WorkerW 含 SHELLDLL_DefView，壁纸层是它 z 序的下一张）；
+/// 没拆出来就直接挂 Progman，效果相同。
+fn embed_desktop(h: HWND) -> bool {
+    unsafe {
+        let Ok(progman) = FindWindowW(w!("Progman"), PCWSTR::null()) else {
+            return false;
+        };
+        // 未公开但多年稳定的消息：Progman 收到后把壁纸层与图标层拆开
+        let _ = SendMessageTimeoutW(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 500, None);
+        let mut host: isize = 0;
+        let _ = EnumWindows(Some(find_wallpaper_workerw), LPARAM(&mut host as *mut isize as isize));
+        let host = if host != 0 {
+            HWND(host as *mut core::ffi::c_void)
+        } else {
+            progman
+        };
+        // popup → child：SetParent 后保持 popup 样式部分系统会有绘制异常
+        let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
+        let _ = SetWindowLongPtrW(h, GWL_STYLE, ((style & !WS_POPUP.0) | WS_CHILD.0) as isize);
+        let _ = SetParent(h, host);
+        true
+    }
+}
+
+/// 枚举子窗口：找 SHELLDLL_DefView（桌面图标宿主）
+unsafe extern "system" fn defview_child(c: HWND, l: LPARAM) -> BOOL {
+    if class_name(c) == "SHELLDLL_DefView" {
+        *(l.0 as *mut bool) = true;
+        return BOOL(0);
+    }
+    BOOL(1)
+}
+
+/// 枚举顶层窗口：找到含 SHELLDLL_DefView 的 WorkerW（图标层），
+/// 壁纸层是它在 z 序里的下一张 WorkerW（EnumWindows 自顶向下枚举）。
+unsafe extern "system" fn find_wallpaper_workerw(h: HWND, l: LPARAM) -> BOOL {
+    if class_name(h) != "WorkerW" {
+        return BOOL(1);
+    }
+    let mut has_defview = false;
+    let _ = EnumChildWindows(
+        h,
+        Some(defview_child),
+        LPARAM(&mut has_defview as *mut bool as isize),
+    );
+    if !has_defview {
+        return BOOL(1);
+    }
+    let mut next = h;
+    loop {
+        let Ok(nxt) = GetWindow(next, GW_HWNDNEXT) else { break };
+        next = nxt;
+        if class_name(next) == "WorkerW" {
+            *(l.0 as *mut isize) = next.0 as isize;
+            return BOOL(0);
+        }
+    }
+    BOOL(1)
 }
 
 /// 文字绘制（带淡描影）：同一句话用反差色先画一遍，混合壁纸上也能读。
@@ -442,6 +564,64 @@ fn ellipsize(soft: &SoftBackend, text: &str, max_w: f32, size: f32) -> String {
     }
     out.push('…');
     out
+}
+
+/// 详情段按可用宽度折行（段间用 "   ·   " 连接），单段超宽时省略号兜底。
+fn detail_lines(soft: &SoftBackend, v: &View, max_w: f32, size: f32) -> Vec<String> {
+    let font = egui::FontId::proportional(size);
+    let sep = "   ·   ";
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for seg in &v.details {
+        let trial = if cur.is_empty() { seg.clone() } else { format!("{cur}{sep}{seg}") };
+        if cur.is_empty() || soft.text_width(&trial, font.clone()) <= max_w {
+            cur = trial;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = seg.clone();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines.into_iter().map(|l| ellipsize(soft, &l, max_w, size)).collect()
+}
+
+/// 卡片内容总高度（逻辑点，宽度按 CARD_W 量）。与 paint 的纵向布局一一对应，
+/// place() 用它把窗口撑到正好装下内容——详情折行、字号放大都不再裁字。
+fn card_height(soft: &mut SoftBackend, v: &View, k: f32) -> f32 {
+    let pad = 16.0 * k;
+    let mut y = 8.0 * k;
+    // ① 标题行
+    let title_font = egui::FontId::proportional(13.0 * k);
+    y += soft.text_height("当地天气", title_font) + 10.0 * k;
+    // ② 主行（图标 / 大温度，取高者）
+    let icon_h = soft.text_height(
+        &v.icon,
+        egui::FontId::proportional(cfg::WEATHER_ICON_SIZE * k * 0.82),
+    );
+    let temp_h = soft.text_height(&v.temp, bold_font(36.0 * k));
+    y += temp_h.max(icon_h) + 12.0 * k;
+    // ③ 详情行（折行，每行 dh，行间 4k，行后 7k）
+    let detail_size = cfg::WEATHER_DETAIL_SIZE * k;
+    let dfont = egui::FontId::proportional(detail_size);
+    let dh = soft.text_height("湿", dfont);
+    let lines = detail_lines(soft, v, CARD_W - pad * 2.0, detail_size);
+    for n in 0..lines.len() {
+        if n > 0 {
+            y += 4.0 * k;
+        }
+        y += dh;
+    }
+    if !lines.is_empty() {
+        y += 7.0 * k;
+    }
+    // ④ 来源行
+    if !v.report.is_empty() {
+        let rep_font = egui::FontId::proportional(9.5 * k);
+        y += soft.text_height("Open-Meteo", rep_font);
+    }
+    y + 6.0 * k // 底部留一点呼吸
 }
 
 /// 按壁纸明暗给一套字色：主文字 / 次要 / 更淡 / 描影
@@ -524,15 +704,21 @@ fn paint(soft: &mut SoftBackend, w: i32, h: i32, scale: f32, v: &View, dark_bg: 
         txt(&p, right_x, stack_y + cond_h + 3.0 * k, &city, city_font, dim, shadow, scale);
         y += row_h + 12.0 * k;
 
-        // ③ 详情行：湿度 / 风 / 体感，一行放不下就省略
+        // ③ 详情行：湿度 / 风 / 体感，一行放不下就折行（不再截断）
         if !v.details.is_empty() {
             let detail_size = cfg::WEATHER_DETAIL_SIZE * k;
-            let detail = v.details.join("   ·   ");
-            let detail = ellipsize(soft, &detail, fw - pad * 2.0, detail_size);
             let dfont = egui::FontId::proportional(detail_size);
             let dh = soft.text_height("湿", dfont.clone());
-            txt(&p, pad, y, &detail, dfont, dim, shadow, scale);
-            y += dh + 7.0 * k;
+            let lines = detail_lines(soft, v, fw - pad * 2.0, detail_size);
+            let gap_line = 4.0 * k;
+            for (n, line) in lines.iter().enumerate() {
+                if n > 0 {
+                    y += gap_line;
+                }
+                txt(&p, pad, y, line, dfont.clone(), dim, shadow, scale);
+                y += dh;
+            }
+            y += 7.0 * k;
         }
 
         // ④ 来源行（数据源 · 发布时间）

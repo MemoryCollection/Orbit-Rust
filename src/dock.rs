@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use windows::core::{w, Interface, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
@@ -22,8 +22,13 @@ use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Shell::{
-    IShellLinkW, SHGetFileInfoW, SHGetImageList, ShellExecuteW, ShellLink,
-    SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHIL_JUMBO, SLGP_RAWPATH,
+    IShellItemImageFactory, IShellLinkW, SHCreateItemFromIDList, SHGetFileInfoW, SHGetImageList,
+    SHParseDisplayName, ShellExecuteW, ShellLink, SIIGBF, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHIL_JUMBO, SLGP_RAWPATH, ILFree,
+};
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::PropertiesSystem::{
+    IPropertyStore, PROPERTYKEY, SHGetPropertyStoreForWindow,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, EnumWindows, GetClassNameW, GetCursorPos,
@@ -897,27 +902,41 @@ impl Dock {
             });
         }
 
-        // 运行中应用（exe 去重，已钉选的跳过）
-        for (exe, hwnd) in &run_map {
-            if pinned_exes.iter().any(|p| !p.is_empty() && p == exe) {
+        // 运行中应用（exe / AUMID 去重，已钉选的跳过）
+        for (key, hwnd) in &run_map {
+            if pinned_exes.iter().any(|p| !p.is_empty() && p == key) {
                 continue;
             }
-            let name = PathBuf::from(exe)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
+            let uwp = key.strip_prefix(UWP_PREFIX);
+            // UWP 的"exe"是宿主 ApplicationFrameHost，拿它当名字只会出现一堆同名项，
+            // 用窗口标题（「设置」「照片」）当名字更接近用户在系统里看到的东西
+            let name = match uwp {
+                Some(_) => window_title(*hwnd).unwrap_or_else(|| key.clone()),
+                None => PathBuf::from(key)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            };
             let norm = normalize_name(&name);
             if pinned_names.iter().any(|p| norm.contains(p.as_str()) || p.contains(&norm)) {
                 continue;
             }
-            // 大图标从 exe 取；拿不到再退回窗口图标
-            let mut rgba = large_icon_of_path(std::path::Path::new(exe), px);
+            // 大图标：UWP 走 AppsFolder 的 App logo，其余从 exe 取；都没有再退回窗口图标
+            let mut rgba = match uwp {
+                Some(aumid) => aumid_icon(aumid, px),
+                None => large_icon_of_path(std::path::Path::new(key), px),
+            };
+            if rgba.is_empty() {
+                if let Some(exe) = exe_path(*hwnd) {
+                    rgba = large_icon_of_path(std::path::Path::new(&exe), px);
+                }
+            }
             if rgba.is_empty() {
                 rgba = unsafe { render::window_icon(*hwnd) }
                     .and_then(|h| render::capture_icon_rgba(h, px))
                     .unwrap_or_default();
             }
-            let wins = groups.get(exe).cloned().unwrap_or_else(|| vec![*hwnd]);
+            let wins = groups.get(key).cloned().unwrap_or_else(|| vec![*hwnd]);
             // 多开时提示条写"名字 + 窗口数"，用户才知道点一下会弹列表
             let tip = if wins.len() > 1 {
                 format!("{}（{} 个窗口）", name, wins.len())
@@ -928,7 +947,7 @@ impl Dock {
                 tip,
                 name,
                 norm,
-                exe: exe.clone(),
+                exe: key.clone(),
                 running: true,
                 target: Target::Window(*hwnd),
                 wins,
@@ -953,6 +972,9 @@ impl Dock {
         if self.hovered.map(|i| i >= self.items.len()).unwrap_or(false) {
             self.hovered = None;
         }
+        // 列表重排后按下标记的 `active` 会指到别的图标上：跟着重算一次，
+        // 别让指示条在两个图标之间错位（T_FLASH 的 300ms 节流太慢，扫完就得对上）
+        self.active = self.foreground_hits().0;
         changed
     }
 
@@ -1269,6 +1291,30 @@ impl Dock {
         }
     }
 
+    /// 波浪放大的瞬时值：`(图标被抬出的距离, 放大后的图标边长)`（k=1 逻辑点）。
+    /// 与 dockview::paint 同一套公式：光标不在 Dock 上时为 (0, DOCK_ICON)。
+    fn pop_wave(&self, axis: f32) -> (f32, f32) {
+        let anchor = settings::dock_anchor();
+        let vertical = anchor.is_vertical();
+        let (gx, gy) = match anchor {
+            settings::DockAnchor::Bottom => (0.0, -1.0),
+            settings::DockAnchor::Top => (0.0, 1.0),
+            settings::DockAnchor::Left => (1.0, 0.0),
+            settings::DockAnchor::Right => (-1.0, 0.0),
+        };
+        let m = crate::dockview::dock_margin();
+        let cursor_axis = self.mouse.map(|(x, y)| {
+            let x = x - if gx < 0.0 { m } else { 0.0 };
+            let y = y - if gy < 0.0 { m } else { 0.0 };
+            if vertical { y } else { x }
+        });
+        let mag = crate::dockview::wave_mag(cursor_axis, axis);
+        (
+            (cfg::DOCK_H * 0.5) * (mag - 1.0) / cfg::DOCK_WAVE_AMP,
+            cfg::DOCK_ICON * mag,
+        )
+    }
+
     /// 根据当前悬停项显示提示条（托盘用 tooltip 名字，任务图标用程序名）
     fn update_tip(&mut self) {
         // 末端细长条：按钮本身没有文字，靠提示条说清楚它是干什么的
@@ -1282,13 +1328,14 @@ impl Dock {
                     let cx = wr.left + (r[0] + r[2] / 2.0) as i32;
                     let cy = wr.top + (r[1] + r[3] / 2.0) as i32;
                     let ty = wr.top + r[1] as i32;
-                    self.show_tip("返回桌面", cx, cy, ty);
+                    self.show_tip("返回桌面", cx, cy, ty, 0);
                 }
                 None => self.hide_tip(),
             }
             return;
         }
-        let (text, rect) = if let Some(i) = self.hovered_tray {
+        let show_desktop = settings::show_desktop_btn();
+        let (text, rect, axis) = if let Some(i) = self.hovered_tray {
             let rect = self.tray_rects.get(i).copied();
             let item = self
                 .tray_shown
@@ -1297,12 +1344,18 @@ impl Dock {
                 .map(|it| it.name.clone())
                 .unwrap_or_default();
             match rect {
-                Some(r) => (item, r),
+                Some(r) => (
+                    item,
+                    r,
+                    crate::dockview::tray_axis(i, self.items.len(), show_desktop),
+                ),
                 None => return self.hide_tip(),
             }
         } else if let Some(i) = self.hovered {
             match (self.rects.get(i).copied(), self.items.get(i)) {
-                (Some(r), Some(it)) => (it.tip.clone(), r),
+                (Some(r), Some(it)) => {
+                    (it.tip.clone(), r, crate::dockview::icon_axis(i, show_desktop))
+                }
                 _ => return self.hide_tip(),
             }
         } else {
@@ -1317,13 +1370,26 @@ impl Dock {
         }
         let cx = wr.left + (rect[0] + rect[2] / 2.0) as i32;
         let cy = wr.top + (rect[1] + rect[2] / 2.0) as i32;
-        let ty = wr.top + rect[1] as i32;
-        self.show_tip(&text, cx, cy, ty);
+        // 弹出避让：悬停图标放大后会越过底板边缘，提示条要贴着**弹出的图标**
+        // 外缘摆，不然弹出的半截正好压住提示条（与 dockview::paint 同一套波浪）
+        let (rise, side) = self.pop_wave(axis);
+        let se = (self.scale * settings::icon_scale().clamp(0.5, 2.0)).max(0.5);
+        let (ty, clear) = if matches!(settings::dock_anchor(), settings::DockAnchor::Bottom) {
+            // 下锚：提示条在图标上方 —— 直接贴弹出图标的上缘（静止时贴槽位里的图标）
+            let dy = (cfg::DOCK_SLOT * 0.5 - rise - side * 0.5) * se;
+            (wr.top + rect[1] as i32 + dy.round() as i32, 0)
+        } else {
+            // 其余锚：图标越过底板边缘的伸出量，提示条整体再挪出去
+            let out = ((rise + side * 0.5 - cfg::DOCK_H * 0.5).max(0.0) * se).ceil() as i32;
+            (wr.top + rect[1] as i32, out)
+        };
+        self.show_tip(&text, cx, cy, ty, clear);
     }
 
     /// 提示条位置随 Dock 锚位走：下 = 图标上方；上 = Dock 下方；
     /// 左 = Dock 右侧；右 = Dock 左侧。文本在锚点方向上居中。
-    fn show_tip(&mut self, text: &str, cx: i32, cy: i32, ty: i32) {
+    /// `clear`：弹出图标越过底板边缘的额外让位（物理像素，见 update_tip）。
+    fn show_tip(&mut self, text: &str, cx: i32, cy: i32, ty: i32, clear: i32) {
         if self.tip.is_invalid() {
             crate::vlog!("[dock] 提示条窗口无效，跳过");
             return;
@@ -1351,9 +1417,9 @@ impl Dock {
         let board_b = board_t + bh;
         let (x, y) = match settings::dock_anchor() {
             crate::settings::DockAnchor::Bottom => (clamp_x(cx - w / 2), ty - h - gap),
-            crate::settings::DockAnchor::Top => (clamp_x(cx - w / 2), board_b + gap),
-            crate::settings::DockAnchor::Left => (board_r + gap, clamp_y(cy - h / 2)),
-            crate::settings::DockAnchor::Right => (board_l - w - gap, clamp_y(cy - h / 2)),
+            crate::settings::DockAnchor::Top => (clamp_x(cx - w / 2), board_b + gap + clear),
+            crate::settings::DockAnchor::Left => (board_r + gap + clear, clamp_y(cy - h / 2)),
+            crate::settings::DockAnchor::Right => (board_l - w - gap - clear, clamp_y(cy - h / 2)),
         };
         unsafe {
             let _ = SetWindowPos(self.tip, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
@@ -1444,27 +1510,30 @@ impl Dock {
         }
     }
 
-    /// 前台应用在 `items` 里的下标：先按窗口句柄精确匹配，再按 exe 兜底
-    /// （同一程序有多个窗口时，前台那个可能不是 Dock 记下的那个）
     /// 查前台落在哪个 Dock 图标、哪个托盘图标上：返回 (应用下标, 托盘下标)。
     ///
     /// 应用位按"该程序的任一窗口是不是前台"判定（多开折叠后不能只比一个句柄），
     /// 拿不到再退回 exe 比对；托盘位按托盘图标所属 exe 比对（explorer 那批没 exe 的不参与）。
+    ///
+    /// 前台窗口先过一遍 [`foreground_window`] 的筛子：点桌面 / 任务栏之后
+    /// `GetForegroundWindow` 给的是 `Progman`/`WorkerW`/`Shell_TrayWnd`，属主同样是
+    /// explorer.exe，不过滤就会把指示条一直挂在"文件资源管理器"图标下面。
     fn foreground_hits(&self) -> (Option<usize>, Option<usize>) {
-        let fg = unsafe { GetForegroundWindow() };
-        if fg.0.is_null() {
+        let Some(fg) = foreground_window() else {
             return (None, None);
-        }
+        };
         let exe = exe_path(fg).map(|s| s.to_lowercase());
+        // 应用位按 `window_key`（UWP 是 AUMID，其余是 exe）比对，托盘位仍比真 exe
+        let key = window_key(fg);
         let app = self
             .items
             .iter()
             .position(|it| it.wins.iter().any(|h| *h == fg))
             .or_else(|| {
-                exe.as_ref().and_then(|e| {
+                key.as_ref().and_then(|k| {
                     self.items
                         .iter()
-                        .position(|it| !it.exe.is_empty() && it.exe == *e)
+                        .position(|it| !it.exe.is_empty() && it.exe == *k)
                 })
             });
         let tray = exe.as_ref().and_then(|e| {
@@ -1823,16 +1892,20 @@ fn running_groups() -> BTreeMap<String, Vec<HWND>> {
     unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut hwnds as *mut Vec<HWND> as isize));
     }
-    let fg = unsafe { GetForegroundWindow() };
+    let fg = foreground_window();
     let mut map: BTreeMap<String, Vec<HWND>> = BTreeMap::new();
     for hwnd in hwnds {
-        let Some(exe) = exe_path(hwnd) else { continue };
-        map.entry(exe.to_lowercase()).or_default().push(hwnd);
+        // 键 = UWP 的 AUMID 或 exe 全路径：同一个 ApplicationFrameHost 里的不同 UWP
+        // 应用必须分开，否则「设置」「照片」会挤在最前面那一项上
+        let Some(key) = window_key(hwnd) else { continue };
+        map.entry(key).or_default().push(hwnd);
     }
     // 前台窗口提到组首：布局别按枚举顺序乱动，但"点一下切过去"要命中用户正在看的那个
-    for wins in map.values_mut() {
-        if let Some(pos) = wins.iter().position(|h| *h == fg) {
-            wins.swap(0, pos);
+    if let Some(fg) = fg {
+        for wins in map.values_mut() {
+            if let Some(pos) = wins.iter().position(|h| *h == fg) {
+                wins.swap(0, pos);
+            }
         }
     }
     map
@@ -1841,14 +1914,16 @@ fn running_groups() -> BTreeMap<String, Vec<HWND>> {
 fn running_apps() -> BTreeMap<String, HWND> {
     running_groups()
         .into_iter()
-        .filter_map(|(exe, wins)| wins.first().map(|h| (exe, *h)))
+        .filter_map(|(key, wins)| wins.first().map(|h| (key, *h)))
         .collect()
 }
 
-/// 设置页「添加固定图标」用：正在运行的应用（显示名, exe 全路径），按名字排序
+/// 设置页「添加固定图标」用：正在运行的应用（显示名, exe 全路径），按名字排序。
+/// UWP 项（键是 `uwp:<AUMID>`）不列：固定项要落成 .lnk/exe 路径，AUMID 固定不了。
 pub fn running_app_list() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = running_apps()
         .into_keys()
+        .filter(|k| !k.starts_with(UWP_PREFIX))
         .map(|exe| {
             let name = PathBuf::from(&exe)
                 .file_stem()
@@ -1883,6 +1958,144 @@ fn window_title(hwnd: HWND) -> Option<String> {
     }
 }
 
+/// 这些类名的窗口属主是 explorer.exe（桌面 / 任务栏 / 开始菜单），或者是本程序
+/// 自己的分层窗。它们出现在"前台"不代表用户切到了某个程序：桌面和任务栏都不该
+/// 点亮 Dock 指示条，也不该出现在运行中应用列表里。
+fn is_shell_class(cls: &str) -> bool {
+    matches!(
+        cls,
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "NotifyIconOverflowWindow"
+            | "TopLevelWindowForOverflowXamlIsland"
+            | "Windows.UI.Core.CoreWindow"
+            | "XamlExplorerHostIslandWindow"
+            | "MultitaskingViewFrame"
+            | "ForegroundStaging"
+            | "TaskListThumbnailWnd"
+            | "ORBIT_CAPSULE"
+            | "ORBIT_DOCK"
+    )
+}
+
+/// 窗口类名（取不到返回空串）
+fn window_class(hwnd: HWND) -> String {
+    let mut buf = [0u16; 128];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// 真正"用户切过去的程序窗口"：无效 / 不可见 / cloaked / 外壳窗口一律返回 None。
+///
+/// 桌面上点一下、任务栏上点一下、Win+D 之后，前台会落到 Progman / WorkerW /
+/// Shell_TrayWnd 上；它们的 exe 也是 explorer.exe，直接拿 exe 比 Dock 图标就会
+/// 误判成"文件资源管理器在前台"。关掉的 UWP 还会留下 cloaked 的前台窗，同样跳过。
+fn foreground_window() -> Option<HWND> {
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() || !unsafe { IsWindowVisible(fg).as_bool() } {
+        return None;
+    }
+    let mut cloaked = 0u32;
+    if unsafe {
+        DwmGetWindowAttribute(
+            fg,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
+    .is_ok()
+        && cloaked != 0
+    {
+        return None;
+    }
+    if is_shell_class(&window_class(fg)) {
+        return None;
+    }
+    Some(fg)
+}
+
+// ---------- 打包应用（UWP）：顶层窗是宿主进程的壳，真正的 App 靠 AUMID 认 ----------
+
+/// UWP 项在 `DockItem.exe` 里存 `uwp:<AUMID>` 当分组键（普通应用存 exe 全路径）。
+const UWP_PREFIX: &str = "uwp:";
+
+/// `PKEY_AppUserModel_ID`（`System.AppUserModel.ID`）。windows crate 把它挂在
+/// `Win32_Storage_EnhancedStorage` 上，为一个常量不值得多开一个 feature，直接按 GUID + pid 写死。
+const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: windows::core::GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+    pid: 5,
+};
+
+/// 窗口上挂的 AppUserModelID。UWP 的 `ApplicationFrameWindow` 上挂的是**宿主 App** 的
+/// AUMID（`Microsoft.Windows.Photos_8wekyb3d8bbwe!App` 这种），不是 ApplicationFrameHost。
+fn window_aumid(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(hwnd).ok()?;
+        let pv = store.GetValue(&PKEY_APP_USER_MODEL_ID).ok()?;
+        let s = pv.to_string().trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+}
+
+/// Dock 的分组键：UWP 用 `uwp:<AUMID>`。
+///
+/// 所有 UWP 应用的顶层窗都是同一个 ApplicationFrameHost.exe 进程里的
+/// `ApplicationFrameWindow`，按 exe 分组会把「设置」「照片」全并成一个
+/// ApplicationFrameHost 项——而这个 exe 根本没有图标资源，所以那个项永远没有图标。
+/// 其余应用仍按 exe 全路径（小写）分组。
+fn window_key(hwnd: HWND) -> Option<String> {
+    if window_class(hwnd).eq_ignore_ascii_case("ApplicationFrameWindow") {
+        if let Some(a) = window_aumid(hwnd) {
+            return Some(format!("{UWP_PREFIX}{a}"));
+        }
+    }
+    exe_path(hwnd).map(|s| s.to_lowercase())
+}
+
+/// 按 AUMID 取应用图标（开始菜单/任务栏显示的那一张）：走 `shell:AppsFolder\<AUMID>`
+/// 的 `IShellItemImageFactory`，能拿到 App 的 256px logo，比宿主 exe 的通用图标清楚得多。
+///
+/// 注意 `SHCreateItemFromParsingName` 不认 `shell:` 协议（实测 0x80070003 找不到路径），
+/// 必须先 `SHParseDisplayName` 把外壳命名空间解析成 PIDL 再建 item。
+fn aumid_icon(aumid: &str, px: i32) -> Vec<u8> {
+    if px <= 0 {
+        return Vec::new();
+    }
+    let path = format!("shell:AppsFolder\\{aumid}");
+    let wide = to_wide(std::ffi::OsStr::new(&path));
+    unsafe {
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        if let Err(e) = SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) {
+            crate::vlog!("[dock] 解析 {aumid} 失败: {e:?}");
+            return Vec::new();
+        }
+        if pidl.is_null() {
+            crate::vlog!("[dock] {aumid} 解析出空 PIDL");
+            return Vec::new();
+        }
+        let item: windows::core::Result<IShellItemImageFactory> = SHCreateItemFromIDList(pidl);
+        ILFree(Some(pidl));
+        let item = match item {
+            Ok(i) => i,
+            Err(e) => {
+                crate::vlog!("[dock] AppsFolder item 打不开 {aumid}: {e:?}");
+                return Vec::new();
+            }
+        };
+        let size = SIZE { cx: px, cy: px };
+        match item.GetImage(size, SIIGBF(SIIGBF_ICONONLY.0 | SIIGBF_BIGGERSIZEOK.0)) {
+            Ok(hbm) => render::bitmap_rgba(hbm, px).unwrap_or_default(),
+            Err(e) => {
+                crate::vlog!("[dock] 取 {aumid} 的图标失败: {e:?}");
+                Vec::new()
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn enum_proc(hwnd: HWND, l: LPARAM) -> BOOL {
     unsafe {
         let out = &mut *(l.0 as *mut Vec<HWND>);
@@ -1914,17 +2127,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, l: LPARAM) -> BOOL {
         let mut buf = [0u16; 128];
         let n = GetClassNameW(hwnd, &mut buf);
         let cls = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-        if matches!(
-            cls.as_str(),
-            "Progman"
-                | "WorkerW"
-                | "Shell_TrayWnd"
-                | "Shell_SecondaryTrayWnd"
-                | "NotifyIconOverflowWindow"
-                | "Windows.UI.Core.CoreWindow"
-                | "ORBIT_CAPSULE"
-                | "ORBIT_DOCK"
-        ) {
+        if is_shell_class(&cls) {
             return true.into();
         }
         if GetWindowTextLengthW(hwnd) == 0 {

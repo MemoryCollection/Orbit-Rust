@@ -39,7 +39,8 @@ fn icon_k() -> f32 {
 /// 波浪放大倍数：光标停在主轴 `c` 处时，主轴坐标 `axis` 上的图标放大多少。
 /// 高斯衰减（macOS Dock 同款手感）：光标正上方 ≈ 1+AMP，相邻格平滑过渡到 1。
 /// `cursor_axis = None`（光标不在 Dock 上）时恒为 1。
-fn wave_mag(cursor_axis: Option<f32>, axis: f32) -> f32 {
+/// dock.rs 算提示条避让时也用这把尺子，所以公开。
+pub fn wave_mag(cursor_axis: Option<f32>, axis: f32) -> f32 {
     match cursor_axis {
         None => 1.0,
         Some(c) => {
@@ -47,6 +48,24 @@ fn wave_mag(cursor_axis: Option<f32>, axis: f32) -> f32 {
             1.0 + cfg::DOCK_WAVE_AMP * (-d * d).exp()
         }
     }
+}
+
+/// 第 i 个应用图标的主轴中心（底板坐标，k=1 逻辑点）。
+/// 与 paint 的排布严格一致：paint 用同一个函数取 axis，不会两处漂移。
+pub fn icon_axis(i: usize, show_desktop: bool) -> f32 {
+    cfg::DOCK_PAD_X
+        + desktop_side(show_desktop)
+        + i as f32 * (cfg::DOCK_SLOT + cfg::DOCK_GAP)
+        + cfg::DOCK_SLOT * 0.5
+}
+
+/// 第 j 个托盘图标的主轴中心。任务组与托盘组之间隔一个普通间距
+/// （分隔线画在间隙里，paint 里 -gap/+gap 一去一回正好是 n*(slot+gap)）。
+pub fn tray_axis(j: usize, n_apps: usize, show_desktop: bool) -> f32 {
+    let base = cfg::DOCK_PAD_X
+        + desktop_side(show_desktop)
+        + if n_apps > 0 { n_apps as f32 * (cfg::DOCK_SLOT + cfg::DOCK_GAP) } else { 0.0 };
+    base + j as f32 * (cfg::DOCK_TRAY_SLOT + cfg::DOCK_TRAY_GAP) + cfg::DOCK_TRAY_SLOT * 0.5
 }
 
 /// 窗口在内侧多留的一圈**透明留白**（逻辑点，k=1 基准）。
@@ -247,11 +266,9 @@ impl DockView {
                     let (rx, ry) = if vertical { (rc, pos) } else { (pos, rc) };
                     let rect = egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(slot, slot));
                     rects_pt.push([rx, ry, slot, slot]);
-                    // 波浪放大：中心沿主轴按槽位算，放大倍数随光标距离衰减。
-                    // 满幅悬停时图标中心被抬到 Dock 内缘（rise = cross/2）——
-                    // 一半留在 Dock 里、一半伸进外侧留白（macOS 手感）；
-                    // 相邻图标按同一比例平滑过渡，光标不在时 rise = 0。
-                    let axis = pos + slot * 0.5;
+                    // 波浪放大：中心沿主轴按槽位算（几何只此一处，见 icon_axis），
+                    // 放大倍数随光标距离衰减。
+                    let axis = icon_axis(i, show_desktop);
                     let mag = wave_mag(cursor_axis, axis);
                     let side = isz * mag;
                     let rise = (cross * 0.5) * (mag - 1.0) / cfg::DOCK_WAVE_AMP;
@@ -259,17 +276,6 @@ impl DockView {
                         ox + (rx + slot * 0.5) + gx * rise,
                         oy + (ry + slot * 0.5) + gy * rise,
                     );
-                    // 浅色主题下彩色图标直接压在浅底上会发脏，先垫一层圆角白底
-                    if !buf.is_empty() && cfg::cur().icon_backing != 0 {
-                        p.rect_filled(
-                            egui::Rect::from_center_size(
-                                icon_c,
-                                egui::vec2(side + 2.0, side + 2.0),
-                            ),
-                            egui::CornerRadius::same((side * 0.22) as u8),
-                            argb(cfg::cur().icon_backing),
-                        );
-                    }
                     if !buf.is_empty() {
                         let px = buf.len() / 4;
                         let side_px = (px as f32).sqrt().round().max(1.0) as usize;
@@ -332,7 +338,7 @@ impl DockView {
                         let (rx, ry) = if vertical { (rc, pos) } else { (pos, rc) };
                         tray_rects_pt.push([rx, ry, tslot, tslot]);
                         // 托盘图标与任务图标同一套波浪放大（大小已统一）
-                        let t_axis = pos + tslot * 0.5;
+                        let t_axis = tray_axis(i, icons.len(), show_desktop);
                         let t_mag = wave_mag(cursor_axis, t_axis);
                         let t_side = tisz * t_mag;
                         let t_rise = (cross * 0.5) * (t_mag - 1.0) / cfg::DOCK_WAVE_AMP;
@@ -340,16 +346,6 @@ impl DockView {
                             ox + (rx + tslot * 0.5) + gx * t_rise,
                             oy + (ry + tslot * 0.5) + gy * t_rise,
                         );
-                        if !buf.is_empty() && cfg::cur().icon_backing != 0 {
-                            p.rect_filled(
-                                egui::Rect::from_center_size(
-                                    t_center,
-                                    egui::vec2(t_side + 2.0, t_side + 2.0),
-                                ),
-                                egui::CornerRadius::same((t_side * 0.22) as u8),
-                                argb(cfg::cur().icon_backing),
-                            );
-                        }
                         if !buf.is_empty() {
                             let px = buf.len() / 4;
                             let side_px = (px as f32).sqrt().round().max(1.0) as usize;

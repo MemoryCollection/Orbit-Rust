@@ -188,8 +188,15 @@ main.rs → app.rs（启动/消息循环）
    键不存在 = 还没改过 → 回落到系统钉选。设置页「Dock → 固定图标」里可以逐个移除、
    从"正在运行的应用"一键固定、或用系统文件对话框挑 exe/快捷方式。固定项**不要求程序在运行**
    （图标从 exe/lnk 取，点一下 `ShellExecuteW` 启动）；取不到图标的钉选项直接跳过，不占空槽。
-9. **前台应用指示条**：`Dock::active_index()` 用 `GetForegroundWindow()` 定位当前前台应用
+9. **前台应用指示条**：`Dock::foreground_hits()` 用 `GetForegroundWindow()` 定位当前前台应用
    （先按窗口句柄精确匹配，再按 exe 兜底），`T_FLASH`（70ms）里比对变化后重绘。
+   **前台窗口先过 `foreground_window()` 的筛子**：无效 / 不可见 / DWM cloaked / 外壳窗口
+   （`is_shell_class`：`Progman` `WorkerW` `Shell_TrayWnd` `Shell_SecondaryTrayWnd`
+   `NotifyIconOverflowWindow` `XamlExplorerHostIslandWindow` `MultitaskingViewFrame`
+   `TaskListThumbnailWnd` `Windows.UI.Core.CoreWindow` 以及 `ORBIT_*`）一律视为"没有前台程序"。
+   否则点桌面 / Win+D / 点任务栏之后，前台是 explorer.exe 的桌面壳窗口，按 exe 兜底会把指示条
+   一直挂在「文件资源管理器」钉选项下面。`running_groups()` 的"前台窗口提到组首"也走同一个筛子；
+   `scan()` 末尾会同步重算一次 `active`，列表重排后不会短暂指错图标。
    `dockview` 在这个图标下方画一条 `DOCK_ACTIVE_H = 3` 点厚、槽位 34% 长的强调色短条
    （竖排 dock 转 90°，贴在外侧边上）。
 10. **托盘轮询**：托盘镜像由 Dock 持有，跟应用重扫共用 2s 定时器（`T_RESCAN`）：`scan() | poll_tray()` 任一有变化就重绘。收到 `TaskbarCreated`（explorer 重启）时把镜像整个丢掉重建。
