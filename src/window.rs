@@ -318,6 +318,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             // 设置页点「应用/还原」后主动投来：立即按新版本重绘，不等 500ms 轮询
             m if m == crate::appmsg::WM_SETTINGS_APPLIED => {
+                // 设置页是独立子进程：它写的是 settings.txt，本进程的内存还是旧值。
+                // 先按 mtime 重读一次再重绘，否则这一帧画的还是旧样式（下一轮 500ms
+                // 轮询才跟上，视觉上是"点应用后先闪一下旧样子"）。
+                settings::reload_if_changed();
                 app.seen_settings = settings::version();
                 if app.panel.is_some() {
                     app.reload_panel();

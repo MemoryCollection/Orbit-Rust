@@ -212,6 +212,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         }
         match msg {
             m if m == crate::appmsg::WM_SETTINGS_APPLIED => {
+                // 设置页在独立子进程里写盘，本进程内存是旧值：先重读再按新主题重绘
+                crate::settings::reload_if_changed();
                 card.apply(hwnd);
                 LRESULT(0)
             }

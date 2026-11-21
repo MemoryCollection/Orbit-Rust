@@ -160,27 +160,34 @@ fn wechat_instances() -> Vec<(String, bool)> {
     }
 }
 
-/// 找主进程的胶囊窗口（类名 ORBIT_CAPSULE）
-fn parent_hwnd() -> Option<windows::Win32::Foundation::HWND> {
+/// 找主进程里某个类名的窗口（类名见 app.rs / dock.rs / weathercard.rs 的注册）
+fn find_main_window(class: windows::core::PCWSTR) -> Option<windows::Win32::Foundation::HWND> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
     unsafe {
-        let h = FindWindowW(windows::core::w!("ORBIT_CAPSULE"), PCWSTR::null()).ok()?;
-        if h.is_invalid() {
-            None
-        } else {
-            Some(h)
+        match FindWindowW(class, PCWSTR::null()) {
+            Ok(h) if !h.is_invalid() => Some(h),
+            _ => None,
         }
     }
 }
 
-/// 给主进程胶囊窗口投一条消息（跨进程）
+/// 给主进程的所有窗口投一条消息：胶囊 + Dock + 天气卡片。
+///
+/// 早先只投胶囊，Dock 得等自己的 500ms 轮询才更新，改 Dock 透明度/图标大小时
+/// 会明显"慢半拍"。跨进程拿不到 appmsg 里登记的 HWND，只能按类名找。
 fn post_to_parent(msg: u32) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-    if let Some(h) = parent_hwnd() {
-        unsafe {
-            let _ = PostMessageW(h, msg, WPARAM(0), LPARAM(0));
+    for class in [
+        windows::core::w!("ORBIT_CAPSULE"),
+        windows::core::w!("ORBIT_DOCK"),
+        windows::core::w!("ORBIT_WEATHER_CARD"),
+    ] {
+        if let Some(h) = find_main_window(class) {
+            unsafe {
+                let _ = PostMessageW(h, msg, WPARAM(0), LPARAM(0));
+            }
         }
     }
 }
@@ -317,6 +324,18 @@ pub fn init(_instance: windows::Win32::Foundation::HINSTANCE) {}
 pub fn run_child() {
     use winit::platform::windows::EventLoopBuilderExtWindows as _;
     IS_CHILD.store(true, Ordering::Relaxed);
+    // 子进程是独立进程，settings 的静态变量全是 UNLOADED——必须先读一次本地
+    // settings.txt，否则设置页显示的是编译期默认值，点「应用」还会把默认值写回去，
+    // 直接覆盖掉用户的配置。（同进程时代这条由主进程的 window.rs 负责，改子进程后
+    // 落到这里。）
+    crate::settings::init();
+    crate::tlog!(
+        "[settings] 子进程已载入本地配置：version={} theme={} pill_alpha={:.2} dock_alpha={:.2}",
+        crate::settings::version(),
+        crate::settings::theme_index(),
+        crate::settings::pill_alpha(),
+        crate::settings::dock_alpha()
+    );
     load_runtime();
     let options = eframe::NativeOptions {
         // 建窗前就算好居中位置（默认 false：窗口先出现在左上角，首帧再跳到中间，
@@ -374,11 +393,50 @@ fn ink_on(fill: u32) -> egui::Color32 {
     let g = ((fill >> 8) & 0xFF) as f32;
     let b = (fill & 0xFF) as f32;
     let lum = 0.299 * r + 0.587 * g + 0.114 * b;
-    if lum > 150.0 {
+    // 阈值取 118（而不是 150）：陶土棕 #B07A4E 这类中等亮度的强调色亮度约 133，
+    // 按 150 判会选白字，白字压在 85% 不透明的棕色上只有 2.6:1，小字看着发虚；
+    // 改成深字后约 4.6:1。浅紫 / 浅蓝这类高亮强调色仍然落在深字一侧。
+    if lum > 118.0 {
         egui::Color32::from_rgb(0x1C, 0x1A, 0x1F)
     } else {
         egui::Color32::WHITE
     }
+}
+
+// ---------- 开关类控件的主题化配色 ----------
+//
+// 早先这些按钮直接用 Blue 600 + 白字，只有深色主题下能看：浅色主题（Calm 浅色 /
+// M3 浅色）上「关」态的白 20% 底几乎看不出，「开」态的蓝底白字又和奶油底打架。
+// 统一改成从当前主题派生：底色取强调色 / 正文色的低透明度，文字色按底色亮度反选，
+// 这样 6 套主题（含浅色）都不需要单独调。
+
+/// 「开」态底色：主题强调色，压到 85% 不透明（浅色主题的强调色偏浅，太透会糊进背景）
+fn on_fill() -> egui::Color32 {
+    argb((0xD9 << 24) | (cfg::cur().accent & 0x00FF_FFFF))
+}
+
+/// 「开」态文字：按强调色亮度选深字 / 浅字
+fn on_text() -> egui::Color32 {
+    ink_on(cfg::cur().accent)
+}
+
+/// 「关」态底色：正文色做 12% 中性底（深色主题=淡白，浅色主题=淡黑，两边都看得出边界）
+fn off_fill() -> egui::Color32 {
+    argb((0x1F << 24) | (cfg::cur().text & 0x00FF_FFFF))
+}
+
+/// 「关」态文字：正文色压到 55%
+fn off_text() -> egui::Color32 {
+    argb(cfg::cur().text).gamma_multiply(0.62)
+}
+
+/// 成功/已连通这类语义绿：深色主题用亮绿，浅色主题换深绿才够对比
+fn ok_green() -> egui::Color32 {
+    argb(if cfg::cur().dark {
+        0xFF_3D_D6_8C
+    } else {
+        0xFF_1B_7F_45
+    })
 }
 
 fn shade(c: u32, k: f32) -> u32 {
@@ -402,26 +460,52 @@ fn apply_style(ctx: &egui::Context) {
     let panel = argb(t.panel_bg);
     let text_body = argb(t.text_body);
     let accent = argb(t.accent);
-    let hover = argb(t.hover);
     let border = argb(t.panel_border);
+    // 控件底：从面板底色派生一档"抬起"色。深色主题要更亮、浅色主题要更暗，
+    // 都用同一个 k→色 的映射容易在浅色主题上糊成一片，所以两边分开取系数。
+    let raised = argb(shade(t.panel_bg, if t.dark { 1.14 } else { 0.94 }));
+    // hover 走主题 hover 色（本来就带低透明度），再压一层同色系实底，
+    // 免得浅色主题下 0x0E 的 alpha 几乎看不出"指到哪一行"
+    let hover_solid = argb(shade(t.panel_bg, if t.dark { 1.22 } else { 0.90 }));
     ctx.set_theme(th);
     ctx.style_mut_of(th, |st| {
         let v = &mut st.visuals;
         v.panel_fill = panel;
         v.window_fill = panel;
+        // 全局文字色统一用主题正文色：所有 RichText 不加 color 时都由此兜底，
+        // 浅色主题下才不会继承 egui 深色默认的白字
         v.override_text_color = Some(text_body);
         v.selection.bg_fill = accent;
-        // 选中项的文字色跟着强调色的亮度走（否则浅紫底 + 白字读不清）
-        v.selection.stroke = egui::Stroke::new(0.0, ink_on(t.accent));
-        v.widgets.hovered.bg_fill = hover;
-        v.widgets.active.bg_fill = hover;
+        // 选中项的文字色跟着强调色的亮度走（否则浅紫底 + 白字读不清）。
+        // 宽度不能给 0：TextEdit 的选中文字就是用它画的，0 = 看不见。
+        v.selection.stroke = egui::Stroke::new(1.0, ink_on(t.accent));
+        // 普通按钮 / 输入框轨道：抬起色，保证在面板上分得清边界
+        v.widgets.inactive.bg_fill = raised;
+        v.widgets.inactive.weak_bg_fill = raised;
+        v.widgets.noninteractive.bg_fill = raised;
+        v.widgets.noninteractive.weak_bg_fill = raised;
+        v.widgets.hovered.bg_fill = hover_solid;
+        v.widgets.hovered.weak_bg_fill = hover_solid;
+        v.widgets.active.bg_fill = hover_solid;
+        v.widgets.active.weak_bg_fill = hover_solid;
+        // 描边统一用主题分隔线色：浅色主题下默认的中灰描边会显脏
+        v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
+        v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
         v.window_corner_radius = egui::CornerRadius::same(WIN_RADIUS as u8);
         v.window_stroke = egui::Stroke::new(1.0, border);
-        if t.dark {
-            // 深色下输入框/轨道要比面板再暗一档才有凹陷感；浅色交给 egui 默认
-            v.extreme_bg_color = argb(shade(t.panel_bg, 0.86));
-            v.widgets.noninteractive.bg_fill = argb(shade(t.panel_bg, 1.14));
-        }
+        // 次级/说明文字（`.weak()`）的专用色。
+        //
+        // egui 默认是「正文色 × weak_text_alpha(0.6)」，浅色主题下压到 0.54 的
+        // 透明度，压在白底上只有 3.1:1，说明文字看着发灰发虚。这里显式给一个
+        // 透明度更高的同色：浅色 72%、深色 66%，两边的对比度都能到 5:1 左右。
+        v.weak_text_color = Some(argb(
+            ((if t.dark { 0xA8 } else { 0xB8 }) << 24) | (t.text & 0x00FF_FFFF),
+        ));
+        // 输入框/滑条槽：深色主题再暗一档才有凹陷感；浅色主题反向往亮推，
+        // 让输入框从奶油面板上"浮"出来（再配合上面的 border 描边就有边界了）
+        v.extreme_bg_color = argb(shade(t.panel_bg, if t.dark { 0.86 } else { 1.04 }));
+        // 非交互文字兜底：次级文字色（别用 divider——那个带 0x12 alpha，当文字用会看不见）
+        v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, argb(t.text_dim));
     });
 }
 
@@ -865,7 +949,7 @@ impl SettingsApp {
                         egui::RichText::new(if *got { "已拿到" } else { "未拿到" })
                             .size(12.0)
                             .color(if *got {
-                                argb(0xFF_2F_C6_6F)
+                                ok_green()
                             } else {
                                 argb(cfg::cur().text_dim)
                             }),
@@ -1644,7 +1728,7 @@ impl SettingsApp {
                         egui::RichText::new(if verified { "✓ 已连通" } else { "未验证" })
                             .size(11.5)
                             .color(if verified {
-                                argb(0xFF_2F_C6_6F)
+                                ok_green()
                             } else {
                                 argb(cfg::cur().text_dim)
                             }),
@@ -1726,7 +1810,7 @@ impl SettingsApp {
                         settings::set_dock_alpha(alpha);
                     }
                     ui.label(
-                        egui::RichText::new(format!("{:.0}%", settings::dock_alpha() * 100.0))
+                        egui::RichText::new(format!("{:.0}%", alpha * 100.0))
                             .size(12.5)
                             .monospace(),
                     );
@@ -1770,17 +1854,10 @@ impl SettingsApp {
                     } else {
                         !settings::tray_hidden(key)
                     };
-                    let fill = if on {
-                        argb(0x66_3C_8D_FF)
-                    } else {
-                        argb(0x33_FF_FF_FF)
-                    };
-                    let txt =
-                        egui::RichText::new(name.as_str()).size(12.0).color(if on {
-                            egui::Color32::WHITE
-                        } else {
-                            argb(0x8C_FF_FF_FF)
-                        });
+                    let fill = if on { on_fill() } else { off_fill() };
+                    let txt = egui::RichText::new(name.as_str())
+                        .size(12.0)
+                        .color(if on { on_text() } else { off_text() });
                     if ui
                         .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(cell_w, 24.0)))
                         .clicked()
@@ -1969,9 +2046,9 @@ impl SettingsApp {
                         egui::Button::new(
                             egui::RichText::new("应用")
                                 .size(12.0)
-                                .color(if settings::editing() { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) }),
+                                .color(if settings::editing() { on_text() } else { off_text() }),
                         )
-                        .fill(if settings::editing() { argb(0x66_3C_8D_FF) } else { argb(0x33_FF_FF_FF) })
+                        .fill(if settings::editing() { on_fill() } else { off_fill() })
                         .min_size(egui::vec2(52.0, 24.0)),
                     )
                     .clicked()
@@ -2115,10 +2192,10 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
 
 /// 开/关按钮：返回 true 表示这次点击把它切成了另一个状态
 fn toggle_btn(ui: &mut egui::Ui, on: bool, label: &str) -> bool {
-    let fill = if on { argb(0x66_3C_8D_FF) } else { argb(0x33_FF_FF_FF) };
+    let fill = if on { on_fill() } else { off_fill() };
     let txt = egui::RichText::new(if on { "已开启" } else { "已关闭" })
         .size(12.0)
-        .color(if on { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) });
+        .color(if on { on_text() } else { off_text() });
     let r = ui.add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(76.0, 24.0)));
     r.clicked() && { let _ = label; true }
 }

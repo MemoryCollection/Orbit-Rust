@@ -288,6 +288,8 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             // 设置页点「应用/还原」后主动投来：立即重扫+重绘，不等 500ms 轮询
             m if m == crate::appmsg::WM_SETTINGS_APPLIED => {
+                // 设置页在独立子进程里写盘，本进程内存还是旧值，先重读再重排
+                settings::reload_if_changed();
                 dock.apply_settings_change();
                 LRESULT(0)
             }

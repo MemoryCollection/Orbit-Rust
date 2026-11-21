@@ -355,4 +355,83 @@ mod tests {
             assert_ne!(t.text & 0xFF_FF_FF, 0, "{} 的文字全黑看不见", t.key);
         }
     }
+
+    // ---------- 配色对比度 ----------
+    //
+    // 设置页早先用过硬编码的白字/白底，在浅色主题（平静浅色、玻璃浅色、M3 浅色）
+    // 上基本看不见。这里把"文字 vs 背景"的 WCAG 对比度固化成分测试：以后调主题
+    // 色要是把哪套主题调到读不清，测试会直接报出来，不用等肉眼发现。
+
+    fn srgb_to_lin(c: f32) -> f32 {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance(c: [f32; 3]) -> f32 {
+        0.2126 * srgb_to_lin(c[0]) + 0.7152 * srgb_to_lin(c[1]) + 0.0722 * srgb_to_lin(c[2])
+    }
+
+    fn channels(argb: u32) -> [f32; 3] {
+        [
+            ((argb >> 16) & 0xFF) as f32 / 255.0,
+            ((argb >> 8) & 0xFF) as f32 / 255.0,
+            (argb & 0xFF) as f32 / 255.0,
+        ]
+    }
+
+    /// 把带 alpha 的颜色压到不透明底色上（分层窗口就是逐像素这么合成的）
+    fn over(fg: u32, bg: [f32; 3]) -> [f32; 3] {
+        let a = ((fg >> 24) & 0xFF) as f32 / 255.0;
+        let f = channels(fg);
+        [
+            f[0] * a + bg[0] * (1.0 - a),
+            f[1] * a + bg[1] * (1.0 - a),
+            f[2] * a + bg[2] * (1.0 - a),
+        ]
+    }
+
+    fn contrast(a: [f32; 3], b: [f32; 3]) -> f32 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 面板底：半透明主题压在"假壁纸"上（浅色压白、深色压黑）后再算
+    fn panel_of(t: &Theme) -> [f32; 3] {
+        over(t.panel_bg, if t.dark { [0.0; 3] } else { [1.0; 3] })
+    }
+
+    #[test]
+    fn text_contrast_is_readable_in_every_theme() {
+        for t in ALL {
+            let panel = panel_of(t);
+            // 正文（设置页的主要文字）
+            let body = contrast(over(t.text_body, panel), panel);
+            assert!(body >= 7.0, "{} 正文对比度只有 {body:.2}:1", t.key);
+
+            // 主文字 / 胶囊上的文字
+            let strong = contrast(over(t.text, panel), panel);
+            assert!(strong >= 8.0, "{} 主文字对比度只有 {strong:.2}:1", t.key);
+
+            // 说明文字（.weak()）：浅色 0xB8、深色 0xA8 的 alpha
+            let weak_alpha = if t.dark { 0xA8u32 } else { 0xB8u32 };
+            let weak = contrast(
+                over((weak_alpha << 24) | (t.text & 0x00FF_FFFF), panel),
+                panel,
+            );
+            assert!(weak >= 4.5, "{} 说明文字对比度只有 {weak:.2}:1", t.key);
+
+            // 强调色当文字用（预览时间、已读角标这类），3:1 是图形/大字的底线
+            let accent = contrast(over(t.accent, panel), panel);
+            assert!(accent >= 3.0, "{} 强调色对比度只有 {accent:.2}:1", t.key);
+
+            // 胶囊底上的文字（胶囊是半透明的，压在面板上看）
+            let pill = over(t.pill_bg, panel);
+            let on_pill = contrast(over(t.text, pill), pill);
+            assert!(on_pill >= 8.0, "{} 胶囊文字对比度只有 {on_pill:.2}:1", t.key);
+        }
+    }
 }
