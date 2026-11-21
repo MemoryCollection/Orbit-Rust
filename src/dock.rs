@@ -73,8 +73,6 @@ pub struct FlashIcon {
     pub name: String,
     /// 图标像素（straight RGBA，px*px*4）
     pub rgba: Vec<u8>,
-    /// 位图边长
-    pub px: i32,
     /// 这一帧是否"灭"（灭 = 图标消失帧，胶囊留空位不画）
     pub dim: bool,
     /// 回调目标（悬停/点击转发用；UIA 兜底模式可能还没有）。
@@ -457,7 +455,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             // Dock 压住一角——改由菜单守位线程把它挪到 Dock 旁边
                             if cfg::TRAY_RELOCATE_MENU {
                                 let mut cap = RECT::default();
-                                if unsafe { GetWindowRect(hwnd, &mut cap) }.is_ok() {
+                                if GetWindowRect(hwnd, &mut cap).is_ok() {
                                     let label = dock.flyout_label(idx);
                                     flyout::watch_menu(t.pid, t.hwnd, cap, c, &label);
                                 }
@@ -1101,12 +1099,10 @@ impl Dock {
                         }
                     }
                 }
-                let px = ((it.rgba.len() / 4) as f32).sqrt().round() as i32;
                 snap.push(FlashIcon {
                     key,
                     name: it.name.clone(),
                     rgba: it.rgba.clone(),
-                    px: if px > 0 { px } else { 0 },
                     dim: it.dim,
                     target: self.host_targets.get(i).cloned().flatten().map(|t| t.raw()),
                 });
@@ -1557,12 +1553,10 @@ impl Dock {
         let mon = crate::window::primary_monitor().rcMonitor;
         let clamp_x = |x: i32| x.clamp(mon.left + 4, (mon.right - w - 4).max(mon.left + 4));
         let clamp_y = |y: i32| y.clamp(mon.top + 4, (mon.bottom - h - 4).max(mon.top + 4));
-        // 底板在屏幕上的边缘（窗口含内侧透明留白）
-        let (bx, by, bw, bh) = self.board;
+        // 底板在屏幕上的边缘（窗口含内侧透明留白）；上下锚位用不到底板高/顶
+        let (bx, _by, bw, _bh) = self.board;
         let board_l = wr.left + bx;
-        let board_t = wr.top + by;
         let board_r = board_l + bw;
-        let board_b = board_t + bh;
         match settings::dock_anchor() {
             crate::settings::DockAnchor::Bottom => (clamp_x(cx - w / 2), clamp_y(top - h - gap)),
             crate::settings::DockAnchor::Top => (clamp_x(cx - w / 2), clamp_y(bottom + gap)),

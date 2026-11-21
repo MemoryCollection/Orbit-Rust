@@ -435,20 +435,6 @@ impl TrayMirror {
         self.order = order;
     }
 
-    /// 托管模式下把 Dock 实际画出的图标屏幕矩形报回宿主，用于回答位置查询（悬停坐标校验）。
-    pub fn report_placements(&self, centers: &[(i32, i32, i32, i32)]) {
-        if self.hosted.is_some() {
-            let pl: Vec<trayhost::Placement> = self.items.iter().zip(centers.iter()).filter_map(|(it, r)| {
-                let h = it.host.as_ref()?;
-                Some(trayhost::Placement {
-                    hwnd: h.hwnd, uid: h.uid, guid: h.guid,
-                    left: r.0, top: r.1, right: r.2, bottom: r.3,
-                })
-            }).collect();
-            trayhost::set_placements(pl);
-        }
-    }
-
     /// 快速采样：抓一次任务栏，看每个托盘图标此刻是"亮"还是"灭"。
     /// 应用用"图标一闪一闪"提示新消息（微信就是这样），Dock 直接跟着这个真实状态走，
     /// 频率自然和系统一致，不用去猜周期。返回是否有图标状态变了。

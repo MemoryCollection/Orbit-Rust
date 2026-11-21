@@ -949,7 +949,7 @@ impl SettingsApp {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("可选托盘图标").size(11.5).weak());
         // 候选只有托盘图标：任务栏（钉选项 / 运行项）读的是 exe 自带的大图标，本来就不糊
-        let mut cands: Vec<(String, String)> = tray_entries().into_iter().collect();
+        let cands: Vec<(String, String)> = tray_entries().into_iter().collect();
         let mut shown = 0;
         for (key, name) in cands {
             if overs.iter().any(|(k, _)| k.eq_ignore_ascii_case(&key)) {

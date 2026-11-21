@@ -92,10 +92,9 @@ pub fn present(hwnd: HWND, bgra: &[u8], w: i32, h: i32) {
 
 // ---------- 文本测量 ----------
 
-/// 字体族：正文拉丁、中文回退、符号图标
+/// 字体族：正文中文、符号图标
 #[derive(Clone, Copy, PartialEq)]
 pub enum FontKind {
-    Latin,
     Cjk,
     Symbol,
 }
@@ -130,8 +129,6 @@ pub fn measure_text(text: &[u16], size: f32, kind: FontKind, scale: f32) -> (f32
 /// 灭帧画全透明（格子仍占位），亮帧画真实图标——与 Dock 托盘区的闪烁同一节奏。
 pub struct FlashView<'a> {
     pub rgba: &'a [u8],
-    /// 位图边长（rgba 是 px*px*4）
-    pub px: i32,
     pub dim: bool,
 }
 
@@ -629,7 +626,6 @@ unsafe fn create_font(kind: FontKind, px: f32, font: &mut *mut GpFont) -> bool {
     let name: PCWSTR = match kind {
         FontKind::Cjk => w!("Microsoft YaHei UI"),
         FontKind::Symbol => w!("Segoe UI Symbol"),
-        FontKind::Latin => w!("Segoe UI Variable Display"),
     };
     let mut family: *mut GpFontFamily = null_mut();
     GdipCreateFontFamilyFromName(name, null_mut(), &mut family);

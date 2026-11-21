@@ -48,8 +48,6 @@ impl InputAcc {
 pub enum PillEvent {
     /// 按下了第 i 个 widget（按下即触发，对齐旧版）
     WidgetClick(usize),
-    /// 按下了第 i 个托盘闪烁图标
-    FlashClick(usize),
     /// 悬停进入 / 离开第 i 个闪烁图标
     FlashEnter(usize),
     FlashLeave,
@@ -64,8 +62,6 @@ pub struct View<'a> {
     pub items: &'a [WidgetItem],
     /// 托盘闪烁图标（排在最右）
     pub flash: &'a [FlashView<'a>],
-    pub hovered_widget: Option<usize>,
-    pub hovered_flash: Option<usize>,
     pub shape: PillShape,
     /// 整体透明度 0..1（烘焙由 window.rs 做，这里只参与变化检测）
     pub alpha: f32,
@@ -80,8 +76,6 @@ pub struct Painted {
     pub rgba: Vec<u8>,
     /// 命中矩形（物理像素）：前 widget_kinds.len() 个是 widget，其余是闪烁图标
     pub widget_rects: Vec<[f32; 4]>,
-    pub hovered_widget: Option<usize>,
-    pub hovered_flash: Option<usize>,
     pub events: Vec<PillEvent>,
 }
 
@@ -186,7 +180,7 @@ impl PillUi {
 
         let mut rects_pts: Vec<[f32; 4]> = Vec::new();
         let mut events: Vec<PillEvent> = Vec::new();
-        let (mut hov_w, mut hov_f) = (None, None);
+        let (mut hov_w, hov_f) = (None, None);
         // Context 内部是 Arc，clone 出来共享同一上下文（闭包里只读它）
         let ctx = self.soft.ctx().clone();
 
@@ -348,8 +342,6 @@ impl PillUi {
                 h,
                 rgba: Vec::new(),
                 widget_rects: Vec::new(),
-                hovered_widget: hov_w,
-                hovered_flash: hov_f,
                 events,
             };
         }
@@ -362,6 +354,6 @@ impl PillUi {
             .map(|r| [r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale])
             .collect();
 
-        Painted { changed: true, w, h, rgba, widget_rects, hovered_widget: hov_w, hovered_flash: hov_f, events }
+        Painted { changed: true, w, h, rgba, widget_rects, events }
     }
 }

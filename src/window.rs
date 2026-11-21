@@ -54,7 +54,6 @@ pub struct App {
     pill_ui: crate::pillui::PillUi,
     /// 上次绘制时的时钟（时:分, 日, 秒——秒只在"带秒"格式下参与比较）
     last_time: (u32, u16, u16),
-    hovered_widget: Option<usize>,
     mouse_tracked: bool,
     widget_rects: Vec<[f32; 4]>,
     widget_kinds: Vec<WidgetKind>,
@@ -62,10 +61,6 @@ pub struct App {
     flash: Vec<FlashIcon>,
     /// 上次见到的闪烁快照版本号（变了才重绘）
     flash_ver: u64,
-    /// 悬停中的闪烁图标下标（相对 flash 的下标）
-    hovered_flash: Option<usize>,
-    /// 上次左键按下的时刻（判双击）
-    last_lclick: Option<std::time::Instant>,
     /// 悬停中的闪烁图标下标（相对 flash 的下标）
     /// 已转发"悬停进入"的闪烁图标下标（离开时要补发 leave）
     flash_hover_sent: Option<usize>,
@@ -338,15 +333,12 @@ impl App {
             scale: 1.0,
             pill_ui: crate::pillui::PillUi::new(),
             last_time: (0, 0, 0),
-            hovered_widget: None,
             mouse_tracked: false,
             widget_rects: vec![],
             widget_kinds: vec![],
             flash: Vec::new(),
             flash_ver: 0,
-            hovered_flash: None,
             flash_hover_sent: None,
-            last_lclick: None,
             pill: (0, 0),
             pos: (0, 0),
             weather: Weather::default(),
@@ -400,12 +392,9 @@ impl App {
         // 托盘闪烁快照：谁在闪就显示谁（灭帧留空位），跟随 Dock 的真实节奏
         let flash = dock::flash_icons();
         self.flash_ver = dock::flash_version();
-        if self.hovered_flash.map(|i| i >= flash.len()).unwrap_or(false) {
-            self.hovered_flash = None;
-        }
         let flash_views: Vec<render::FlashView<'_>> = flash
             .iter()
-            .map(|f| render::FlashView { rgba: &f.rgba, px: f.px, dim: f.dim })
+            .map(|f| render::FlashView { rgba: &f.rgba, dim: f.dim })
             .collect();
 
         let shape = match settings::pill_anchor() {
@@ -418,13 +407,9 @@ impl App {
             clock: &clock_text,
             items: &pill_items,
             flash: &flash_views,
-            hovered_widget: self.hovered_widget,
-            hovered_flash: self.hovered_flash,
             shape,
             alpha: settings::pill_alpha(),
         });
-        self.hovered_widget = out.hovered_widget;
-        self.hovered_flash = out.hovered_flash;
         let events = out.events;
         if out.changed {
             self.pill = (out.w, out.h);
@@ -469,7 +454,6 @@ impl App {
                         self.on_widget(kind);
                     }
                 }
-                crate::pillui::PillEvent::FlashClick(i) => self.click_flash(i),
                 crate::pillui::PillEvent::FlashEnter(i) => self.flash_hover_enter(i),
                 crate::pillui::PillEvent::FlashLeave => self.flash_hover_leave(),
             }
@@ -581,35 +565,6 @@ impl App {
             }
         }
         out
-    }
-
-    /// 点了胶囊右侧的闪烁图标：转发左键给真实托盘图标（与点 Dock 上的托盘一个效果）。
-    /// 没有回调目标（UIA 兜底还没扫到）就忽略——Dock 那边的图标仍是入口。
-    fn click_flash(&mut self, i: usize) {
-        let Some(f) = self.flash.get(i) else { return };
-        let Some(raw) = f.target else { return };
-        let t = traymsg::Target::from_raw(raw);
-        let now = std::time::Instant::now();
-        let dbl = self.last_lclick.map_or(false, |lt| {
-            now.duration_since(lt).as_millis() as u32
-                <= unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() }
-        });
-        self.last_lclick = Some(now);
-        // 坐标用胶囊里这个图标自己的中心（v4 编码进 wParam；应用常用它定位菜单）
-        let (cx, cy) = self
-            .widget_rects
-            .get(self.widget_kinds.len() + i)
-            .map(|r| {
-                (
-                    self.pos.0 + (r[0] + r[2] / 2.0) as i32,
-                    self.pos.1 + (r[1] + r[3] / 2.0) as i32,
-                )
-            })
-            .unwrap_or(self.pos);
-        crate::tlog!("[pill] 点击闪烁图标 {}（{}）", f.name, f.key);
-        // 点击 = 悬停结束，先吊销守位线程（与 Dock 托盘同规则），别让它碰应用的真面板
-        crate::flyout::cancel(t.hwnd, t.pid);
-        traymsg::click(&t, (cx, cy), dbl);
     }
 
     /// 闪烁图标**悬停进入**：与 Dock 托盘转发同一套回调消息（hover 事件），

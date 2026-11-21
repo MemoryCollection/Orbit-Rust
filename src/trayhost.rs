@@ -94,6 +94,8 @@ impl Default for State {
 }
 
 pub struct Host {
+    // 主 crate 内不读，但 `tools/trayhostcheck` 以 #[path] 引入本模块后使用
+    #[allow(dead_code)]
     pub state: Arc<Mutex<State>>,
     hwnd: usize,
 }
@@ -617,11 +619,6 @@ pub fn table() -> Option<Arc<Mutex<State>>> {
     TABLE.lock().unwrap().clone()
 }
 
-/// 托盘托管是否处于活动状态。
-pub fn is_active() -> bool {
-    TABLE.lock().unwrap().is_some()
-}
-
 /// 当前托管表里所有图标的进程 PID 去重列表（Dock 托盘实际显示的图标所属进程）。
 /// 微信这类多进程应用用它过滤辅助子进程：托盘没图标的进程不用去枚举 UIA。
 pub fn hosted_pids() -> Vec<u32> {
@@ -639,11 +636,13 @@ pub fn is_own_hwnd(hwnd: HWND) -> bool {
 }
 
 impl Host {
-    /// 拍一份当前图标表快照
+    /// 拍一份当前图标表快照（主 crate 内不调用；`tools/trayhostcheck` 经 #[path] 使用）
+    #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<Icon> {
         self.state.lock().unwrap().icons.clone()
     }
-    /// 表的版本号
+    /// 表的版本号（主 crate 内不调用；`tools/trayhostcheck` 经 #[path] 使用）
+    #[allow(dead_code)]
     pub fn generation(&self) -> u64 {
         self.state.lock().unwrap().generation
     }

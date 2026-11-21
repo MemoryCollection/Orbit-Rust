@@ -419,16 +419,6 @@ pub fn set_theme_index(i: usize) {
     bump();
 }
 
-/// 取窗口该用哪套 egui 视觉（深色主题用 Dark，浅色主题用 Light）。
-/// 用于设置页里的原生控件（滑条、按钮、输入框）跟主题对齐。
-pub fn egui_theme() -> eframe::egui::Theme {
-    if crate::theme::cur().dark {
-        eframe::egui::Theme::Dark
-    } else {
-        eframe::egui::Theme::Light
-    }
-}
-
 /// 胶囊锚位/形状
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PillAnchor {
@@ -1247,16 +1237,6 @@ pub fn set_show_desktop_btn(on: bool) {
         return;
     }
     SHOW_DESKTOP.store(bool_code(on), Ordering::Relaxed);
-    save();
-    bump();
-}
-
-/// 开关微信提示音
-pub fn set_wechat_sound(on: bool) {
-    if on == wechat_sound() {
-        return;
-    }
-    WECHAT_SOUND.store(bool_code(on), Ordering::Relaxed);
     save();
     bump();
 }

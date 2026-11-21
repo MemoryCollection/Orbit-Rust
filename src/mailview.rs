@@ -97,15 +97,6 @@ pub fn init(instance: HINSTANCE) {
     }
 }
 
-pub fn hide() {
-    let h = hwnd();
-    if !h.is_invalid() {
-        unsafe {
-            let _ = ShowWindow(h, SW_HIDE);
-        }
-    }
-}
-
 /// 显示/更新阅读窗。(x, y) = 期望左上角（物理像素），自动收进工作区。
 pub fn show(
     owner: HWND, scale: f32, subject: &str, from: &str, body: &str, uid: &str, x: i32, y: i32,

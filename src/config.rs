@@ -50,35 +50,10 @@ pub const SHOW_TRAY: bool = true;
 
 // ---------- 胶囊 widget ----------
 
-/// widget 摆在哪：胶囊里（`Pill`），还是分离出去贴胶囊左边 / 右边（`Left` / `Right`）
-///
-/// 分离出去的和音乐条一样是独立小窗（`widgetbar.rs`）。同一侧再按 `slot` 分组：
-/// 同 (侧, slot) 的多个 widget 合成一条胶囊，slot 不同的各自一条（1 号最贴近胶囊）。
-/// 位置与分组可在 `data/settings.txt` 里用 `weather_pos` / `mail_pos` /
-/// `clipboard_pos` 逐个改（`pill` / `left` / `left2` / `left3` / `right` / `right2` / `right3`）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum WidgetPos {
-    Pill,
-    Left,
-    Right,
-}
-
-/// 天气 widget 开关
-pub const SHOW_WEATHER: bool = true;
-/// 天气 widget 默认位置（分离到胶囊左侧）
-pub const WEATHER_POS: WidgetPos = WidgetPos::Left;
-/// 天气默认分组
-pub const WEATHER_SLOT: u8 = 1;
 /// 音乐条（封面 + 歌词，胶囊旁那条）开关；原胶囊里的音乐 widget 已合并到音乐条
 pub const SHOW_MUSIC: bool = true;
 /// 剪贴板 widget 开关
 pub const SHOW_CLIPBOARD: bool = true;
-/// 剪贴板 widget 默认位置（分离到胶囊右侧，单独一条）
-pub const CLIPBOARD_POS: WidgetPos = WidgetPos::Right;
-/// 剪贴板默认分组：2 → 与邮箱分两条胶囊，各占一格（默认「一个模块一条」）
-pub const CLIPBOARD_SLOT: u8 = 2;
-/// 邮箱默认分组
-pub const MAIL_SLOT: u8 = 1;
 /// 分离出来的模块条与胶囊之间的间距（多条之间也用这个间距）
 pub const WIDGET_BAR_GAP: i32 = 6;
 /// 每侧最多分几条（= `slot` 取值上限，也决定 widgetbar 预建的窗口数）
@@ -91,9 +66,6 @@ pub const WIDGET_BAR_ITEM_GAP: f32 = 3.0;
 pub const WIDGET_ICON_SIZE: f32 = 15.0;
 /// 图标格子边长：所有 widget 图标都占同样大的格子，间距才均匀
 pub const WIDGET_ICON_CELL: f32 = 16.0;
-/// 图标墨迹的目标视觉尺寸（按墨迹面积开方算的等效边长）：
-/// 同一字号下 ☁ 比 ✉/▤ 胖一圈，靠这个把它们的观感拉到一样大
-pub const WIDGET_GLYPH_INK: f32 = 12.5;
 /// widget 文本字号
 pub const WIDGET_TEXT_SIZE: f32 = 13.0;
 /// 符号与文本之间的间距
@@ -103,8 +75,6 @@ pub const WIDGET_PAD_X: f32 = 4.0;
 /// 相邻两个 widget 之间的间距（不含两侧 pad）。
 /// 注意：egui 的 `item_spacing` 会再叠一层，胶囊布局里已显式置 0，间距只由它决定
 pub const WIDGET_ITEM_GAP: f32 = 4.0;
-/// 胶囊右侧的托盘闪烁图标显示边长（位图，非字形）
-pub const FLASH_ICON: f32 = 22.0;
 /// 闪烁判定窗口：最后一次"灭帧"后多久内还算"正在闪烁"（毫秒）。
 /// 微信亮/灭各约 250ms，留 2.5s 宽限，闪烁一停图标就从胶囊里收走。
 pub const FLASH_WINDOW_MS: u64 = 2500;
@@ -120,8 +90,6 @@ pub const WEATHER_INTERVAL: u64 = 1800;
 
 /// 邮箱 widget 开关
 pub const SHOW_MAIL: bool = true;
-/// 邮箱 widget 默认位置（分离到胶囊右侧）
-pub const MAIL_POS: WidgetPos = WidgetPos::Right;
 /// IMAP 服务器（QQ 邮箱）
 pub const MAIL_HOST: &str = "imap.qq.com";
 pub const MAIL_PORT: u16 = 993;

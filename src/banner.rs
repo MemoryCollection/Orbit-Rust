@@ -102,11 +102,6 @@ impl BannerNotice {
     }
 }
 
-/// 全局默认停留时长（设置页「横幅秒数」，默认 6）；0 = 不自动关闭。
-/// 各条横幅可以用 `BannerNotice::with_secs` 覆盖（模块自定秒数）。
-fn default_ms() -> u128 {
-    (settings::banner_secs() as u128).saturating_mul(1000)
-}
 /// 横幅逻辑尺寸（96 DPI 基准）。宽 = 原 330 + 1/3
 const CARD_W: f32 = 440.0;
 const CARD_H: f32 = 92.0;
