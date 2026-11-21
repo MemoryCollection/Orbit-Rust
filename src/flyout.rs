@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
@@ -27,7 +27,7 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowRect,
+    EnumWindows, GetClassNameW, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
     SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     WS_MAXIMIZE,
@@ -116,6 +116,19 @@ impl Drop for ClaimGuard {
             m.retain(|_, owner| *owner != self.0);
         }
     }
+}
+
+/// 鼠标是否还在宿主条（Dock / 胶囊）的矩形内。
+///
+/// 守位线程只在用户还把指针停在条上时才纠偏弹窗/菜单：鼠标一旦离开 Dock，
+/// 卡片/菜单就交还应用自己管理，不再被硬拽回 Dock 边。取不到光标位置时
+/// 返回 true（维持原行为），别让探测失败把守位整体弄失灵。
+fn cursor_on_bar(bar: RECT) -> bool {
+    let mut pt = POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return true;
+    }
+    pt.x >= bar.left && pt.x < bar.right && pt.y >= bar.top && pt.y < bar.bottom
 }
 
 /// 用户开始悬停某个托盘图标了：按需要启动一个后台线程去盯它的悬停弹窗。
@@ -228,6 +241,11 @@ fn run(
     while Instant::now() < deadline {
         if !is_current(key, generation) {
             return;
+        }
+        // 只有鼠标还在 Dock 上才纠偏；移开后把弹窗交还应用自己管理
+        if !cursor_on_bar(capsule) {
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+            continue;
         }
         unsafe {
             if !IsWindow(found).as_bool() || !IsWindowVisible(found).as_bool() {
@@ -581,6 +599,11 @@ fn run_menu(
     while Instant::now() < deadline {
         if !is_current(key, generation) {
             return;
+        }
+        // 只有鼠标还在 Dock 上才纠偏；移开后把菜单交还应用自己管理
+        if !cursor_on_bar(capsule) {
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+            continue;
         }
         unsafe {
             // 菜单关了（点掉/按 Esc）就收工；菜单不会销毁重建，不用宽限期
