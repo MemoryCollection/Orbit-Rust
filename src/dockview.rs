@@ -49,19 +49,33 @@ fn wave_mag(cursor_axis: Option<f32>, axis: f32) -> f32 {
     }
 }
 
+/// 窗口在内侧多留的一圈**透明留白**（逻辑点，k=1 基准）。
+///
+/// 悬停的图标会被抬到"一半在 Dock 内、一半在 Dock 外"（中心压到 Dock 内缘），
+/// 伸出去的半截要画在 Dock 底板之外——分层窗口恰好等于底板尺寸就会把它裁掉。
+/// 窗口在内侧加一圈透明留白（悬停满幅时图标最远伸出 `DOCK_ICON*(1+AMP)/2`），
+/// 物理像素 = 本值 × 图标倍率 × DPI。
+pub fn dock_margin() -> f32 {
+    (cfg::DOCK_ICON * (1.0 + cfg::DOCK_WAVE_AMP) * 0.5).ceil() + 2.0
+}
+
 /// 前台指示条：图标下沿一条短横条（任务栏那套视觉语言）。竖排时整条转向，
 /// 贴在"远离屏幕中心"的那一侧。任务图标和托盘图标共用，前台是谁就给谁画。
-fn active_bar(p: &egui::Painter, rect: egui::Rect, slot: f32, cross: f32, vertical: bool) {
+/// `rect`/`cross` 是底板坐标，`(ox, oy)` 把结果平移进窗口（底板原点）。
+fn active_bar(
+    p: &egui::Painter, rect: egui::Rect, slot: f32, cross: f32, vertical: bool,
+    ox: f32, oy: f32,
+) {
     let th = cfg::DOCK_ACTIVE_H;
     let tw = (slot * 0.34).max(9.0);
     let bar = if vertical {
         egui::Rect::from_min_size(
-            egui::pos2(cross - th - 1.6, rect.center().y - tw / 2.0),
+            egui::pos2(cross - th - 1.6 + ox, rect.center().y - tw / 2.0 + oy),
             egui::vec2(th, tw),
         )
     } else {
         egui::Rect::from_min_size(
-            egui::pos2(rect.center().x - tw / 2.0, cross - th - 1.6),
+            egui::pos2(rect.center().x - tw / 2.0 + ox, cross - th - 1.6 + oy),
             egui::vec2(tw, th),
         )
     };
@@ -165,12 +179,9 @@ impl DockView {
         let slot = cfg::DOCK_SLOT;
         let gap = cfg::DOCK_GAP;
         let isz = cfg::DOCK_ICON;
-        let cross = if vertical { fw } else { fh };
-        let long = if vertical { fh } else { fw };
 
         // ---- 波浪放大 ----
         // 光标沿主轴的坐标；图标按与光标的距离高斯放大（覆盖相邻 2~3 格）
-        let cursor_axis = cursor.map(|(x, y)| if vertical { y } else { x });
         // 放大时图标朝屏幕内侧"浮出"的方向：底部 Dock 向上、左锚向右、右锚向左
         let (gx, gy) = match crate::settings::dock_anchor() {
             crate::settings::DockAnchor::Bottom => (0.0, -1.0),
@@ -178,6 +189,20 @@ impl DockView {
             crate::settings::DockAnchor::Left => (1.0, 0.0),
             crate::settings::DockAnchor::Right => (-1.0, 0.0),
         };
+        // 窗口在内侧多一圈透明留白，装下"伸出去"的半截图标。
+        // 底板原点 (ox, oy)：内侧在左/上时，底板被推向留白的另一侧。
+        let m = dock_margin();
+        let ox = if gx < 0.0 { m } else { 0.0 };
+        let oy = if gy < 0.0 { m } else { 0.0 };
+        // 底板尺寸（窗口 = 底板 + 内侧留白）
+        let bw = if gx != 0.0 { fw - m } else { fw };
+        let bh = if gy != 0.0 { fh - m } else { fh };
+        let cross = if vertical { bw } else { bh };
+        let long = if vertical { bh } else { bw };
+        let cursor_axis = cursor.map(|(x, y)| {
+            let (x, y) = (x - ox, y - oy);
+            if vertical { y } else { x }
+        });
 
         let mut rects_pt: Vec<[f32; 4]> = Vec::new();
         let mut tray_rects_pt: Vec<[f32; 4]> = Vec::new();
@@ -188,13 +213,17 @@ impl DockView {
         // ppp 每帧走 RawInput（见 egui_soft::input 的注释）：不带会被 egui 当 1.0，
         // 缩放 ≠ 1.0 时底板/图标/命中矩形整体错位
         let input = soft.input(fw, fh);
-        let out = ctx.run_ui(
+        let mut out = ctx.run_ui(
             input,
             |ui| {
                 let p = ui.painter().clone();
-                // ---- 底板：胶囊圆角 + 1px 内描边 + 顶面反光 ----
-                let board = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
-                let radius = cfg::cur().dock_radius.min(cross * 0.5);
+                // ---- 底板：圆角 + 内发光 ----
+                let board = egui::Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(bw, bh));
+                // 圆角走统一设置（默认圆角矩形）；主题的 dock_radius 作上限
+                let radius = crate::settings::corner_radius()
+                    .min(cfg::cur().dock_radius)
+                    .min(cross * 0.5)
+                    .max(0.0);
                 let cr = egui::CornerRadius::same(radius.round() as u8);
                 // 底色 + 内描边（描边内移到 shrink(1.5)，羽化不出窗——
                 // 画在 shrink(0.5) 时会往壁纸溢一圈白边）
@@ -202,12 +231,12 @@ impl DockView {
                 // 迎光面的细反光：水平条画在上缘，竖排条画在左缘；两端内缩掉圆角，
                 // 免得直角的亮线从圆角里探出去
                 if vertical {
-                    let a = egui::pos2(1.0, radius);
-                    let b = egui::pos2(1.0, fh - radius);
+                    let a = egui::pos2(ox + 1.0, oy + radius);
+                    let b = egui::pos2(ox + 1.0, oy + bh - radius);
                     grad_quad(&p, a, b, 1.0, argb(cfg::cur().dock_glow), argb(cfg::cur().dock_glow));
                 } else {
-                    let a = egui::pos2(radius, 1.0);
-                    let b = egui::pos2(fw - radius, 1.0);
+                    let a = egui::pos2(ox + radius, oy + 1.0);
+                    let b = egui::pos2(ox + bw - radius, oy + 1.0);
                     grad_quad(&p, a, b, 1.0, argb(cfg::cur().dock_glow), argb(cfg::cur().dock_glow));
                 }
 
@@ -218,14 +247,17 @@ impl DockView {
                     let (rx, ry) = if vertical { (rc, pos) } else { (pos, rc) };
                     let rect = egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(slot, slot));
                     rects_pt.push([rx, ry, slot, slot]);
-                    // 波浪放大：中心沿主轴按槽位算，放大倍数随光标距离衰减；
-                    // 放大出的部分朝屏幕内侧浮出（内缘锚定：偏移 = 增量的一半）
+                    // 波浪放大：中心沿主轴按槽位算，放大倍数随光标距离衰减。
+                    // 满幅悬停时图标中心被抬到 Dock 内缘（rise = cross/2）——
+                    // 一半留在 Dock 里、一半伸进外侧留白（macOS 手感）；
+                    // 相邻图标按同一比例平滑过渡，光标不在时 rise = 0。
                     let axis = pos + slot * 0.5;
-                    let side = isz * wave_mag(cursor_axis, axis);
-                    let lift = (side - isz) * 0.5;
+                    let mag = wave_mag(cursor_axis, axis);
+                    let side = isz * mag;
+                    let rise = (cross * 0.5) * (mag - 1.0) / cfg::DOCK_WAVE_AMP;
                     let icon_c = egui::pos2(
-                        (rx + slot * 0.5) + gx * lift,
-                        (ry + slot * 0.5) + gy * lift,
+                        ox + (rx + slot * 0.5) + gx * rise,
+                        oy + (ry + slot * 0.5) + gy * rise,
                     );
                     // 浅色主题下彩色图标直接压在浅底上会发脏，先垫一层圆角白底
                     if !buf.is_empty() && cfg::cur().icon_backing != 0 {
@@ -255,7 +287,7 @@ impl DockView {
                     // 前台应用：图标下沿一条短横条（任务栏那套视觉语言）。
                     // 竖排时整条转向，贴在"远离屏幕中心"的那一侧
                     if Some(i) == active {
-                        active_bar(&p, rect, slot, cross, vertical);
+                        active_bar(&p, rect, slot, cross, vertical, ox, oy);
                     }
 
                     pos += slot + gap;
@@ -276,16 +308,16 @@ impl DockView {
                         if vertical {
                             fade_line(
                                 &p,
-                                egui::pos2(dc, mid),
-                                egui::pos2(dc + cfg::DIVIDER_H, mid),
+                                egui::pos2(dc + ox, mid + oy),
+                                egui::pos2(dc + cfg::DIVIDER_H + ox, mid + oy),
                                 1.0,
                                 line,
                             );
                         } else {
                             fade_line(
                                 &p,
-                                egui::pos2(mid, dc),
-                                egui::pos2(mid, dc + cfg::DIVIDER_H),
+                                egui::pos2(mid + ox, dc + oy),
+                                egui::pos2(mid + ox, dc + cfg::DIVIDER_H + oy),
                                 1.0,
                                 line,
                             );
@@ -301,11 +333,12 @@ impl DockView {
                         tray_rects_pt.push([rx, ry, tslot, tslot]);
                         // 托盘图标与任务图标同一套波浪放大（大小已统一）
                         let t_axis = pos + tslot * 0.5;
-                        let t_side = tisz * wave_mag(cursor_axis, t_axis);
-                        let t_lift = (t_side - tisz) * 0.5;
+                        let t_mag = wave_mag(cursor_axis, t_axis);
+                        let t_side = tisz * t_mag;
+                        let t_rise = (cross * 0.5) * (t_mag - 1.0) / cfg::DOCK_WAVE_AMP;
                         let t_center = egui::pos2(
-                            (rx + tslot * 0.5) + gx * t_lift,
-                            (ry + tslot * 0.5) + gy * t_lift,
+                            ox + (rx + tslot * 0.5) + gx * t_rise,
+                            oy + (ry + tslot * 0.5) + gy * t_rise,
                         );
                         if !buf.is_empty() && cfg::cur().icon_backing != 0 {
                             p.rect_filled(
@@ -339,7 +372,7 @@ impl DockView {
                         if Some(i) == active_tray {
                             let trect =
                                 egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(tslot, tslot));
-                            active_bar(&p, trect, tslot, cross, vertical);
+                            active_bar(&p, trect, tslot, cross, vertical, ox, oy);
                         }
                         pos += tslot + cfg::DOCK_TRAY_GAP;
                     }
@@ -350,18 +383,18 @@ impl DockView {
                     // 条的长度横跨 Dock 厚度方向（`DOCK_DESKTOP_H` 占位，留上下呼吸）
                     let thin = cfg::DOCK_DESKTOP_W.min(cross - 12.0).max(2.0);
                     let span = (cross * cfg::DOCK_DESKTOP_H).max(8.0);
-                    let (bw, bh) = if vertical { (span, thin) } else { (thin, span) };
-                    let (bx, by) = if vertical {
-                        (0.0, long - pad - bh)
+                    let (bw2, bh2) = if vertical { (span, thin) } else { (thin, span) };
+                    let (bx2, by2) = if vertical {
+                        (0.0, long - pad - bh2)
                     } else {
-                        (long - pad - bw, 0.0)
+                        (long - pad - bw2, 0.0)
                     };
                     let (rx, ry) = if vertical {
-                        ((cross - bw) / 2.0, by)
+                        ((cross - bw2) / 2.0, by2)
                     } else {
-                        (bx, (cross - bh) / 2.0)
+                        (bx2, (cross - bh2) / 2.0)
                     };
-                    let bar = egui::Rect::from_min_size(egui::pos2(rx, ry), egui::vec2(bw, bh));
+                    let bar = egui::Rect::from_min_size(egui::pos2(rx + ox, ry + oy), egui::vec2(bw2, bh2));
                     let r_bar = thin / 2.0;
 
                     // **只有鼠标停在这一条上才画出形状**（用户要求"不触发就不显示"）：
@@ -384,27 +417,28 @@ impl DockView {
                     // 命中区要比细条宽一圈，否则 7 点宽根本点不准；两侧都是空白，不会抢图标
                     let gap = cfg::DOCK_DESKTOP_GAP;
                     desktop_rect_pt = Some(if vertical {
-                        [0.0, ry - gap, cross, bh + gap * 2.0]
+                        [0.0, ry - gap, cross, thin + gap * 2.0]
                     } else {
-                        [rx - gap, 0.0, bw + gap * 2.0, cross]
+                        [rx - gap, 0.0, thin + gap * 2.0, cross]
                     });
                 }
             },
         );
 
-        self.soft.update_textures(&out.textures_delta);
+        self.soft.update_textures(&mut out.textures_delta);
         let rgba = self.soft.rasterize(out.shapes, out.pixels_per_point, w, h);
 
-        // 命中矩形：逻辑点 → 物理像素
+        // 命中矩形：底板坐标 + 底板原点 → 物理像素窗口坐标
         let rects = rects_pt
             .iter()
-            .map(|r| [r[0] * scale, r[1] * scale, r[2] * scale])
+            .map(|r| [(r[0] + ox) * scale, (r[1] + oy) * scale, r[2] * scale])
             .collect();
         let tray_rects = tray_rects_pt
             .iter()
-            .map(|r| [r[0] * scale, r[1] * scale, r[2] * scale])
+            .map(|r| [(r[0] + ox) * scale, (r[1] + oy) * scale, r[2] * scale])
             .collect();
-        let desktop_rect = desktop_rect_pt.map(|r| [r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale]);
+        let desktop_rect = desktop_rect_pt
+            .map(|r| [(r[0] + ox) * scale, (r[1] + oy) * scale, r[2] * scale, r[3] * scale]);
 
         DockPainted { rgba, rects, tray_rects, desktop_rect }
     }
@@ -445,7 +479,7 @@ impl DockView {
 
         let ctx = self.soft.ctx().clone();
         let input = self.soft.input(fw, fh);
-        let out = ctx.run_ui(
+        let mut out = ctx.run_ui(
             input,
             |ui| {
                 let p = ui.painter().clone();
@@ -463,7 +497,7 @@ impl DockView {
                 );
             },
         );
-        self.soft.update_textures(&out.textures_delta);
+        self.soft.update_textures(&mut out.textures_delta);
         let rgba = self.soft.rasterize(out.shapes, out.pixels_per_point, w, h);
         (w, h, rgba)
     }
@@ -532,7 +566,7 @@ impl DockView {
         let mut rows_pt: Vec<[f32; 4]> = Vec::with_capacity(labels.len());
         let ctx = self.soft.ctx().clone();
         let input = self.soft.input(fw, fh);
-        let out = ctx.run_ui(
+        let mut out = ctx.run_ui(
             input,
             |ui| {
                 let p = ui.painter().clone();
@@ -560,7 +594,7 @@ impl DockView {
                 }
             },
         );
-        self.soft.update_textures(&out.textures_delta);
+        self.soft.update_textures(&mut out.textures_delta);
         let rgba = self.soft.rasterize(out.shapes, out.pixels_per_point, w, h);
         let rows = rows_pt
             .iter()

@@ -25,6 +25,7 @@ use eframe::egui;
 
 use crate::clock;
 use crate::config as cfg;
+use crate::egui_soft;
 use crate::settings::{self, DockAnchor, LyricPos, ModuleMode, PillAnchor, WeatherSource};
 
 const TITLE: &str = "Orbit 设置";
@@ -181,21 +182,9 @@ fn ppp(ctx: &egui::Context) -> f32 {
         .max(0.5)
 }
 
-/// 中文兜底字体：微软雅黑（没有就黑体），追加到各字体族末尾做回退
+/// 字体：与其余窗口共用同一份定义（MiSans 优先，系统字体兜底）
 fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    for p in ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyh.ttf", "C:/Windows/Fonts/simhei.ttf"] {
-        if let Ok(bytes) = std::fs::read(p) {
-            fonts
-                .font_data
-                .insert("orbit_cjk".into(), Arc::new(egui::FontData::from_owned(bytes)));
-            for fam in fonts.families.values_mut() {
-                fam.push("orbit_cjk".into());
-            }
-            break;
-        }
-    }
-    ctx.set_fonts(fonts);
+    ctx.set_fonts(crate::egui_soft::build_font_definitions());
 }
 
 /// 按当前主题配色重建设置页的原生控件样式。
@@ -239,6 +228,7 @@ enum Group {
     #[default]
     Pill,
     Dock,
+    Start,
     MusicBar,
     Weather,
     Mail,
@@ -246,9 +236,10 @@ enum Group {
 }
 
 impl Group {
-    const ALL: [Group; 6] = [
+    const ALL: [Group; 7] = [
         Group::Pill,
         Group::Dock,
+        Group::Start,
         Group::MusicBar,
         Group::Weather,
         Group::Mail,
@@ -258,6 +249,7 @@ impl Group {
         match self {
             Group::Pill => "顶部胶囊",
             Group::Dock => "Dock",
+            Group::Start => "开始菜单/系统",
             Group::MusicBar => "音乐条",
             Group::Weather => "天气",
             Group::Mail => "邮箱账户",
@@ -290,31 +282,30 @@ struct SettingsApp {
     seen_version: u64,
     /// 上次套用样式的版本号（主题变了要重刷 egui 原生控件配色）
     seen_style_version: u64,
+    /// 上次安装字体的版本号（字体切换后要重建当前窗口的字体图集）
+    seen_font_version: u64,
     /// 编辑框的本地缓冲（失焦且版本变化时才从 settings 重读，打字时不被写盘值顶掉）
     edits: Edits,
-    /// 模块芯片拖动状态
-    drag: Option<Drag>,
-    /// 本帧各芯片的矩形（拖动换位用）
-    chip_rects: Vec<(String, egui::Rect)>,
     /// 当前选中的分组
     group: Group,
     /// 邮箱测试连通状态（与后台线程共享）
     test: Arc<Mutex<TestState>>,
+    /// 编辑会话中已应用预览的主题索引（主题改动需立即刷本窗样式）
+    preview_theme: usize,
+    /// 编辑会话中已应用预览的字体开关（字体改动需立即重建本窗图集）
+    preview_misans: bool,
 }
 
 #[derive(Default)]
 struct Edits {
     clock: String,
+    wechat_ignore: String,
+    banner_secs: String,
     amap: String,
     host: String,
     port: String,
     user: String,
     pass: String,
-}
-
-struct Drag {
-    name: String,
-    moved: bool,
 }
 
 impl eframe::App for SettingsApp {
@@ -331,6 +322,10 @@ impl eframe::App for SettingsApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     OPEN.store(true, Ordering::Relaxed);
+                    // 打开即进入编辑会话：改动先攒内存，点「应用」才落盘；
+                    // 同时刷新编辑框缓冲，避免上次关窗 discard 后残留旧值
+                    settings::begin_edit();
+                    self.load_edits();
                 }
                 Cmd::Hide => self.do_hide(ctx),
             }
@@ -351,11 +346,23 @@ impl eframe::App for SettingsApp {
         let ver_changed = ver != self.seen_version;
         if self.seen_version == 0 {
             self.load_edits();
+            self.preview_theme = settings::theme_index();
+            self.preview_misans = settings::use_misans();
         }
-        // 主题（或任何设置）变了就重刷原生控件样式；只在变化时做，避免每帧 clone Style
-        if ver_changed || self.seen_style_version == 0 {
+        // 主题（或任何设置）变了就重刷原生控件样式；只在变化时做，避免每帧 clone Style。
+        // 编辑会话里 bump 被吞、ver 不变，但主题改动要立即预览，所以单独比对主题索引。
+        let theme_idx = settings::theme_index();
+        if ver_changed || self.seen_style_version == 0 || theme_idx != self.preview_theme {
             apply_style(&ctx);
             self.seen_style_version = ver;
+            self.preview_theme = theme_idx;
+        }
+        // 字体切换（MiSans / 系统）后立刻重建本窗口的字体图集
+        let misans = settings::use_misans();
+        if ver_changed || self.seen_font_version == 0 || misans != self.preview_misans {
+            install_fonts(&ctx);
+            self.seen_font_version = ver;
+            self.preview_misans = misans;
         }
 
         egui::CentralPanel::default()
@@ -384,13 +391,13 @@ impl eframe::App for SettingsApp {
                             ui.set_width(NAV_W);
                             for g in Group::ALL {
                                 let sel = self.group == g;
-                                let txt = egui::RichText::new(g.label())
-                                    .size(13.0)
-                                    .color(if sel {
-                                        ink_on(cfg::cur().accent)
-                                    } else {
-                                        argb(cfg::cur().text_body)
-                                    });
+                                // 选中项用真正的粗体（MiSans Bold / 雅黑 Bold），
+                                // `.strong()` 在 egui 0.37 里只改颜色不改字重。
+                                let txt = if sel {
+                                    egui_soft::bold(g.label()).size(13.0).color(ink_on(cfg::cur().accent))
+                                } else {
+                                    egui::RichText::new(g.label()).size(13.0).color(argb(cfg::cur().text_body))
+                                };
                                 if ui
                                     .add_sized([NAV_W, 30.0], egui::Button::selectable(sel, txt))
                                     .clicked()
@@ -409,15 +416,26 @@ impl eframe::App for SettingsApp {
                     });
 
                 egui::CentralPanel::no_frame().show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
+                    // 右侧内容离中间竖线留出内边距：之前实测只有约 10px，
+                    // 看起来像贴在线上。这里统一给 16px，滚动时不会跟着晃。
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin {
+                            left: 16,
+                            right: 8,
+                            top: 2,
+                            bottom: 0,
+                        })
                         .show(ui, |ui| {
-                            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                // 取滚动区自己的可用宽度：出滚动条后要自动减掉，
-                                // 否则右侧「移除 / 指定图标…」按钮会被挤出可视区
-                                ui.set_width(ui.available_width());
-                                self.detail(ui, ver_changed);
-                            });
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                                        // 取滚动区自己的可用宽度：出滚动条后要自动减掉，
+                                        // 否则右侧「移除 / 指定图标…」按钮会被挤出可视区
+                                        ui.set_width(ui.available_width());
+                                        self.detail(ui, ver_changed);
+                                    });
+                                });
                         });
                 });
             });
@@ -428,6 +446,8 @@ impl eframe::App for SettingsApp {
 
 impl SettingsApp {
     fn do_hide(&mut self, ctx: &egui::Context) {
+        // 关窗 = 放弃未应用改动，从文件恢复
+        settings::discard_edit();
         OPEN.store(false, Ordering::Relaxed);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
@@ -445,6 +465,8 @@ impl SettingsApp {
 
     fn load_edits(&mut self) {
         self.edits.clock = settings::clock_format();
+        self.edits.wechat_ignore = settings::wechat_ignore_text();
+        self.edits.banner_secs = settings::banner_secs().to_string();
         self.edits.amap = settings::amap_key();
         let (h, p, u, w) = settings::mail_overrides();
         self.edits.host = h.unwrap_or_default();
@@ -461,11 +483,135 @@ impl SettingsApp {
         match self.group {
             Group::Pill => self.detail_pill(ui, ver_changed),
             Group::Dock => self.detail_dock(ui),
+            Group::Start => self.detail_start(ui),
             Group::MusicBar => self.detail_music(ui),
             Group::Weather => self.detail_weather(ui, ver_changed),
             Group::Mail => self.detail_mail(ui, ver_changed),
-            Group::Modules => self.detail_modules(ui),
+            Group::Modules => self.detail_modules(ui, ver_changed),
         }
+    }
+
+    /// 开始菜单快捷方式 + 开机启动 + 退出守护
+    fn detail_start(&mut self, ui: &mut egui::Ui) {
+        section(ui, "开始菜单快捷方式");
+        ui.label(
+            egui::RichText::new("按 Win 键弹出开始菜单（再按一次收起）；上栏最多显示 8 个（一行 4 个）")
+                .size(11.5)
+                .weak(),
+        );
+        let pins = settings::start_pins();
+        if pins.is_empty() {
+            ui.label(
+                egui::RichText::new("还没有快捷方式，点「浏览程序…」添加")
+                    .size(11.5)
+                    .weak(),
+            );
+        }
+        for (name, target) in &pins {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(egui::RichText::new(name.as_str()).size(12.5));
+                ui.label(
+                    egui::RichText::new(target.as_str())
+                        .size(11.0)
+                        .color(argb(cfg::cur().text_dim)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("移除").small()).clicked() {
+                        let mut list: Vec<(String, String)> = settings::start_pins();
+                        list.retain(|(_, p)| !p.eq_ignore_ascii_case(target));
+                        settings::set_start_pins(list);
+                    }
+                });
+            });
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new("浏览程序…").small()).clicked() {
+                if let Some(path) = pick_program(false) {
+                    let mut list = settings::start_pins();
+                    if !list.iter().any(|(_, p)| p.eq_ignore_ascii_case(&path)) {
+                        let name = std::path::Path::new(&path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.clone());
+                        list.push((name, path));
+                        settings::set_start_pins(list);
+                    }
+                }
+            }
+            if ui.add(egui::Button::new("恢复默认").small())
+                .on_hover_text("恢复为「命令提示符 (cmd)」一条")
+                .clicked()
+            {
+                settings::set_start_pins(vec![
+                    (
+                        "命令提示符".to_string(),
+                        "C:\\Windows\\System32\\cmd.exe".to_string(),
+                    ),
+                ]);
+            }
+        });
+
+        ui.add_space(10.0);
+        section(ui, "系统");
+        // 开机启动
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let on = settings::autostart();
+            let fill = if on { argb(0x66_3C_8D_FF) } else { argb(0x33_FF_FF_FF) };
+            let txt = egui::RichText::new(if on { "已开启" } else { "已关闭" })
+                .size(12.0)
+                .color(if on { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) });
+            if ui
+                .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(76.0, 24.0)))
+                .clicked()
+            {
+                settings::set_autostart(!on);
+                // 注册表立即对齐（不走「应用」，开关即生效）
+                crate::guard::apply_autostart(settings::autostart());
+                crate::tlog!(
+                    "[settings] 开机启动 → {}",
+                    if settings::autostart() { "开启" } else { "关闭" }
+                );
+            }
+            ui.label(
+                egui::RichText::new("开机自启动（写注册表 HKCU\\…\\CurrentVersion\\Run）")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+        ui.add_space(6.0);
+        // 退出守护
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let on = settings::guardian();
+            let fill = if on { argb(0x66_3C_8D_FF) } else { argb(0x33_FF_FF_FF) };
+            let txt = egui::RichText::new(if on { "已开启" } else { "已关闭" })
+                .size(12.0)
+                .color(if on { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) });
+            if ui
+                .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(76.0, 24.0)))
+                .clicked()
+            {
+                settings::set_guardian(!on);
+                crate::tlog!(
+                    "[settings] 退出守护 → {}",
+                    if settings::guardian() { "开启" } else { "关闭" }
+                );
+            }
+            ui.label(
+                egui::RichText::new("退出守护：orbit 被强杀（任务栏没恢复）时自动重启 explorer 拉回任务栏")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+        ui.label(
+            egui::RichText::new("守护随 orbit 启动；开关在下次启动 orbit 时生效。正常退出（Ctrl+Alt+O）不会触发重启任务栏")
+                .size(11.5)
+                .weak(),
+        );
     }
 
     fn detail_pill(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
@@ -475,17 +621,34 @@ impl SettingsApp {
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
                 ui.label(row_label("时钟格式"));
-                let r = ui.add_sized(
-                    [CTRL_W, 24.0],
-                    egui::TextEdit::singleline(&mut self.edits.clock),
-                );
-                // 失焦才写盘（每键写文件会卡）；预览直接读本地缓冲，打字时照样实时
-                if r.lost_focus() && self.edits.clock != settings::clock_format() {
-                    settings::set_clock_format(&self.edits.clock);
-                }
-                if ver_changed && !r.has_focus() {
-                    self.edits.clock = settings::clock_format();
-                }
+                ui.vertical(|ui| {
+                    let r = ui.add_sized(
+                        [CTRL_W, 24.0],
+                        egui::TextEdit::singleline(&mut self.edits.clock),
+                    );
+                    // 失焦才写盘（每键写文件会卡）；预览直接读本地缓冲，打字时照样实时
+                    if r.lost_focus() && self.edits.clock != settings::clock_format() {
+                        settings::set_clock_format(&self.edits.clock);
+                    }
+                    if ver_changed && !r.has_focus() {
+                        self.edits.clock = settings::clock_format();
+                    }
+                    // 占位符对照（对应 clock::format_time 支持的全部占位符）
+                    ui.label(
+                        egui::RichText::new(
+                            "%Y 年   %m 月   %d 日   %H 时   %M 分   %S 秒",
+                        )
+                        .size(10.5)
+                        .weak(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "%y 两位年   %I 12时制   %p 上午/下午   %a %A 周几   %% 百分号",
+                        )
+                        .size(10.5)
+                        .weak(),
+                    );
+                });
                 ui.end_row();
 
                 ui.label(row_label("实时预览"));
@@ -599,6 +762,39 @@ impl SettingsApp {
                         _ => PillAnchor::Float,
                     });
                 }
+                ui.end_row();
+
+                // 圆角：胶囊 / 音乐条 / 模块条 / Dock 共用（默认 14px = 圆角矩形）
+                ui.label(row_label("圆角"));
+                let mut cr = settings::corner_radius();
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.spacing_mut().slider_width = CTRL_W - 148.0;
+                    let r = ui.add(
+                        egui::Slider::new(&mut cr, settings::CORNER_MIN..=settings::CORNER_MAX)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    if r.changed() {
+                        settings::preview_corner_radius(cr);
+                    }
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        settings::persist_corner_radius();
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}px", settings::corner_radius()))
+                            .size(12.5)
+                            .monospace(),
+                    );
+                    let at_default = (settings::corner_radius() - 14.0).abs() < 0.5;
+                    if ui
+                        .add_enabled(!at_default, egui::Button::new("重置").small())
+                        .on_hover_text("回到圆角矩形（14px）")
+                        .clicked()
+                    {
+                        settings::set_corner_radius(14.0);
+                    }
+                });
                 ui.end_row();
             });
     }
@@ -803,6 +999,19 @@ impl SettingsApp {
                 ui.label(row_label("歌词字号"));
                 if let Some(d) = stepper(ui, &format!("{size:.0}"), size > 10.0, size < 26.0) {
                     settings::set_lyric_size(size + d as f32);
+                }
+                ui.end_row();
+
+                let lead = settings::lyric_lead();
+                ui.label(row_label("提前量"));
+                if let Some(d) = stepper(
+                    ui,
+                    &format!("{lead:+.1}s"),
+                    lead > -settings::LYRIC_LEAD_MAX + 0.05,
+                    lead < settings::LYRIC_LEAD_MAX - 0.05,
+                ) {
+                    // 0.1 秒一步；负值 = 歌词延后（提前量可以为负）
+                    settings::set_lyric_lead(lead + d as f32 * 0.1);
                 }
                 ui.end_row();
             });
@@ -1018,14 +1227,167 @@ impl SettingsApp {
         );
     }
 
-    fn detail_modules(&mut self, ui: &mut egui::Ui) {
-        section(ui, "顶部胶囊模块");
-        self.chips(ui);
+    fn detail_modules(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+        section(ui, "界面字体");
+        if let Some(pick) = seg(
+            ui,
+            &["MiSans", "系统字体"],
+            if settings::use_misans() { 0 } else { 1 },
+        ) {
+            settings::set_use_misans(pick == 0);
+            crate::tlog!("[settings] 界面字体 → {}", if settings::use_misans() { "MiSans" } else { "系统字体" });
+        }
         ui.label(
-            egui::RichText::new("点击芯片切换：胶囊 → 左条 → 右条 → 隐藏；拖动排序")
+            egui::RichText::new("MiSans 随程序目录分发（data/MiSans-Semibold.ttf，缺失时回落系统字体）；系统字体 = 微软雅黑等本机字体")
                 .size(11.5)
                 .weak(),
         );
+
+        ui.add_space(10.0);
+        section(ui, "顶部胶囊模块");
+        self.chips(ui);
+        ui.label(
+            egui::RichText::new("下拉选择位置：胶囊 / 左条 / 右条 / 隐藏；▲▼ 调整顺序。邮件仅在新邮件/验证码时出现，无新邮件自动隐藏")
+                .size(11.5)
+                .weak(),
+        );
+
+        ui.add_space(10.0);
+        section(ui, "微信消息卡片");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let on = settings::wechat_cards();
+            let fill = if on {
+                argb(0x66_3C_8D_FF)
+            } else {
+                argb(0x33_FF_FF_FF)
+            };
+            let txt = egui::RichText::new(if on { "已开启" } else { "已关闭" })
+                .size(12.0)
+                .color(if on { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) });
+            if ui
+                .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(76.0, 24.0)))
+                .clicked()
+            {
+                settings::set_wechat_cards(!on);
+                crate::tlog!(
+                    "[settings] 微信消息卡片 → {}",
+                    if settings::wechat_cards() { "开启" } else { "关闭" }
+                );
+            }
+            ui.label(
+                egui::RichText::new("新消息在屏幕右下角弹会话名+摘要小卡片（只读微信界面）")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(row_label("不弹白名单"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.wechat_ignore)
+                    .hint_text("可添加多个：标题之间用分号 ; 分隔"),
+            );
+            if r.lost_focus() {
+                let list: Vec<String> = self
+                    .edits
+                    .wechat_ignore
+                    .split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                settings::set_wechat_ignore(list);
+                self.edits.wechat_ignore = settings::wechat_ignore_text();
+                crate::tlog!("[settings] 微信卡片白名单 → {}", settings::wechat_ignore_text());
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.wechat_ignore = settings::wechat_ignore_text();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "可添加多个标题（分号分隔，完全匹配才跳过）；被跳过的标题会写进 orbit.log",
+            )
+            .size(11.5)
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(row_label("横幅秒数"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.banner_secs).hint_text("6"),
+            );
+            // 逐键提交：设置窗失活会直接收起，文本框来不及触发 lost_focus，
+            // 只靠 lost_focus 提交会出现「改完又变回默认」
+            if r.changed() {
+                if let Ok(v) = self.edits.banner_secs.trim().parse::<u32>() {
+                    settings::set_banner_secs(v);
+                }
+            }
+            if r.lost_focus() {
+                let v: u32 = self.edits.banner_secs.trim().parse().unwrap_or(6);
+                settings::set_banner_secs(v);
+                self.edits.banner_secs = settings::banner_secs().to_string();
+                crate::tlog!("[settings] 横幅秒数 → {}", settings::banner_secs());
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.banner_secs = settings::banner_secs().to_string();
+            }
+        });
+        ui.label(
+            egui::RichText::new("每条横幅自动关闭的秒数；0 = 不自动关闭，点一下才收起")
+                .size(11.5)
+                .weak(),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("手动拿 UIA").size(12.0))
+                        .min_size(egui::vec2(96.0, 24.0)),
+                )
+                .clicked()
+            {
+                crate::banner::request_grab();
+                crate::tlog!("[settings] 手动拿 UIA 已点击");
+            }
+            ui.label(
+                egui::RichText::new("先唤出微信窗口（支持多开）再点；拿到后右下角提示一次")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+
+        // 多开状态：每个微信实例是否已拿到 UIA 会话数据（按进程创建时间排序，
+        // 先开的在前，与 Dock 托盘里多开图标的顺序一致）
+        let insts = crate::wechatmsg::instances();
+        if !insts.is_empty() {
+            ui.add_space(6.0);
+            for (label, got) in &insts {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(egui::RichText::new(label.as_str()).size(12.0));
+                    ui.label(
+                        egui::RichText::new(if *got { "已拿到" } else { "未拿到" })
+                            .size(12.0)
+                            .color(if *got {
+                                argb(0xFF_2F_C6_6F)
+                            } else {
+                                argb(cfg::cur().text_dim)
+                            }),
+                    );
+                });
+            }
+            if insts.iter().any(|(_, g)| !*g) {
+                ui.label(
+                    egui::RichText::new("未拿到的实例：先显示一次它的主窗口，再点上面的按钮")
+                        .size(11.0)
+                        .weak(),
+                );
+            }
+        }
 
         ui.add_space(10.0);
         section(ui, "托盘图标");
@@ -1096,101 +1458,139 @@ impl SettingsApp {
 
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Orbit 设置").size(16.0).strong());
+            ui.label(egui_soft::bold("Orbit 设置").size(17.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if close_button(ui).clicked() {
                     self.do_hide(ctx);
                 }
+                // 「还原」：丢弃本次编辑（未应用时才有意义）
+                ui.add_enabled_ui(settings::editing(), |ui| {
+                    if ui.add(egui::Button::new("还原").small()).clicked() {
+                        settings::discard_edit();
+                        self.load_edits();
+                        crate::tlog!("[settings] 已还原未应用的改动");
+                    }
+                });
+                // 「应用」：编辑会话中才生效，点击统一落盘
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("应用")
+                                .size(12.0)
+                                .color(if settings::editing() { egui::Color32::WHITE } else { argb(0x8C_FF_FF_FF) }),
+                        )
+                        .fill(if settings::editing() { argb(0x66_3C_8D_FF) } else { argb(0x33_FF_FF_FF) })
+                        .min_size(egui::vec2(52.0, 24.0)),
+                    )
+                    .clicked()
+                {
+                    settings::commit_edit();
+                    crate::tlog!("[settings] 已应用改动");
+                }
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(8.0);
         ui.separator();
+        ui.add_space(10.0);
     }
 
-    /// 模块芯片：拖动排序（扫过别的芯片中部就换位）+ 点击循环状态
+    /// 模块位置/隐藏：每模块一行，位置下拉 + 上下移按钮（替代原来的「点击芯片循环 + 拖动换位」）。
     fn chips(&mut self, ui: &mut egui::Ui) {
-        self.chip_rects.clear();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-            // 固定芯片：时间日期永远在最前
-            ui.add(
-                egui::Button::new(egui::RichText::new("时间 · 日期").size(12.0))
-                    .fill(argb(0x33_FF_FF_FF)),
-            );
-            for name in settings::module_order() {
-                let m = settings::module_mode(&name);
-                let tag = match m {
-                    ModuleMode::Pill => "胶囊",
-                    ModuleMode::BarLeft => "左条",
-                    ModuleMode::BarRight => "右条",
-                    ModuleMode::Off => "隐藏",
-                };
-                let fill = match m {
-                    ModuleMode::Pill => argb(0x66_3C_8D_FF),
-                    ModuleMode::BarLeft => argb(0x5C_2E_8F_6E),
-                    ModuleMode::BarRight => argb(0x5C_8A_5A_C8),
-                    ModuleMode::Off => argb(0x2E_FF_FF_FF),
-                };
-                let label = format!("{} · {tag}", module_label(&name));
-                let r = ui.add(
-                    egui::Button::new(egui::RichText::new(label).size(12.0)).fill(fill),
-                );
-                self.chip_rects.push((name.clone(), r.rect));
-                if r.drag_started() {
-                    self.drag = Some(Drag { name: name.clone(), moved: false });
-                }
-                if let Some(d) = &mut self.drag {
-                    if d.name == name && r.dragged() {
-                        let moved = ui.input(|i| {
-                            let d = i.pointer.delta();
-                            d.x.abs() + d.y.abs() > 3.0
-                        });
-                        if moved {
-                            d.moved = true;
-                        }
-                    }
-                }
-                if r.clicked() {
-                    let next = match m {
-                        ModuleMode::Pill => ModuleMode::BarLeft,
-                        ModuleMode::BarLeft => ModuleMode::BarRight,
-                        ModuleMode::BarRight => ModuleMode::Off,
-                        ModuleMode::Off => ModuleMode::Pill,
-                    };
-                    settings::set_module_mode(&name, next);
-                    crate::tlog!("[settings] 模块 {name} → {next:?}");
-                }
-            }
-        });
+        // 位置选项：胶囊 / 左条 / 右条 / 隐藏，与 ModuleMode 一一对应
+        const POSITIONS: [(&str, ModuleMode); 4] = [
+            ("胶囊", ModuleMode::Pill),
+            ("左条", ModuleMode::BarLeft),
+            ("右条", ModuleMode::BarRight),
+            ("隐藏", ModuleMode::Off),
+        ];
 
-        // 拖动换位：指针落在别的芯片中部就交换顺序（写 settings，立即生效）
-        if let Some(d) = &self.drag {
-            if d.moved {
-                if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
-                    for (other, rect) in &self.chip_rects {
-                        if *other == d.name || !rect.contains(p) {
-                            continue;
-                        }
-                        // 只认芯片中部（带滞回，防止两枚芯片来回打架）
-                        if (p.x - rect.center().x).abs() < rect.width() * 0.3 {
-                            let mut order = settings::module_order();
-                            if let (Some(a), Some(b)) = (
-                                order.iter().position(|n| *n == d.name),
-                                order.iter().position(|n| n == other),
-                            ) {
-                                order.swap(a, b);
-                                settings::set_module_order(order);
-                                crate::tlog!("[settings] 模块顺序 → {:?}", settings::module_order());
-                            }
-                            break;
-                        }
-                    }
+        let order = settings::module_order();
+        let n = order.len();
+        for (idx, name) in order.iter().enumerate() {
+            let m = settings::module_mode(name);
+            // 下拉当前选中项的显示名
+            let cur_label = POSITIONS
+                .iter()
+                .find(|(_, mm)| *mm == m)
+                .map(|(l, _)| *l)
+                .unwrap_or("胶囊");
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                // 模块名（固定宽度对齐），邮件胶囊模式补一句说明
+                let mut label = module_label(name).to_string();
+                if name == "mail" && m == ModuleMode::Pill {
+                    label.push_str("（有新邮件时）");
                 }
-            }
+                ui.add_sized(
+                    [64.0, 22.0],
+                    egui::Label::new(egui::RichText::new(label).size(12.5)),
+                );
+
+                if name == "weather" {
+                    // 天气已移出胶囊，改为桌面右上角常驻卡片：没有 胶囊/左条/右条
+                    // 可选，只留一个 显示/隐藏 开关
+                    let off = m == ModuleMode::Off;
+                    if let Some(i) = seg(ui, &["显示", "隐藏"], if off { 1 } else { 0 }) {
+                        settings::set_module_mode(
+                            name,
+                            if i == 1 { ModuleMode::Off } else { ModuleMode::Pill },
+                        );
+                        crate::tlog!(
+                            "[settings] 天气卡片 → {}",
+                            if i == 1 { "隐藏" } else { "显示" }
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new("常驻桌面右上角").size(11.5).weak(),
+                    );
+                    return; // 天气不参与胶囊排序，不需要 上下移
+                }
+
+                // 位置下拉
+                egui::ComboBox::from_id_salt(format!("mod_pos_{name}"))
+                    .width(92.0)
+                    .selected_text(cur_label)
+                    .show_ui(ui, |ui| {
+                        for (lbl, mm) in POSITIONS {
+                            if ui
+                                .selectable_label(m == mm, egui::RichText::new(lbl).size(12.5))
+                                .clicked()
+                            {
+                                settings::set_module_mode(name, mm);
+                                crate::tlog!("[settings] 模块 {name} → {mm:?}");
+                            }
+                        }
+                    });
+
+                // 上下移（第一项不能上移，最后一项不能下移）
+                ui.add_enabled_ui(idx > 0, |ui| {
+                    if ui.add(egui::Button::new("▲").small()).clicked() {
+                        let mut o = settings::module_order();
+                        o.swap(idx, idx - 1);
+                        settings::set_module_order(o);
+                        crate::tlog!("[settings] 模块顺序 → {:?}", settings::module_order());
+                    }
+                });
+                ui.add_enabled_ui(idx + 1 < n, |ui| {
+                    if ui.add(egui::Button::new("▼").small()).clicked() {
+                        let mut o = settings::module_order();
+                        o.swap(idx, idx + 1);
+                        settings::set_module_order(o);
+                        crate::tlog!("[settings] 模块顺序 → {:?}", settings::module_order());
+                    }
+                });
+            });
         }
-        if ui.input(|i| i.pointer.any_released()) {
-            self.drag = None;
-        }
+
+        // 时间 · 日期固定在最前，不参与排序
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([64.0, 22.0], egui::Label::new(egui::RichText::new("时间 · 日期").size(12.5)));
+            ui.label(
+                egui::RichText::new("固定显示在胶囊最前").size(11.5).weak(),
+            );
+        });
     }
 }
 
@@ -1220,13 +1620,19 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(2.0);
-    ui.label(egui::RichText::new(title).size(11.5).weak());
-    ui.add_space(2.0);
+    // 段标题与上下内容（分割线 / 上一组控件）之间留出间隙，别贴着线。
+    // 标题本身用真正的粗体族，不再靠 `.weak()` / `.strong()` 只改颜色。
+    ui.add_space(12.0);
+    ui.label(
+        egui_soft::bold(title)
+            .size(12.5)
+            .color(argb(cfg::cur().text_body)),
+    );
+    ui.add_space(8.0);
 }
 
 fn row_label(s: &str) -> egui::RichText {
-    egui::RichText::new(s).size(13.0)
+    egui_soft::bold(s).size(13.0)
 }
 
 /// 分段选择：返回被点中的段（None = 没点）

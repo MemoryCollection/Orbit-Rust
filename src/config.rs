@@ -302,8 +302,8 @@ pub const TIP_MAX_W: f32 = 260.0;
 pub const LYRIC_FONT_SIZE: f32 = 14.0;
 /// 音乐条左右内边距
 pub const LYRIC_PAD_X: f32 = 16.0;
-/// 音乐条与胶囊之间的间距（像素）
-pub const LYRIC_GAP: i32 = 8;
+/// 音乐条与胶囊之间的间距（像素；用户要求左右距离再拉开一点，8 → 14）
+pub const LYRIC_GAP: i32 = 14;
 /// 音乐条最大宽度（超出按省略号截断）
 pub const LYRIC_MAX_W: f32 = 560.0;
 /// 句首音符符号的字号（无歌词/无封面时的占位）

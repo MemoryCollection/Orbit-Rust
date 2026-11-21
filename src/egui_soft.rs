@@ -11,12 +11,14 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
 use eframe::egui::epaint;
 use eframe::egui::epaint::Primitive;
 
 use crate::config as cfg;
+use crate::settings;
 
 // ---------- 纹理数据 ----------
 
@@ -131,6 +133,11 @@ fn sample_tex(tex: &TexData, u: f32, v: f32) -> [f32; 4] {
 /// 一个三角形的光栅化：重心插值 uv/颜色，预乘 over 合成。
 /// epaint 的抗锯齿靠"羽化边"（几何外扩 + 顶点色透明渐变），
 /// 所以这里不需要逐像素 AA，直接硬边填充即可。
+///
+/// `snap_px`：把顶点对齐到物理像素网格。字体图集网格（文字）必须开——
+/// epaint 只对 galley 整体取整，字形在 galley 内部仍是亚像素摆放，
+/// 双线性采样会把已经抗锯齿的字形再糊一遍（小字号下尤其明显，
+/// 表现为天气卡片的小字发虚）。逐字形对齐后采样 1:1 命中纹素，文字恢复锐利。
 pub fn fill_tri(
     buf: &mut [u8],
     w: i32,
@@ -139,12 +146,16 @@ pub fn fill_tri(
     v: [&egui::epaint::Vertex; 3],
     ppp: f32,
     tex: Option<&TexData>,
+    snap_px: bool,
 ) {
-    // 顶点坐标：逻辑点 → 物理像素
+    // 顶点坐标：逻辑点 → 物理像素（文字网格先对齐到整数物理像素）
+    let snap = |q: f32| -> f32 { (q * ppp).round() / ppp };
+    let sx = |i: usize| if snap_px { snap(v[i].pos.x) } else { v[i].pos.x };
+    let sy = |i: usize| if snap_px { snap(v[i].pos.y) } else { v[i].pos.y };
     let p: [(f32, f32); 3] = [
-        (v[0].pos.x * ppp, v[0].pos.y * ppp),
-        (v[1].pos.x * ppp, v[1].pos.y * ppp),
-        (v[2].pos.x * ppp, v[2].pos.y * ppp),
+        (sx(0) * ppp, sy(0) * ppp),
+        (sx(1) * ppp, sy(1) * ppp),
+        (sx(2) * ppp, sy(2) * ppp),
     ];
     let area = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[2].0 - p[0].0) * (p[1].1 - p[0].1);
     if area.abs() < 1e-6 {
@@ -263,6 +274,8 @@ pub struct SoftBackend {
     font_defs: egui::FontDefinitions,
     /// pass 之外的字体度量通道（惰性创建：`Fonts::new` 很贵）
     measure: RefCell<Option<MeasureFonts>>,
+    /// 上次构建字体定义时用的字体选择（切换后重建图集 / 度量通道）
+    font_misans: bool,
 }
 
 impl Default for SoftBackend {
@@ -287,6 +300,7 @@ impl SoftBackend {
             scale: 1.0,
             font_defs,
             measure: RefCell::new(None),
+            font_misans: settings::use_misans(),
         }
     }
 
@@ -310,6 +324,14 @@ impl SoftBackend {
         let scale = scale.max(0.5);
         self.scale = scale;
         self.last_scale = scale;
+        // 字体设置变了（设置页切换 MiSans / 系统字体）：重建字体图集与度量通道。
+        // 度量通道必须整个丢掉重来——它缓存了旧字体的 Galley 宽度，不清会错位。
+        let misans = settings::use_misans();
+        if misans != self.font_misans {
+            self.font_misans = misans;
+            self.font_defs = install_fonts(&self.ctx);
+            *self.measure.get_mut() = None;
+        }
         if let Some(m) = self.measure.get_mut().as_mut() {
             m.begin_frame(scale);
         }
@@ -358,7 +380,10 @@ impl SoftBackend {
     }
 
     /// 消费一帧的纹理增量（上传 / 释放）。
-    pub fn update_textures(&mut self, delta: &egui::TexturesDelta) {
+    ///
+    /// egui 0.37 的 `TexturesDelta` 在 Drop 时会 `debug_assert` 它已被处理完，
+    /// 所以这里应用完必须 `clear()`；否则 debug 版只要有字体图集增量就会 panic。
+    pub fn update_textures(&mut self, delta: &mut egui::TexturesDelta) {
         for (id, deltas) in &delta.set {
             for d in deltas {
                 // 字体图集是**局部更新**（pos = Some），必须合并进已有纹理，
@@ -386,6 +411,8 @@ impl SoftBackend {
         for id in &delta.free {
             self.tex.remove(id);
         }
+        // 告诉 epaint 这些增量已经被消费，否则 Drop 时 debug_assert 会 panic
+        delta.clear();
     }
 
     /// 把 epaint 网格光栅化为预乘 RGBA（w*h*4）。
@@ -401,6 +428,8 @@ impl SoftBackend {
                 (prim.clip_rect.bottom() * ppp).ceil(),
             );
             let tex = self.tex.get(&mesh.texture_id);
+            // 字体图集 = Managed(0)（epaint 约定第一张托管纹理）：文字网格做像素对齐
+            let snap_px = mesh.texture_id == egui::TextureId::Managed(0);
             for tri in mesh.indices.chunks_exact(3) {
                 fill_tri(
                     &mut rgba,
@@ -414,6 +443,7 @@ impl SoftBackend {
                     ],
                     ppp,
                     tex,
+                    snap_px,
                 );
             }
         }
@@ -566,6 +596,87 @@ pub fn glass_board(p: &egui::Painter, board: egui::Rect, cr: egui::CornerRadius)
     }
 }
 
+// ---------- 刘海剪影（吸顶 / 吸底共用） ----------
+
+/// 吸顶刘海剪影的闭合路径：顶边两端各向外张开一段凹弧"耳朵"，剪影沿屏幕
+/// 边缘多探出 `ew`，再用 `eh` 的深度平滑收回条身；条身底部仍是半圆。
+///
+/// 返回点序列**第一个点必须落在左耳与条身的交界角上**：epaint 对填充路径
+/// 做"从首顶点出发"的扇形三角化，剪影对该点呈星形分布时才能正确铺满
+/// （见 tessellator::triangulate_convex_path）。吸底版本由调用方把点
+/// 上下镜像，绕向由填充端自动纠正。
+pub fn island_silhouette(fw: f32, fh: f32, ew: f32, eh: f32, rb: f32) -> Vec<egui::Pos2> {
+    // 耳朵凹弧：深度 y 处距窗口左缘 x = ew·sin(π/2 · y/eh)——
+    // 贴边处张满 ew，深 eh 处收进条身，两端切线分别贴合顶边与侧边。
+    let curve = |y: f32| ew * (std::f32::consts::FRAC_PI_2 * (y / eh).clamp(0.0, 1.0)).sin();
+    let n = 12; // 耳朵弧采样段数
+    let arc_n = 10; // 底部圆角采样段数
+    let (bx0, bx1) = (ew, fw - ew); // 条身左右边（窗口比条身左右各宽一只耳朵）
+    let rb = rb.min((bx1 - bx0) / 2.0).max(0.0); // 底部圆角半径
+    let mut pts = Vec::with_capacity(2 * n + 2 * arc_n + 6);
+
+    pts.push(egui::pos2(bx0, 0.0)); // 星形中心角：左耳与条身的交界
+    pts.push(egui::pos2(bx1, 0.0)); // 顶边（贴屏幕边缘）
+    for k in 1..=n {
+        let y = eh * k as f32 / n as f32;
+        pts.push(egui::pos2(fw - curve(y), y)); // 右耳凹弧
+    }
+    pts.push(egui::pos2(bx1, fh - rb)); // 条身右侧直边
+    for k in 1..=arc_n {
+        // 右下圆角（圆心 bx1-rb, fh-rb）
+        let a = std::f32::consts::FRAC_PI_2 * k as f32 / arc_n as f32;
+        pts.push(egui::pos2(bx1 - rb + rb * a.cos(), fh - rb + rb * a.sin()));
+    }
+    for k in (0..arc_n).rev() {
+        // 左下圆角（圆心 bx0+rb, fh-rb）
+        let a = std::f32::consts::FRAC_PI_2 * k as f32 / arc_n as f32;
+        pts.push(egui::pos2(bx0 + rb - rb * a.cos(), fh - rb + rb * a.sin()));
+    }
+    pts.push(egui::pos2(bx0, eh)); // 条身左侧直边（回到左耳末端）
+    for k in (0..n).rev() {
+        let y = eh * k as f32 / n as f32;
+        pts.push(egui::pos2(curve(y), y)); // 左耳凹弧，收到窗口左上角
+    }
+    pts
+}
+
+/// 吸顶 / 吸底剪影底板：耳朵与条身是**一整条闭合路径一次填充**——
+/// 分成两块拼会在半透明底色下露出接缝（叠色比单层更实）。
+/// 霓虹主题下沿剪影内缘补几圈递减的发光带，等效 `glow_edges`。
+///
+/// `flush_top` = 贴屏幕顶（耳朵在顶边两角）；false = 贴屏幕底（上下镜像）。
+pub fn island_board(
+    p: &egui::Painter, fw: f32, fh: f32, ew: f32, eh: f32, rb: f32, flush_top: bool,
+) {
+    let mut pts = island_silhouette(fw, fh, ew, eh, rb);
+    if !flush_top {
+        for pt in &mut pts {
+            pt.y = fh - pt.y;
+        }
+    }
+    let path = |fill: egui::Color32, stroke: egui::epaint::PathStroke| {
+        egui::Shape::Path(egui::epaint::PathShape {
+            points: pts.clone(),
+            closed: true,
+            fill,
+            stroke,
+        })
+    };
+    p.add(path(argb(cfg::pill_bg_effective()), egui::Stroke::NONE.into()));
+    if cfg::cur().glow {
+        // 内发光：外缘贴剪影、内缘逐圈收进，等价 glass_board 的 glow_edges
+        let color = cfg::cur().dock_edge;
+        for k in 0..3 {
+            let kf = k as f32;
+            let w = 2.8 + kf * 1.7;
+            p.add(path(
+                egui::Color32::TRANSPARENT,
+                egui::epaint::PathStroke::new(w, argb(with_alpha(color, 0.28 - kf * 0.09))).inside(),
+            ));
+        }
+    }
+}
+
 /// 分隔线（竖 1px，垂直居中）。顶部胶囊已去掉分割线，保留给其它视图备用。
 #[allow(dead_code)]
 pub fn divider(p: &egui::Painter, x: f32, fh: f32) {
@@ -579,6 +690,55 @@ pub fn divider(p: &egui::Painter, x: f32, fh: f32) {
     );
 }
 
+/// MiSans 字体文件名（随发布包放在 `<exe>/data/`，**不打进 exe**：
+/// 运行时从磁盘加载，找不到就回落系统字体）。
+const MISANS_FONT_FILE: &str = "MiSans-Semibold.ttf";
+
+/// 标题/强调文字用的命名字体族名。
+/// egui 的 `RichText::strong()` 只改颜色不改字重，真正要粗体必须走这个族。
+pub const BOLD_FAMILY: &str = "orbit-bold";
+
+/// 生成一段粗体文字：MiSans 模式下用 MiSans Semibold，
+/// 系统字体模式下退回微软雅黑 Bold（msyhbd.ttc）。
+pub fn bold(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).family(egui::FontFamily::Name(BOLD_FAMILY.into()))
+}
+
+/// 给 `Painter::text` / 度量通道用的粗体 FontId。
+/// MiSans 模式下即 MiSans-Semibold；文件缺失时回落系统默认粗体字体。
+pub fn bold_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(BOLD_FAMILY.into()))
+}
+
+/// 时钟/日期用的 FontId：统一走粗体族（MiSans Semibold / 系统默认粗体）。
+pub fn clock_font(size: f32) -> egui::FontId {
+    bold_font(size)
+}
+
+/// 依次找：发布目录 data/ → exe 同目录 → 开发期仓库 assets/fonts → 当前目录 assets/fonts。
+/// 找不到 / 读失败都返回 None，调用方回落默认字体（= 系统字体效果）。
+fn load_font_file(name: &str) -> Option<(Vec<u8>, std::path::PathBuf)> {
+    let mut cands: Vec<std::path::PathBuf> = vec![crate::store::path(name)];
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        cands.push(dir.join(name));
+        // 开发期 exe 在 target/debug，仓库根在上两级
+        cands.push(dir.join("../../assets/fonts").join(name));
+        cands.push(dir.join("../assets/fonts").join(name));
+    }
+    cands.push(std::path::PathBuf::from("assets/fonts").join(name));
+    for p in cands {
+        if let Ok(bytes) = std::fs::read(&p) {
+            if !bytes.is_empty() {
+                return Some((bytes, p));
+            }
+        }
+    }
+    None
+}
+
 /// 中文字体兜底：微软雅黑 + Segoe UI Symbol（天气/信封/剪贴板这些字形符号），
 /// 追加到比例字体族末尾做回退。
 ///
@@ -590,22 +750,82 @@ pub fn install_fonts(ctx: &egui::Context) -> egui::FontDefinitions {
     fonts
 }
 
-/// 构建三套字体定义（不设置到任何 Context）。
-fn build_font_definitions() -> egui::FontDefinitions {
+/// 构建字体定义（不设置到任何 Context）。
+///
+/// `settings::use_misans()` = 真 → MiSans 排在最前（中英文统一字形）；
+/// = 假 → 只有系统字体（微软雅黑等），跟接入前一致。
+/// 设置项变化时各窗口会重建字体图集，见 `SoftBackend::set_scale`。
+pub fn build_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
+    let use_misans = settings::use_misans();
+    static MISANS_WARNED: AtomicBool = AtomicBool::new(false);
+    if use_misans {
+        // MiSans 从磁盘加载（不打进 exe）：正文够清晰，标题/强调也用同一款。
+        // 发布包里放在 <exe>/data/MiSans-Semibold.ttf；文件缺失时回落系统字体。
+        match load_font_file(MISANS_FONT_FILE) {
+            Some((bytes, _path)) => {
+                fonts.font_data.insert(
+                    "misans".into(),
+                    std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                // 插到最前面：MiSans 命中绝大多数中英文，系统字体只补它缺的字形
+                for fam in fonts.families.values_mut() {
+                    fam.insert(0, "misans".into());
+                }
+                // 粗体族：只有一个字重，仍让它指向 Semibold（比系统 Regular 稳），
+                // 系统字体模式下才补 msyhbd.ttc 做真粗
+                fonts.families.insert(
+                    egui::FontFamily::Name(BOLD_FAMILY.into()),
+                    vec!["misans".into()],
+                );
+                MISANS_WARNED.store(false, Ordering::Relaxed);
+            }
+            None => {
+                if !MISANS_WARNED.swap(true, Ordering::Relaxed) {
+                    crate::tlog!(
+                        "[font] MiSans 未找到（{}），回落系统字体",
+                        MISANS_FONT_FILE
+                    );
+                }
+            }
+        }
+    }
     let candidates = [
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/msyh.ttf",
         "C:/Windows/Fonts/seguisym.ttf",
         "C:/Windows/Fonts/simhei.ttf",
     ];
+    let mut loaded_cjk = Vec::new();
     for (i, path) in candidates.iter().enumerate() {
         if let Ok(bytes) = std::fs::read(path) {
+            let name = format!("soft_cjk{i}");
             fonts
                 .font_data
-                .insert(format!("soft_cjk{i}"), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-            fonts.families.entry(egui::FontFamily::Proportional).or_default().push(format!("soft_cjk{i}"));
+                .insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            fonts.families.entry(egui::FontFamily::Proportional).or_default().push(name.clone());
+            loaded_cjk.push(name);
         }
     }
+    // 粗体族的回退：MiSans 缺字形（如某些符号）时交给系统字体；
+    // 系统字体模式下直接用微软雅黑 Bold，避免标题变成"假粗"（仅颜色加深）。
+    let mut has_soft_bold = false;
+    if !use_misans {
+        if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/msyhbd.ttc") {
+            fonts
+                .font_data
+                .insert("soft_bold".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            has_soft_bold = true;
+        }
+    }
+    let bold_family = fonts
+        .families
+        .entry(egui::FontFamily::Name(BOLD_FAMILY.into()))
+        .or_default();
+    if has_soft_bold {
+        bold_family.push("soft_bold".into());
+    }
+    bold_family.extend(loaded_cjk);
+
     fonts
 }

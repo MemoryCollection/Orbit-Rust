@@ -17,12 +17,15 @@
 //!                         1.0 = 滑条 100%，实际倍率是"老的基准 × 0.85"
 //! - `icon_scale`         Dock 图标（连同 Dock 高度与托盘图标）大小 0.8 ~ 1.35，默认 1.0。
 //!                         1.0 = 滑条 100%，实际倍率是"老的基准 × 0.95"
+//! - `corner_radius`      统一圆角半径（逻辑点，0 ~ 22，默认 14）：
+//!                         顶部胶囊 / 音乐条 / 模块条 / Dock 共用；默认是圆角矩形，
+//!                         调到条高一半即完全胶囊形
 //! - `theme`              外观主题 key（`calm_light` / `calm_dark` / `glass2_light` /
 //!                         `glass2_dark` / `m3_light` / `m3_dark`）；三套风格各带深浅色。
 //!                         老版本的 `glass`/`liquid`/`mica`/`paper`/`neon`/`terminal`
 //!                         会被 `legacy_theme_key` 就近映射到新 key
 //! - `pill_anchor`        胶囊位置/形状：`float`（悬浮顶部，默认）/ `island`（吸顶刘海，
-//!                          顶部两角方形）/ `bottom`（吸底，底部两角方形）
+//!                          贴屏幕顶、顶边两角张开成"耳"）/ `bottom`（吸底，底部对称处理）
 //! - `dock_anchor`        底部 Dock 位置：`bottom`（默认）/ `top` / `left` / `right`
 //! - `weather_source`     天气数据源：`amap`（高德，默认）/ `open_meteo`
 //! - `amap_key`           高德 Web 服务 key（空 = 回落编译期默认）
@@ -31,7 +34,13 @@
 //! - `weather_text_scale` 天气面板字号倍率（1.0 = 基准，0.8 ~ 1.8）
 //! - `lyric_position`     音乐条位置：`right`（默认，贴胶囊右侧）/ `left` / `bottom`
 //! - `lyric_size`         歌词字号（逻辑单位，10 ~ 26，默认 14）
+//! - `lyric_lead`         歌词提前量（-5 ~ 5 秒，默认 1；0 = 不提前，负值 = 延后）
 //! - `show_tray`          Dock 上是否显示托盘图标（0 = 隐藏；仅手改文件生效）
+//! - `wechat_sound`       微信托盘图标闪烁（新消息）时播放内置提示音（0 = 关，默认开）
+//! - `wechat_cards`       微信消息卡片（UIA 读会话名+摘要）：`0` = 关（默认，托盘闪烁
+//!                          直接弹通用横幅）；`1` = 开，读取线程随开关启停
+//! - `wechat_ignore`      卡片白名单：标题命中就不弹（分号分隔，默认「折叠的聊天」）
+//! - `font`               界面字体：`misans`（默认，随包分发 MiSans Semibold）/ `system`（微软雅黑等系统字体）
 //! - `show_desktop_btn`   Dock"返回桌面"细长条（0 = 不显示；设置页在「托盘图标」
 //!                          列表的"返回桌面"格里开关）
 //! - `hide_tray`          Dock 上要**单独隐藏**的托盘图标（分号分隔，键由程序生成）
@@ -45,7 +54,7 @@
 //! 并把 `VERSION` 加一；各窗口在自己的定时器里比对版本号决定是否重绘。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::UNIX_EPOCH;
 
@@ -58,6 +67,13 @@ const SCALE_MAX: f32 = 1.8;
 /// 歌词字号上下限
 const LYRIC_MIN: f32 = 10.0;
 const LYRIC_MAX: f32 = 26.0;
+/// 歌词提前量上限（秒，可正可负）
+pub const LYRIC_LEAD_MAX: f32 = 5.0;
+/// 统一圆角半径上下限（逻辑点）。0 = 直角，到条高一半就成了完全胶囊形
+pub const CORNER_MIN: f32 = 0.0;
+pub const CORNER_MAX: f32 = 22.0;
+/// 圆角半径默认值：圆角矩形（不是胶囊）
+const CORNER_DEFAULT: f32 = 14.0;
 /// 胶囊透明度上下限（再低就看不清了）；滑条量程直接用这两个值
 pub const ALPHA_MIN: f32 = 0.2;
 pub const ALPHA_MAX: f32 = 1.0;
@@ -78,6 +94,8 @@ const UNLOADED: u32 = 0;
 
 static SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
 static LYRIC_SIZE: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 歌词提前量（秒，f32 bits；UNLOADED 时默认 1 秒）
+static LYRIC_LEAD: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 歌词位置编码：1 = 左，2 = 右，3 = 下（0 = 未加载）
 static LYRIC_POS: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 模块排列（列表）与各模块的模式
@@ -100,6 +118,8 @@ static PILL_SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
 static ICON_SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
 static PILL_ANCHOR: AtomicU32 = AtomicU32::new(UNLOADED);
 static DOCK_ANCHOR: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 统一圆角半径（f32 位型）：胶囊 / 音乐条 / 模块条 / Dock 共用
+static CORNER: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 天气数据源编码 / 高德 key
 static WEATHER_SOURCE: AtomicU32 = AtomicU32::new(UNLOADED);
 static AMAP_KEY: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
@@ -113,11 +133,27 @@ static SHOW_TRAY: AtomicU32 = AtomicU32::new(UNLOADED);
 static SHOW_DESKTOP: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 微信托盘图标开始闪烁（新消息）时是否播放内置提示音
 static WECHAT_SOUND: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 微信新消息是否在屏幕右下角弹会话名+摘要小卡片（只读 UIA）
+static WECHAT_CARDS: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 右下角横幅每条停留秒数；0 = 不自动关闭（UNLOADED 时默认 6）
+static BANNER_SECS: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 微信卡片标题白名单：标题命中就不弹（默认含「折叠的聊天」）
+static WECHAT_IGNORE: LazyLock<Mutex<Vec<String>>> =
+    LazyLock::new(|| Mutex::new(vec!["折叠的聊天".to_string()]));
+/// 界面字体：UNLOADED / 1 = MiSans（随包分发，磁盘加载）/ 2 = 系统字体
+static FONT: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 被单独隐藏的托盘图标键（`tray::TrayItem::key`）。数量很少，读写都走这把锁
 static HIDE_TRAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Dock 固定图标（exe / .lnk 全路径，按顺序显示）。
 /// `None` = 用户还没在设置页改过 → 由 dock 回落到系统任务栏的钉选
 static DOCK_PINS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+/// 开始菜单快捷方式（(名称, 程序路径)，按顺序显示）。
+/// `None` = 用户还没在设置页改过 → 默认只有「命令提示符 (cmd)」
+static START_PINS: Mutex<Option<Vec<(String, String)>>> = Mutex::new(None);
+/// 开机启动（0 = 未加载，1 = 关，2 = 开；注册表 HKCU Run 键，见 guard.rs）
+static AUTOSTART: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 退出守护：orbit 被强杀后由守护子进程重启 explorer 恢复任务栏（默认开）
+static GUARDIAN: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 图标指定：键（托盘图标键 / `app:<exe>`）→ 取图标的 exe/.lnk 全路径。
 /// 有些程序注册的托盘 hIcon 只有 16px，放大到 Dock 尺寸必然糊，用户可以指定一个
 /// 图标清晰的 exe 顶替它。
@@ -127,6 +163,9 @@ static VERSION: AtomicU64 = AtomicU64::new(1);
 /// 正在写盘：这时读文件可能拿到半成品，轮询先跳过
 static SAVING: AtomicU64 = AtomicU64::new(0);
 static MTIME: AtomicU64 = AtomicU64::new(0);
+/// 编辑会话中：设置页点「应用」前，所有 `set_*` 只改内存、不落盘不 bump，
+/// 改完由 `commit_edit()` 一次性 save()+bump()。见下方三个函数。
+static EDITING: AtomicBool = AtomicBool::new(false);
 
 // ---------- 模块模型 ----------
 
@@ -739,6 +778,68 @@ pub fn lyric_size() -> f32 {
     }
 }
 
+/// 歌词提前量（秒）：显示"播放位置 + 提前量"对应的那句，让字幕贴住听感。
+/// 默认 1 秒；0 = 不提前；**负值 = 延后**（歌词比听到的晚一点换）。
+pub fn lyric_lead() -> f32 {
+    match LYRIC_LEAD.load(Ordering::Relaxed) {
+        UNLOADED => 1.0,
+        bits => f32::from_bits(bits).clamp(-LYRIC_LEAD_MAX, LYRIC_LEAD_MAX),
+    }
+}
+
+/// 设置歌词提前量（-5 ~ 5 秒，步进 0.1 秒由设置页控制）
+pub fn set_lyric_lead(secs: f32) {
+    let secs = secs.clamp(-LYRIC_LEAD_MAX, LYRIC_LEAD_MAX);
+    if (secs - lyric_lead()).abs() < 1e-3 {
+        return;
+    }
+    LYRIC_LEAD.store(secs.to_bits(), Ordering::Relaxed);
+    save();
+    bump();
+}
+
+// ---------- 圆角 ----------
+
+/// 统一圆角半径（逻辑点）：胶囊 / 音乐条 / 模块条 / Dock 共用。
+/// 默认 14 → 圆角矩形；调到条高一半就是原来的完全胶囊形，0 = 直角。
+pub fn corner_radius() -> f32 {
+    match CORNER.load(Ordering::Relaxed) {
+        UNLOADED => CORNER_DEFAULT,
+        bits => f32::from_bits(bits).clamp(CORNER_MIN, CORNER_MAX),
+    }
+}
+
+/// 实际绘制用的半径：不超过条高的一半，再高也是胶囊形
+pub fn corner_radius_for(fh: f32) -> f32 {
+    corner_radius().min(fh / 2.0).max(0.0)
+}
+
+/// 滑条拖动中的即时预览（只改内存 + 通知重绘，不写盘）
+pub fn preview_corner_radius(v: f32) {
+    let v = v.clamp(CORNER_MIN, CORNER_MAX);
+    if (v - corner_radius()).abs() < 1e-4 {
+        return;
+    }
+    CORNER.store(v.to_bits(), Ordering::Relaxed);
+    bump();
+}
+
+pub fn persist_corner_radius() {
+    save();
+    bump();
+}
+
+/// 一步到位地设值（「重置」按钮用）：改内存 + 落盘 + 通知重绘
+pub fn set_corner_radius(v: f32) {
+    let v = v.clamp(CORNER_MIN, CORNER_MAX);
+    if (v - corner_radius()).abs() < 1e-4 {
+        return;
+    }
+    CORNER.store(v.to_bits(), Ordering::Relaxed);
+    save();
+    bump();
+}
+
 /// Dock 上是否显示托盘图标
 pub fn show_tray() -> bool {
     match SHOW_TRAY.load(Ordering::Relaxed) {
@@ -761,6 +862,109 @@ pub fn wechat_sound() -> bool {
         UNLOADED => true,
         c => c == 2,
     }
+}
+
+/// 微信新消息是否在屏幕右下角弹会话名+摘要小卡片（只读 UIA）。
+/// 默认关（托盘闪烁直接弹通用横幅）；设置页可再开，开后读取线程自动启动。
+pub fn wechat_cards() -> bool {
+    match WECHAT_CARDS.load(Ordering::Relaxed) {
+        UNLOADED => false,
+        c => c == 2,
+    }
+}
+
+/// 微信卡片白名单（标题精确匹配，分号分隔展示/存储）
+pub fn wechat_ignore() -> Vec<String> {
+    WECHAT_IGNORE.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+/// 设置页输入框用的文本
+pub fn wechat_ignore_text() -> String {
+    wechat_ignore().join(";")
+}
+
+/// 这个会话标题是否在白名单里（不弹卡片）
+pub fn is_wechat_ignored(title: &str) -> bool {
+    let title = title.trim();
+    WECHAT_IGNORE
+        .lock()
+        .map(|v| v.iter().any(|s| s == title))
+        .unwrap_or(false)
+}
+
+/// 更新微信卡片白名单；空项自动去掉，标题前后空格 trim
+pub fn set_wechat_ignore(list: Vec<String>) {
+    let mut clean: Vec<String> = Vec::new();
+    for s in list {
+        let s = s.trim();
+        if !s.is_empty() && !clean.iter().any(|k| k == s) {
+            clean.push(s.to_string());
+        }
+    }
+    let changed = WECHAT_IGNORE
+        .lock()
+        .map(|mut v| {
+            if *v == clean {
+                false
+            } else {
+                *v = clean;
+                true
+            }
+        })
+        .unwrap_or(false);
+    if changed {
+        save();
+        bump();
+    }
+}
+
+/// 右下角横幅（微信消息卡片等）每条自动关闭的秒数；0 = 不自动关闭。
+/// 原子内部存「秒数 + 1」：UNLOADED 哨兵是 0，直接存秒数会让「0 秒」
+/// 撞上哨兵被当成未加载、永远读回默认 6（实测 bug）。
+pub fn banner_secs() -> u32 {
+    match BANNER_SECS.load(Ordering::Relaxed) {
+        UNLOADED => 6,
+        n => n.saturating_sub(1),
+    }
+}
+
+/// 设置横幅停留秒数（设置页输入框；0 = 不自动关闭，上限 3600）。
+/// 这一项**立即落盘**，不走「点应用才写盘」的草稿机制：文本框失焦/窗口失活
+/// 的时序会让草稿先丢弃，实测「改了又变回默认」。
+pub fn set_banner_secs(secs: u32) {
+    let secs = secs.min(3600);
+    if secs == banner_secs() {
+        return;
+    }
+    BANNER_SECS.store(secs + 1, Ordering::Relaxed);
+    let was = EDITING.swap(false, Ordering::Relaxed);
+    save();
+    if was {
+        EDITING.store(true, Ordering::Relaxed);
+    }
+    bump();
+}
+
+// ---------- 界面字体 ----------
+
+/// 是否使用 MiSans（随包分发、磁盘加载；文件缺失时回落系统微软雅黑等）
+pub fn use_misans() -> bool {
+    match FONT.load(Ordering::Relaxed) {
+        UNLOADED => true,
+        2 => false,
+        _ => true,
+    }
+}
+
+/// 切换界面字体。改变会让所有窗口在下一个渲染帧重建字体图集。
+pub fn set_use_misans(on: bool) {
+    let code = if on { 1 } else { 2 };
+    if FONT.load(Ordering::Relaxed) == code {
+        return;
+    }
+    FONT.store(code, Ordering::Relaxed);
+    save();
+    bump();
 }
 
 // ---------- 单个托盘图标的显隐 ----------
@@ -862,6 +1066,37 @@ pub fn version() -> u64 {
     VERSION.load(Ordering::Relaxed)
 }
 
+// ---------- 编辑会话（设置页「应用」按钮） ----------
+
+/// 设置页打开时进入编辑会话：之后所有 `set_*` 只改内存、不写盘不 bump。
+/// 点「应用」→ `commit_edit()` 一次落盘；点「还原」/关窗 → `discard_edit()` 从文件恢复。
+pub fn begin_edit() {
+    EDITING.store(true, Ordering::Relaxed);
+}
+
+/// 把编辑会话期间的所有改动一次性落盘，并结束会话。
+pub fn commit_edit() {
+    EDITING.store(false, Ordering::Relaxed);
+    save();
+    bump();
+    // 主动通知胶囊 / Dock 立即重绘，不必等各自 500ms 的轮询（主题/模块切换的顿挫感来源）
+    crate::appmsg::notify_applied();
+}
+
+/// 丢弃编辑会话期间的改动：从 settings.txt 重读恢复内存，并结束会话。
+pub fn discard_edit() {
+    EDITING.store(false, Ordering::Relaxed);
+    load();
+    bump();
+    // 还原同样要立刻刷新回旧值
+    crate::appmsg::notify_applied();
+}
+
+/// 当前是否在编辑会话中（设置页据此决定「应用/还原」按钮显隐与高亮）。
+pub fn editing() -> bool {
+    EDITING.load(Ordering::Relaxed)
+}
+
 // ---------- Dock 固定图标 ----------
 
 /// Dock 固定图标列表（exe / .lnk 全路径，按显示顺序）。
@@ -884,7 +1119,97 @@ pub fn set_dock_pins(list: Vec<String>) {
     bump();
 }
 
+// ---------- 开始菜单 / 系统 ----------
+
+/// 开始菜单快捷方式默认项（用户没改过时的唯一一条）
+fn default_start_pins() -> Vec<(String, String)> {
+    vec![(
+        "命令提示符".to_string(),
+        "C:\\Windows\\System32\\cmd.exe".to_string(),
+    )]
+}
+
+/// 开始菜单快捷方式列表（设置页没改过 → 默认「命令提示符」）
+pub fn start_pins() -> Vec<(String, String)> {
+    match START_PINS.lock().ok().and_then(|v| v.clone()) {
+        Some(list) => list,
+        None => default_start_pins(),
+    }
+}
+
+/// 用户自定义过的开始菜单快捷方式（None = 还没改过；`Some(vec![])` = 清空了）
+pub fn start_pins_custom() -> Option<Vec<(String, String)>> {
+    START_PINS.lock().ok().and_then(|v| v.clone())
+}
+
+/// 覆盖开始菜单快捷方式列表（设置页增删走这里）
+pub fn set_start_pins(list: Vec<(String, String)>) {
+    let mut clean: Vec<(String, String)> = Vec::new();
+    for (name, target) in list {
+        let (name, target) = (name.trim().to_string(), target.trim().to_string());
+        if name.is_empty() || target.is_empty() {
+            continue;
+        }
+        if !clean.iter().any(|(_, p)| p.eq_ignore_ascii_case(&target)) {
+            clean.push((name, target));
+        }
+    }
+    let changed = START_PINS
+        .lock()
+        .map(|mut v| {
+            let diff = v.as_ref() != Some(&clean);
+            if diff {
+                *v = Some(clean);
+            }
+            diff
+        })
+        .unwrap_or(false);
+    if changed {
+        save();
+        bump();
+    }
+}
+
+/// 开机启动（写注册表 HKCU\...\Run；注册表的实际增删见 guard.rs，
+/// 启动时 sync_autostart() 会按这里的值对齐注册表）
+pub fn autostart() -> bool {
+    match AUTOSTART.load(Ordering::Relaxed) {
+        UNLOADED => true,
+        c => c == 2,
+    }
+}
+
+pub fn set_autostart(on: bool) {
+    if autostart() == on {
+        return;
+    }
+    AUTOSTART.store(bool_code(on), Ordering::Relaxed);
+    save();
+    bump();
+}
+
+/// 退出守护（默认开；开关在下次启动 orbit 时生效——守护子进程随主进程拉起）
+pub fn guardian() -> bool {
+    match GUARDIAN.load(Ordering::Relaxed) {
+        UNLOADED => true,
+        c => c == 2,
+    }
+}
+
+pub fn set_guardian(on: bool) {
+    if guardian() == on {
+        return;
+    }
+    GUARDIAN.store(bool_code(on), Ordering::Relaxed);
+    save();
+    bump();
+}
+
 fn bump() {
+    // 编辑会话中不 bump：设置页还没点「应用」，主界面不应重绘
+    if EDITING.load(Ordering::Relaxed) {
+        return;
+    }
     VERSION.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -908,9 +1233,7 @@ pub fn set_lyric_size(v: f32) {
     LYRIC_SIZE.store(v.to_bits(), Ordering::Relaxed);
     save();
     bump();
-}
-
-pub fn set_lyric_position(p: LyricPos) {
+}pub fn set_lyric_position(p: LyricPos) {
     if p == lyric_position() {
         return;
     }
@@ -938,10 +1261,24 @@ pub fn set_wechat_sound(on: bool) {
     bump();
 }
 
+/// 开关微信消息卡片（设置页）
+pub fn set_wechat_cards(on: bool) {
+    if on == wechat_cards() {
+        return;
+    }
+    WECHAT_CARDS.store(bool_code(on), Ordering::Relaxed);
+    save();
+    bump();
+}
+
 /// 按当前值更新设置文件：**只改我们管的键的值**，注释、空行、用户自己加的
 /// 其它键都原样保留（手改过的文件不会被洗掉）；缺的键补在末尾。
 /// 写完把 mtime 同步掉，免得下一轮轮询又当成"外部改动"重载一次。
 fn save() {
+    // 编辑会话中不落盘：改动暂存在内存，点「应用」才 commit_edit() 统一写文件
+    if EDITING.load(Ordering::Relaxed) {
+        return;
+    }
     let order = module_order().join(",");
     let fmt = clock_format();
     let key = AMAP_KEY.lock().map(|s| s.clone()).unwrap_or_default();
@@ -961,6 +1298,7 @@ fn save() {
         ("pill_alpha", trim_num(pill_alpha())),
         ("pill_scale", trim_num(pill_scale_raw())),
         ("icon_scale", trim_num(icon_scale_raw())),
+        ("corner_radius", trim_num(corner_radius())),
         ("theme", crate::theme::cur().key.to_string()),
         ("pill_anchor", pill_anchor().as_str().to_string()),
         ("dock_anchor", dock_anchor().as_str().to_string()),
@@ -973,15 +1311,27 @@ fn save() {
         ("weather_text_scale", trim_num(weather_text_scale())),
         ("lyric_position", lyric_pos_str(lyric_position()).to_string()),
         ("lyric_size", trim_num(lyric_size())),
+        ("lyric_lead", trim_num(lyric_lead())),
         ("show_tray", on_off(show_tray()).to_string()),
         ("show_desktop_btn", on_off(show_desktop_btn()).to_string()),
         ("wechat_sound", on_off(wechat_sound()).to_string()),
+        ("wechat_cards", on_off(wechat_cards()).to_string()),
+        ("wechat_ignore", wechat_ignore().join(";")),
+        ("banner_secs", banner_secs().to_string()),
+        ("font", if use_misans() { "misans" } else { "system" }.to_string()),
         ("hide_tray", hidden_tray().join(";")),
     ];
     // 固定列表按需写：用户还没改过（None）就不落键，免得把系统任务栏钉选"写空"
     if let Some(pins) = dock_pins() {
         vals.push(("dock_pins", pins.join(";")));
     }
+    // 开始菜单快捷方式同上：没改过不落键（改过才覆盖，删掉该键即恢复默认）
+    if let Some(pins) = start_pins_custom() {
+        let s: Vec<String> = pins.iter().map(|(n, p)| format!("{n}|{p}")).collect();
+        vals.push(("start_pins", s.join(";")));
+    }
+    vals.push(("autostart", on_off(autostart()).to_string()));
+    vals.push(("guardian", on_off(guardian()).to_string()));
     let overs: Vec<String> = icon_overrides()
         .into_iter()
         .map(|(k, p)| format!("{k}|{p}"))
@@ -1092,7 +1442,13 @@ struct Snap {
     lyric_size: f32,
     show_tray: bool,
     show_desktop: bool,
+    wechat_cards: bool,
+    wechat_ignore: Vec<String>,
+    use_misans: bool,
     hidden_tray: Vec<String>,
+    start_pins: Option<Vec<(String, String)>>,
+    autostart: bool,
+    guardian: bool,
 }
 
 fn snapshot() -> Snap {
@@ -1116,7 +1472,13 @@ fn snapshot() -> Snap {
         lyric_size: lyric_size(),
         show_tray: show_tray(),
         show_desktop: show_desktop_btn(),
+        wechat_cards: wechat_cards(),
+        wechat_ignore: wechat_ignore(),
+        use_misans: use_misans(),
         hidden_tray: hidden_tray(),
+        start_pins: start_pins_custom(),
+        autostart: autostart(),
+        guardian: guardian(),
     }
 }
 
@@ -1215,6 +1577,9 @@ pill_alpha=1.0
 # 胶囊整体大小 / Dock 图标大小（1.0 = 滑条 100%，0.8 ~ 1.35；设置页里有滑条和「重置」）
 pill_scale=1
 icon_scale=1
+# 统一圆角半径（逻辑点，0 = 直角，默认 14 = 圆角矩形）：
+# 顶部胶囊 / 音乐条 / 模块条 / Dock 共用，调到条高一半就是完全胶囊形
+corner_radius=14
 # 外观主题（每套都有深色 + 浅色）：calm_light/calm_dark（平静极简）/
 # glass2_light/glass2_dark（玻璃拟态 2.0）/ m3_light/m3_dark（Material 3）
 theme=calm_light
@@ -1244,8 +1609,21 @@ show_desktop_btn=1
 # 微信托盘图标开始闪烁（新消息）时播放内置提示音（1 = 开，默认；0 = 关）。
 # 想换音效：直接用同名文件覆盖 data/wechat_notify.mp3 即可
 wechat_sound=1
+# 微信消息卡片（UIA 读会话名+摘要，1 = 开；0 = 关，默认）。
+# 关闭时托盘闪烁直接弹通用横幅；开启后只读微信聊天列表，不改动微信本体
+wechat_cards=0
+# 微信卡片白名单：标题命中就不弹卡片（分号分隔；默认「折叠的聊天」）
+wechat_ignore=折叠的聊天
+# 界面字体：misans = MiSans（随包分发，默认）；system = 系统字体（微软雅黑等）
+font=misans
 # Dock 上要单独隐藏的托盘图标（分号分隔，键由设置页生成；清空 = 全部显示）
 hide_tray=
+# 开始菜单（Win 键弹出）快捷方式：`名称|程序路径`，分号分隔；删掉本行恢复默认「命令提示符」
+start_pins=命令提示符|C:\\Windows\\System32\\cmd.exe
+# 开机启动：写注册表 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run（1 = 开，默认）
+autostart=1
+# 退出守护：orbit 被强杀（任务栏没恢复）时由守护进程重启 explorer 恢复任务栏（1 = 开，默认）
+guardian=1
 ";
 
 /// 文件不存在就写一份默认值；返回 true 表示是新建的
@@ -1274,6 +1652,11 @@ fn append_missing() {
              pill_scale=1\nicon_scale=1\n",
         ),
         (
+            "corner_radius",
+            "# 统一圆角半径（逻辑点，0 = 直角，默认 14 = 圆角矩形）：\n\
+             # 顶部胶囊 / 音乐条 / 模块条 / Dock 共用，调到条高一半就是完全胶囊形\ncorner_radius=14\n",
+        ),
+        (
             "theme",
             "# 外观主题：calm_light/calm_dark（平静极简）/ glass2_light/glass2_dark（玻璃 2.0）\n\
              # m3_light/m3_dark（Material 3）；设置页里点色块切换\ntheme=calm_light\n",
@@ -1291,6 +1674,14 @@ fn append_missing() {
         ),
         ("hide_tray", "# Dock 上要单独隐藏的托盘图标（分号分隔，键由设置页生成；清空 = 全部显示）\nhide_tray=\n"),
         ("wechat_sound", "# 微信托盘图标开始闪烁（新消息）时播放内置提示音（1 = 开，默认；0 = 关）\nwechat_sound=1\n"),
+        ("wechat_cards", "# 微信消息卡片（UIA 读会话名+摘要，1 = 开；0 = 关，默认）\nwechat_cards=0\n"),
+        ("wechat_ignore", "# 微信卡片白名单：标题命中就不弹卡片（分号分隔；默认「折叠的聊天」）\nwechat_ignore=折叠的聊天\n"),
+        ("banner_secs", "# 右下角横幅每条停留秒数（0 = 不自动关闭，默认 6）\nbanner_secs=6\n"),
+        ("lyric_lead", "# 歌词提前量（秒，默认 1；0 = 不提前；负值 = 延后；设置页按 0.1 秒调）\nlyric_lead=1\n"),
+        ("font", "# 界面字体：misans = MiSans（随包分发，默认）；system = 系统字体\nfont=misans\n"),
+        ("start_pins", "# 开始菜单（Win 键弹出）快捷方式：`名称|程序路径`，分号分隔；删掉本行恢复默认\nstart_pins=命令提示符|C:\\Windows\\System32\\cmd.exe\n"),
+        ("autostart", "# 开机启动（1 = 开，默认；写注册表 HKCU Run 键）\nautostart=1\n"),
+        ("guardian", "# 退出守护：orbit 被强杀后由守护进程重启 explorer 恢复任务栏（1 = 开，默认）\nguardian=1\n"),
     ] {
         if !raw.contains(key) {
             add.push_str(line);
@@ -1310,6 +1701,7 @@ fn load() {
     }
     let mut scale = cfg::WEATHER_TEXT_SCALE;
     let mut size = cfg::LYRIC_FONT_SIZE;
+    let mut llead: Option<f32> = None;
     let mut pos = LyricPos::Right;
     let mut fmt: Option<String> = None;
     // 老键迁移用
@@ -1320,12 +1712,21 @@ fn load() {
     let mut tray = cfg::SHOW_TRAY;
     let mut desktop = cfg::SHOW_DESKTOP_BTN;
     let mut wsound = true;
+    let mut wcards = false;
+    let mut misans = true;
+    // None = 文件里没这个键 → 保留默认（折叠的聊天）；Some(空 Vec) = 用户清空了白名单
+    let mut wignore: Option<Vec<String>> = None;
+    let mut bsecs: Option<u32> = None;
     let mut hide_tray: Vec<String> = Vec::new();
     let mut dpins: Option<Vec<String>> = None;
     let mut iover: Vec<(String, String)> = Vec::new();
+    let mut spins: Option<Vec<(String, String)>> = None;
+    let mut auto = true;
+    let mut guard_on = true;
     let mut alpha = 1.0f32;
     let mut pscale = 1.0f32;
     let mut iscale = 1.0f32;
+    let mut corner = CORNER_DEFAULT;
     let mut tkey: String = crate::theme::cur().key.to_string();
     let mut panchor = PillAnchor::Float;
     let mut danchor = DockAnchor::Bottom;
@@ -1384,6 +1785,11 @@ fn load() {
                     iscale = n.clamp(ICON_SCALE_MIN, ICON_SCALE_MAX);
                 }
             }
+            "corner_radius" => {
+                if let Some(n) = parse_num(v) {
+                    corner = n.clamp(CORNER_MIN, CORNER_MAX);
+                }
+            }
             "theme" => {
                 if crate::theme::index_of(v).is_some() {
                     tkey = v.to_string();
@@ -1419,6 +1825,17 @@ fn load() {
             "hide_tray" => hide_tray = parse_hide(v),
             "dock_pins" => dpins = Some(parse_list(v)),
             "icon_over" => iover = parse_pairs(v),
+            "start_pins" => spins = Some(parse_pairs(v)),
+            "autostart" => {
+                if let Some(b) = parse_bool(v) {
+                    auto = b;
+                }
+            }
+            "guardian" => {
+                if let Some(b) = parse_bool(v) {
+                    guard_on = b;
+                }
+            }
             "weather_text_scale" => {
                 if let Some(n) = parse_num(v) {
                     scale = n.clamp(SCALE_MIN, SCALE_MAX);
@@ -1427,6 +1844,11 @@ fn load() {
             "lyric_size" => {
                 if let Some(n) = parse_num(v) {
                     size = n.clamp(LYRIC_MIN, LYRIC_MAX);
+                }
+            }
+            "lyric_lead" => {
+                if let Some(n) = parse_num(v) {
+                    llead = Some(n.clamp(-LYRIC_LEAD_MAX, LYRIC_LEAD_MAX));
                 }
             }
             "lyric_position" => {
@@ -1448,6 +1870,25 @@ fn load() {
                 if let Some(b) = parse_bool(v) {
                     wsound = b;
                 }
+            }
+            "wechat_cards" => {
+                if let Some(b) = parse_bool(v) {
+                    wcards = b;
+                }
+            }
+            "wechat_ignore" => {
+                wignore = Some(
+                    v.split(';')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                );
+            }
+            "banner_secs" => {
+                bsecs = v.trim().parse::<u32>().ok();
+            }
+            "font" => {
+                misans = !v.trim().eq_ignore_ascii_case("system");
             }
             _ => {}
         }
@@ -1501,6 +1942,9 @@ fn load() {
 
     SCALE.store(scale.to_bits(), Ordering::Relaxed);
     LYRIC_SIZE.store(size.to_bits(), Ordering::Relaxed);
+    if let Some(v) = llead {
+        LYRIC_LEAD.store(v.to_bits(), Ordering::Relaxed);
+    }
     LYRIC_POS.store(pos.code(), Ordering::Relaxed);
     if let Ok(mut v) = CLOCK_FORMAT.lock() {
         *v = fmt;
@@ -1511,6 +1955,7 @@ fn load() {
     PILL_ALPHA.store(alpha.to_bits(), Ordering::Relaxed);
     PILL_SCALE.store(pscale.to_bits(), Ordering::Relaxed);
     ICON_SCALE.store(iscale.to_bits(), Ordering::Relaxed);
+    CORNER.store(corner.to_bits(), Ordering::Relaxed);
     // 主题：所有绘制都走 theme::cur()，存一次索引即可，不必逐个窗口通知
     if let Some(i) = crate::theme::index_of(&tkey) {
         crate::theme::set_index(i);
@@ -1544,6 +1989,16 @@ fn load() {
     SHOW_TRAY.store(bool_code(tray), Ordering::Relaxed);
     SHOW_DESKTOP.store(bool_code(desktop), Ordering::Relaxed);
     WECHAT_SOUND.store(bool_code(wsound), Ordering::Relaxed);
+    WECHAT_CARDS.store(bool_code(wcards), Ordering::Relaxed);
+    FONT.store(if misans { 1 } else { 2 }, Ordering::Relaxed);
+    if let Some(list) = wignore {
+        if let Ok(mut v) = WECHAT_IGNORE.lock() {
+            *v = list;
+        }
+    }
+    if let Some(s) = bsecs {
+        BANNER_SECS.store(s.min(3600) + 1, Ordering::Relaxed);
+    }
     if let Ok(mut v) = HIDE_TRAY.lock() {
         *v = hide_tray;
     }
@@ -1555,6 +2010,11 @@ fn load() {
     if let Ok(mut v) = ICON_OVER.lock() {
         *v = iover;
     }
+    if let Ok(mut v) = START_PINS.lock() {
+        *v = spins;
+    }
+    AUTOSTART.store(bool_code(auto), Ordering::Relaxed);
+    GUARDIAN.store(bool_code(guard_on), Ordering::Relaxed);
 }
 
 /// 布尔：1/0、true/false、on/off、开/关
@@ -1694,6 +2154,14 @@ mod tests {
         // 不认识的值不算老 key（交给默认主题）
         assert_eq!(legacy_theme_key("calm_light"), None);
         assert_eq!(legacy_theme_key("随便写的"), None);
+    }
+
+    #[test]
+    fn wechat_ignore_default_blocks_folded_chat() {
+        assert!(is_wechat_ignored("折叠的聊天"));
+        assert!(is_wechat_ignored(" 折叠的聊天 "));
+        assert!(!is_wechat_ignored("张三"));
+        assert!(!is_wechat_ignored("折叠的聊天通知"));
     }
 
     #[test]

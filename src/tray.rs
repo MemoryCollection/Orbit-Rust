@@ -106,6 +106,10 @@ pub struct TrayMirror {
     empty_hits: u8,
     /// tooltip 名字 → 程序 exe → 256px 大图标
     icons: IconCache,
+    /// 图标稳定键的首次出现顺序：位置一旦出现就固定，重注册（闪烁时的
+    /// DELETE+ADD）不挪位；新图标排在同类（同 exe）实例后面，没有同类就排末尾。
+    /// 多开微信因此默认相互挨着、先开的在前、后开的在后。
+    order: Vec<String>,
 }
 
 impl Default for TrayMirror {
@@ -120,6 +124,7 @@ impl Default for TrayMirror {
             last_capture: None,
             empty_hits: 0,
             icons: IconCache::default(),
+            order: Vec::new(),
         }
     }
 }
@@ -267,6 +272,7 @@ impl TrayMirror {
                 .join(" / ")
         ));
         self.items = items;
+        self.stabilize();
         self.last_sig = sig;
         // 占位像素不算"抓过"，下一轮继续重试（否则会一直停在灰点上）
         if !blocked {
@@ -278,6 +284,8 @@ impl TrayMirror {
     /// 托盘托管路径：图标来自 NOTIFYICONDATA 表（hIcon/tooltip/回调消息/GUID/版本），
     /// 完全不碰 UIA/PrintWindow——真任务栏怎么隐藏都不影响。托管表版本号变化才重建。
     fn poll_hosted(&mut self, icon_px: i32) -> bool {
+        // 顺手清掉窗口已销毁的幽灵图标（任务管理器每次刷新 CPU 都会漏一条）
+        crate::trayhost::prune_dead_icons();
         let Some(tab) = self.hosted.clone() else { return false };
         let (gen, icons) = {
             let st = tab.lock().unwrap();
@@ -378,7 +386,53 @@ impl TrayMirror {
             });
         }
         self.items = items;
+        self.stabilize();
         true
+    }
+
+    /// 按首次出现顺序稳定图标位置。
+    ///
+    /// 托管表按注册顺序排（NIM_ADD push 到末尾），应用重注册一次就挪到最后——
+    /// 表现为图标来回跳。这里按稳定键记住首次出现顺序：
+    /// - 老图标位置固定，重注册 / 图标刷新不挪位；
+    /// - 新图标插到**同 exe（进程名相同）的最后一个实例**后面：多开微信默认
+    ///   相互挨着，先开的在前、新创建的在后；
+    /// - 没有同类的全新图标追加到末尾；
+    /// - 消失的图标从顺序表里去掉（重启 Orbit 后顺序重新从零记录）。
+    fn stabilize(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        let mut order = std::mem::take(&mut self.order);
+        let base = |exe: &str| {
+            exe.rsplit(['\\', '/']).next().unwrap_or(exe).to_string()
+        };
+        // 键 → 进程名，给"插到同类后面"用
+        let key_base: std::collections::HashMap<String, String> =
+            self.items.iter().map(|it| (it.key(), base(&it.exe))).collect();
+        for it in &self.items {
+            let k = it.key();
+            if order.iter().any(|o| o == &k) {
+                continue;
+            }
+            let my_base = base(&it.exe);
+            let mut at = order.len();
+            for (pos, o) in order.iter().enumerate().rev() {
+                if key_base.get(o).map(|b| *b == my_base).unwrap_or(false) {
+                    at = pos + 1;
+                    break;
+                }
+            }
+            order.insert(at, k);
+        }
+        // 丢掉已消失的键
+        let alive: std::collections::HashSet<String> =
+            self.items.iter().map(|it| it.key()).collect();
+        order.retain(|k| alive.contains(k));
+        // 稳定排序：order 里的键按其下标，重复键（键冲突的极端情况）保持原相对顺序
+        self.items
+            .sort_by_key(|it| order.iter().position(|k| *k == it.key()).unwrap_or(usize::MAX));
+        self.order = order;
     }
 
     /// 托管模式下把 Dock 实际画出的图标屏幕矩形报回宿主，用于回答位置查询（悬停坐标校验）。

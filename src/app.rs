@@ -37,6 +37,8 @@ pub fn run(hide_taskbar: bool) {
     std::panic::set_hook(Box::new(|info| {
         if let Some(h) = TRAY_HOST.lock().unwrap().take() { h.stop(); }
         hide::restore_all();
+        // 任务栏已恢复，告诉守护子进程不用再动手（见 guard.rs）
+        crate::guard::mark_clean_exit();
         crate::tlog!("[orbit] panic: {info}");
     }));
 
@@ -115,12 +117,24 @@ pub fn run(hide_taskbar: bool) {
         };
 
         (*app_ptr).init(hwnd);
+        // 开机启动按设置对齐注册表；接管了任务栏就拉起退出守护子进程
+        //（orbit 被强杀时由它重启 explorer 把任务栏拉回来，见 guard.rs）
+        crate::guard::sync_autostart();
+        if hide_taskbar {
+            crate::guard::spawn_guardian();
+        }
         // 音乐条要往胶囊窗口回传点击，所以等 hwnd 有了再建
         musicbar::init(hinstance.into(), hwnd);
         // 分离出去的模块条（胶囊左右各一条）同理
         widgetbar::init(hinstance.into(), hwnd);
         // 设置页面（独立小窗，启动时建好、平时隐藏）
         settingsui::init(hinstance.into());
+        // 通用右下角横幅（微信消息卡片只是其中一种；读取线程在定时器里跟随设置项启停）
+        crate::banner::init(hinstance.into());
+        // 开始菜单（Win 键弹出；快捷方式在设置页配置）
+        crate::startmenu::init(hinstance.into());
+        // 桌面右上角当地天气卡片（透明分层窗口，数据由主 App 天气 tick 推送）
+        crate::weathercard::init(hinstance.into());
         (*app_ptr).render();
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
@@ -164,6 +178,8 @@ pub fn run(hide_taskbar: bool) {
         // 正常退出（含 Ctrl+Alt+O 热键）时把系统任务栏还原
         if let Some(h) = TRAY_HOST.lock().unwrap().take() { h.stop(); }
         hide::restore_all();
+        // 任务栏已恢复，留新鲜标记让守护子进程静默收场
+        crate::guard::mark_clean_exit();
         drop(Box::from_raw(app_ptr));
     }
 

@@ -82,15 +82,17 @@ pub fn paint(
     let ctx = soft.ctx().clone();
     // ppp 每帧走 RawInput（见 egui_soft::input 的注释），否则缩放 ≠ 1.0 时整版错位
     let input = soft.input(fw, fh);
-    let out = ctx.run_ui(
+    let mut out = ctx.run_ui(
         input,
         |ui| {
             let p = ui.painter().clone();
-            // 圆角胶囊底（半径 = 高/2），与顶部胶囊同一画法
+            // 圆角底（半径走统一设置，默认圆角矩形），与顶部胶囊同一画法
             glass_board(
                 &p,
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
-                egui::CornerRadius::same((fh / 2.0).min(255.0) as u8),
+                egui::CornerRadius::same(
+                    crate::settings::corner_radius_for(fh).round() as u8,
+                ),
             );
 
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -147,7 +149,7 @@ pub fn paint(
         },
     );
 
-    soft.update_textures(&out.textures_delta);
+    soft.update_textures(&mut out.textures_delta);
     let rgba = soft.rasterize(out.shapes, out.pixels_per_point, w, h);
     let rects = rects_pt
         .iter()

@@ -37,7 +37,7 @@ main.rs → app.rs（启动/消息循环）
 
 所有分层窗口共用同一条绘制链路：**egui 立即模式布局（逻辑点）→ `egui_soft` 公共软件光栅化 → 预乘 RGBA → `render::present()`（UpdateLayeredWindow）**。这是本项目的重要设计约束——这些窗口依赖 NOACTIVATE + 逐像素 alpha + 圆角命中，不能换成 eframe 原生窗口（普通窗口不支持逐像素透明）。egui 后端按窗口分布：胶囊=`pillui`（window.rs 持 `PillUi`）、Dock+提示条=`DockView`（dock.rs 持字段）、模块条=`SoftBackend`（widgetbar 每窗口 thread_local 一份）、音乐条=`SoftBackend`（musicbar thread_local）、面板=`SoftBackend`（Panel 持字段）。各窗口仍持有自己的状态结构（`window::App` / `dock::Dock` / `panel::Panel`），通过窗口 `GWLP_USERDATA` 取回；音乐条/模块条/提示条仍无独立状态、内容几何由胶囊按需传入。设置页（`settingsui`）是唯一例外：egui/eframe 小窗跑在独立线程里，自己接鼠标键盘、自己写设置，谁也不通知——胶囊与 Dock 靠比对 `settings::version()` 发现变化后重绘。
 
-> 常见坑（egui 软件后端）：① 输出是**预乘 RGBA**，整体透明度要连 RGB 一起乘，再换 BGRA 上屏（`premultiplied_rgba_to_bgra`）；② 命中矩形要在逻辑点收集后乘 scale 转物理像素；③ 图标/封面像素块先 `SoftBackend::soft_image()` 上传成 egui 纹理再 `p.image()`；④ 变化检测（hash）必须保留，否则定时器空转光栅化；⑤ 中文字体靠 `install_fonts` 读系统微软雅黑注入 egui 字体族。
+> 常见坑（egui 软件后端）：① 输出是**预乘 RGBA**，整体透明度要连 RGB 一起乘，再换 BGRA 上屏（`premultiplied_rgba_to_bgra`）；② 命中矩形要在逻辑点收集后乘 scale 转物理像素；③ 图标/封面像素块先 `SoftBackend::soft_image()` 上传成 egui 纹理再 `p.image()`；④ 变化检测（hash）必须保留，否则定时器空转光栅化；⑤ 字体由 `build_font_definitions` 统一构建：默认用 MiSans **Semibold** 一款（**不打进 exe**，运行时从磁盘加载：`<exe>/data/MiSans-Semibold.ttf` → exe 目录 → 开发期 `assets/fonts/`，缺失回落系统字体）插在所有字体族最前面，系统微软雅黑 / Segoe UI Symbol 退到后面补缺字形；`orbit-bold` 粗体族同指 Semibold（egui 0.37 的 `.strong()` 只改颜色不改字重，必须显式选字体族）；**时钟/日期**走 `clock_font()` = 粗体族（MiSans Semibold，缺失回落系统默认粗体）；设置项 `font=system` 时回落纯系统字体（粗体用 `msyhbd.ttc`）。切换字体后 `SoftBackend::set_scale` 检测到 `use_misans()` 变化会重建图集并丢掉度量通道（否则旧 Galley 宽度错位），设置页同理在 `ui()` 里重建。
 
 ## 关键设计
 
@@ -300,7 +300,18 @@ main.rs → app.rs（启动/消息循环）
 - **退出恢复**：隐藏前记录每个任务栏的原始矩形、ABM 状态、工作区；`restore_all()` 恢复后**带验证地补恢复**——`stop()` 广播的 `TaskbarCreated` 由 explorer 异步处理，会在恢复之后把任务栏重新设为 autohide 并滑出屏幕（实测 ~150ms 内）。所以每 150ms 检查一次"无 autohide + 可见 + 位置归位"，被覆盖就再恢复，直到稳定（最多 8 次）。实测退出后 `state=0x0 visible=true rect=(0,1032,1920,1080)` 完全归位。
 - **强杀兜底**：进程被强杀不走恢复路径，用 `--restore-taskbar`（`hide::force_restore()`）手动救。
 
+### 通用横幅与微信消息（banner.rs + wechatmsg.rs）
+参照 Atrium `wechat_source.cpp` 的只读 UIA 方案，补上托盘托管拿不到的"谁发的、说了什么"：
+- **通用横幅**（`banner.rs`）：右下角 Dock 上方的分层置顶不抢焦点小窗。**任何模块**调 `banner::show(BannerNotice::info(tag, main, sub))` 就能弹一条，`PostMessageW(WM_BANNER, lParam=Box<BannerNotice>)` 跨线程投递；`BannerNotice::wechat(...)` 是微信消息卡片这一种特化。多条**堆叠**展示——新条在下方、旧的往上递增，各自独立 6 秒到期，不替换旧内容；悬停整叠暂停，点哪张收哪张，最多同时 5 张。**每次弹出都播提示音**（`notify::play_banner()`，250ms 重入兜底；微信卡片按 `wechat_sound` 设置可静音）。微信卡片携带来源 PID，点一下收起该条并 `wechatmsg::focus(pid)` 把对应微信窗口恢复置前（多开按 PID 区分；`SetForegroundWindow` 配 `AttachThreadInput` 绕过前台锁）。
+- **读取**（`wechatmsg.rs`）：一条 MTA 线程 `CoCreateInstance(CUIAutomation)`，`CreatePropertyCondition(ClassName, "mmui::ChatSessionCell")` + `FindAllBuildCache` 拿会话行，解析 UIA Name 里的会话名 / `[N条]` / 摘要 / `消息免打扰`。未读数相对基线上升才发卡片（首次读建基线，新会话只在列表前三行才算新消息，避免滚动带入旧会话）。微信在前台时完全不读（#79：按键会触发 UIA 读取导致卡）。
+- **多开**：遍历所有 `Weixin.exe`/`WeChat.exe` 进程、每个进程的所有 `QWindowIcon` 窗口（不再找到第一个就停）；baseline 键用 `pid|AutomationId` 前缀隔开，同名会话不会互相污染。
+- **关到托盘**：Qt 隐藏窗口后把行从 UIA 树摘掉，但窗口显示时抓到的 `IUIAutomationElement` 引用仍可 `BuildUpdatedCache` 刷新——存一份带 pid 的 `held`，树里读不到时从 held 读，所以图标缩到托盘后照样出卡片。
+- **手动拿 UIA**：设置页「模块与托盘 → 手动拿 UIA」按钮 → `banner::request_grab()` → `wechatmsg` 的 `GRAB_REQ` 标志 + 唤醒读取线程，立即**全量抓一次**（这次不受前台限制）。成功/失败都只弹一条右下角横幅提示（`GRAB_NOTIFIED` 保证后台首次成功只提示一次）。推荐用法：先唤出微信窗口（可多开）→ 点按钮抓取 → 之后关到托盘也能出卡片。
+- **白名单**：`settings::wechat_ignore`（分号分隔，可添加多个；默认「折叠的聊天」）按会话标题**精确匹配**，命中就不建基线、不弹卡片；设置页输入框失焦保存。每次新消息把「标题 + 内容 + 未读 + pid键」用 `tlog!` 写进 `orbit.log`（`[wechatmsg] 新消息 | 标题=... | 内容=...`），白名单命中的标题也按 30 秒去重记一条，方便从日志里挑标题加白名单。
+- **联动**：Dock 每次识别到微信托盘"灭帧"就调 `banner::on_flash`（按 key + 闪烁时刻去重），唤醒读取线程立刻重读。卡片开启时提示音交给卡片横幅（避免一条消息响两遍），卡片关闭时维持托盘闪烁音兜底。设置页「微信消息卡片」开关经 `settings::wechat_cards()` 控制线程启停（500ms 定时器跟随，关掉时清空状态并收起横幅）。
+
 ## 已知限制
+- **微信消息卡片只读、需要拿到一次 UIA 树**：从没打开过主窗口时 UIA 树里没有可 held 的会话行，这条通路拿不到会话名；此时仍有托盘提示音。解决：用设置页「手动拿 UIA」按钮，唤出微信窗口后点一次即可。微信自身界面改版（类名 / UIA Name 格式变化）也会让解析失效。
 - **托盘托管依赖 `TaskbarCreated` 重注册**：接管瞬间会广播该消息，少数不重注册托盘图标的程序可能短暂丢失图标（重启应用即可）。假窗口生命周期与 Orbit 绑定，退出重播 `TaskbarCreated` 让图标回真任务栏。
 - **兜底 UIA 路径的溢出区限制**：`TRAY_TAKEOVER=false` 时，溢出面板里的图标只有展开才在 UIA 树中。托管路径不受此限——应用重新注册时逐个 `NIM_ADD`，包括原本在溢出区的。
 - **托盘图标清晰度**：托管模式直接用 exe/应用提供的 `HICON`（经 `appicon` 优先取 256px），比旧方案从任务栏抠 16px 放大清晰得多；但个别应用只注册小 `hIcon` 时仍会略软。

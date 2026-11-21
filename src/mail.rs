@@ -96,9 +96,25 @@ impl Mail {
                     let old = self.items.first().and_then(|m| m.code.clone());
                     if !self.baseline_done {
                         self.baseline_done = true;
-                    } else if fresh.is_some() && fresh != old {
-                        self.code_at = Some(Instant::now());
-                        self.consumed = false;
+                    } else {
+                        // 新邮件横幅：uid 首次出现且未读才弹，读状态变化不重复提醒。
+                        // 横幅模块独立通用（banner::show 任何模块可调），这里只管投递。
+                        let old_uids: std::collections::HashSet<&str> =
+                            self.items.iter().map(|m| m.uid.as_str()).collect();
+                        for m in items.iter() {
+                            if !m.read && !old_uids.contains(m.uid.as_str()) {
+                                let subject = if m.subject.is_empty() { "(无主题)" } else { &m.subject };
+                                crate::banner::show(crate::banner::BannerNotice::info(
+                                    "邮件",
+                                    subject,
+                                    &m.from,
+                                ));
+                            }
+                        }
+                        if fresh.is_some() && fresh != old {
+                            self.code_at = Some(Instant::now());
+                            self.consumed = false;
+                        }
                     }
                     self.items = items;
                     self.error = None;

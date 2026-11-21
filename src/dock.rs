@@ -11,29 +11,28 @@ use std::time::Instant;
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_ALL, CLSCTX_INPROC_SERVER, STGM_READ};
+use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Shell::{
-    IShellDispatch4, IShellLinkW, SHGetFileInfoW, SHGetImageList, Shell, ShellExecuteW, ShellLink,
+    IShellLinkW, SHGetFileInfoW, SHGetImageList, ShellExecuteW, ShellLink,
     SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHIL_JUMBO, SLGP_RAWPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, EnumWindows, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HICON, HMENU, IDC_ARROW, IsIconic, IsWindowVisible, LoadCursorW,
+    GetWindowThreadProcessId, HICON, HMENU, IDC_ARROW, IsWindowVisible, LoadCursorW,
     LoadImageW, PostMessageW, RegisterClassW, RegisterWindowMessageW, CREATESTRUCTW, IMAGE_ICON,
     LR_LOADFROMFILE, WNDCLASSW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWLP_USERDATA,
-    GW_OWNER, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, SWP_NOACTIVATE, SW_HIDE, SW_RESTORE,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWLP_USERDATA,
+    GW_OWNER, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, SWP_NOACTIVATE, SW_HIDE,
     SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
@@ -85,10 +84,34 @@ pub struct FlashIcon {
 
 static FLASH_SET: Mutex<Vec<FlashIcon>> = Mutex::new(Vec::new());
 static FLASH_VER: AtomicU64 = AtomicU64::new(0);
-/// 每个图标 key 上次已播放提示音的那次闪烁时刻（`it.flash_at`）。
-/// 用它去重：每次亮→灭（新消息的一闪）都响一声，同一帧不重复。
+/// 每个图标 key 上次**见到**的闪烁时刻（`it.flash_at`）。
+/// 提示音按"闪烁轮次"判定：同一轮连续闪烁里相邻两闪只差约 500ms
+/// （小于 `FLASH_SOUND_GAP_MS`），不重复响；停止闪烁 1 秒后再闪，
+/// 间隔 ≥ 1 秒，视为新一轮，再响一声。之前按"响声时刻"节流，
+/// 消息一直不读会每秒响一声（太吵），改成整轮只响开头一声。
 static SOUND_FLASH_AT: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 判定"新一轮闪烁"的最小间隔（毫秒）：距上次闪烁 ≥ 1 秒才再响
+const FLASH_SOUND_GAP_MS: u128 = 1000;
+/// pid → 托盘回调目标（build_host_targets 时同步）。横幅点击跳转兜底用：
+/// 微信主窗口收在托盘（不可见）时，SetForegroundWindow 无效，
+/// 唯一可靠的唤醒方式是模拟左键它的托盘图标。
+static TRAY_BY_PID: LazyLock<Mutex<HashMap<u32, traymsg::Raw>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 模拟左键点击某个 pid 的托盘图标（走图标注册的回调消息，不动光标）。
+/// 横幅点击跳转兜底：微信窗口收在托盘时用它把主窗口唤出来。
+pub fn click_tray_for_pid(pid: u32) {
+    let raw = TRAY_BY_PID.lock().ok().and_then(|m| m.get(&pid).copied());
+    let Some(raw) = raw else {
+        crate::tlog!("[dock] 横幅兜底：没有 pid={pid} 的托盘回调目标");
+        return;
+    };
+    let t = traymsg::Target::from_raw(raw);
+    let c = traymsg::icon_center_of(t).unwrap_or((0, 0));
+    crate::tlog!("[dock] 横幅兜底：模拟左键 pid={pid} 的托盘图标（回调消息投递）");
+    traymsg::click(&t, c, false);
+}
 
 /// 快照版本号：正在闪烁的图标集合（或亮/灭帧）变化时 +1
 pub fn flash_version() -> u64 {
@@ -160,6 +183,10 @@ pub struct Dock {
     tray_shown: Vec<usize>,
     hovered_tray: Option<usize>,
     size: (i32, i32),
+    /// 底板在窗口客户区里的矩形 [x, y, w, h]（物理像素）。
+    /// 窗口在内侧多一圈透明留白装"伸出去"的悬停图标，命中测试/提示条/弹窗
+    /// 都要对齐底板矩形，而不是整窗矩形（留白区必须保持点击穿透）。
+    board: (i32, i32, i32, i32),
     /// 上次扫描的 (名称, 目标) 签名，变化才重绘
     last_sig: Vec<(String, String)>,
     /// explorer 重启后托盘会重建，靠它清缓存
@@ -254,18 +281,13 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             WM_TIMER if w.0 == T_SETTINGS => {
                 // 设置页面改了托盘开关 / 返回桌面按钮，宽度和内容都要重排
                 if dock.seen_settings != settings::version() {
-                    // 图标大小变了：应用图标与托盘像素都要按新尺寸重抓（否则放大会糊）
-                    let k = settings::icon_scale();
-                    if (k - dock.icon_scale).abs() > 1e-3 {
-                        dock.icon_scale = k;
-                        dock.tray.invalidate();
-                    }
-                    // 固定图标列表 / 开关都可能变，内容整轮重扫（签名没变时等价于空转）
-                    dock.scan();
-                    dock.poll_tray();
-                    dock.refresh_active();
-                    dock.render();
+                    dock.apply_settings_change();
                 }
+                LRESULT(0)
+            }
+            // 设置页点「应用/还原」后主动投来：立即重扫+重绘，不等 500ms 轮询
+            m if m == crate::appmsg::WM_SETTINGS_APPLIED => {
+                dock.apply_settings_change();
                 LRESULT(0)
             }
             WM_NCHITTEST => {
@@ -277,14 +299,22 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let _ = GetWindowRect(hwnd, &mut wr);
                 pt.x -= wr.left;
                 pt.y -= wr.top;
-                let (dw, dh) = dock.size;
-                if inside_round(
-                    pt.x as f32,
-                    pt.y as f32,
-                    dw as f32,
-                    dh as f32,
-                    cfg::cur().dock_radius * dock.scale * settings::icon_scale(),
-                ) {
+                // 命中区 = 底板矩形（窗口内侧留白是透明的，必须穿透）
+                let (bx, by, bw, bh) = dock.board;
+                if bw > 0
+                    && inside_round(
+                        (pt.x - bx) as f32,
+                        (pt.y - by) as f32,
+                        bw as f32,
+                        bh as f32,
+                        // 与 dockview 的底板圆角同一口径：统一设置 + 主题上限 + 高度一半
+                        (crate::settings::corner_radius()
+                            .min(cfg::cur().dock_radius)
+                            .max(0.0))
+                            * dock.scale
+                            * settings::icon_scale(),
+                    )
+                {
                     LRESULT(HTCLIENT as isize)
                 } else {
                     LRESULT(HTTRANSPARENT as isize)
@@ -514,6 +544,7 @@ impl Dock {
             tray_shown: Vec::new(),
             hovered_tray: None,
             size: (0, 0),
+            board: (0, 0, 0, 0),
             last_sig: Vec::new(),
             taskbar_created: 0,
             pending_right: None,
@@ -542,6 +573,8 @@ impl Dock {
         self.scale = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
         self.taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
         self.seen_settings = settings::version();
+        // 登记 HWND：设置页点「应用」后主动投消息过来，立即重扫+重绘（不用等轮询）
+        crate::appmsg::register_dock(hwnd);
         self.tip = unsafe { create_tip_window() };
         // 弹窗的窗口过程要拿回 Dock 实例：把 self 的指针当 lpCreateParams 传进去
         self.winlist = unsafe { create_winlist_window(self as *mut Dock) };
@@ -549,6 +582,23 @@ impl Dock {
         self.scan();
         self.refresh_active();
         self.poll_tray();
+        self.render();
+    }
+
+    /// 设置变更后重排：图标大小、固定列表、托盘开关、返回桌面按钮都可能变。
+    /// 定时器轮询和设置页主动通知共用这一条路径。
+    fn apply_settings_change(&mut self) {
+        self.seen_settings = settings::version();
+        // 图标大小变了：应用图标与托盘像素都要按新尺寸重抓（否则放大会糊）
+        let k = settings::icon_scale();
+        if (k - self.icon_scale).abs() > 1e-3 {
+            self.icon_scale = k;
+            self.tray.invalidate();
+        }
+        // 固定图标列表 / 开关都可能变，内容整轮重扫（签名没变时等价于空转）
+        self.scan();
+        self.poll_tray();
+        self.refresh_active();
         self.render();
     }
 
@@ -624,6 +674,13 @@ impl Dock {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        // 同步一份 pid → 回调目标：给横幅跳转兜底用（微信收在托盘时模拟左键）
+        if let Ok(mut m) = TRAY_BY_PID.lock() {
+            m.clear();
+            for t in v.iter().flatten() {
+                m.insert(t.pid, t.raw());
+            }
+        }
         self.host_targets = v;
     }
 
@@ -889,9 +946,22 @@ impl Dock {
         let anchor = settings::dock_anchor();
         let vertical = anchor.is_vertical();
         let (lw, lh) = crate::dockview::dock_size(n, n_tray, show_tray, show_desktop, vertical);
-        let w = (lw * self.scale).ceil() as i32;
-        let h = (lh * self.scale).ceil() as i32;
+        let bw = (lw * self.scale).ceil() as i32;
+        let bh = (lh * self.scale).ceil() as i32;
+        // 窗口在内侧多一圈透明留白：悬停的图标要"一半在 Dock 内、一半在 Dock 外"，
+        // 伸出去的半截画在底板之外，没有留白就会被窗口边界裁掉
+        let m = (crate::dockview::dock_margin() * self.scale * settings::icon_scale().clamp(0.5, 2.0))
+            .ceil() as i32;
+        // 留白在内侧：下锚 → 顶部留白（底板贴下）、上锚 → 底部留白、
+        // 左锚 → 右侧留白、右锚 → 左侧留白。(bx, by) = 底板在窗口里的原点
+        let (w, h, bx, by) = match anchor {
+            crate::settings::DockAnchor::Bottom => (bw, bh + m, 0, m),
+            crate::settings::DockAnchor::Top => (bw, bh + m, 0, 0),
+            crate::settings::DockAnchor::Left => (bw + m, bh, 0, 0),
+            crate::settings::DockAnchor::Right => (bw + m, bh, m, 0),
+        };
         self.size = (w, h);
+        self.board = (bx, by, bw, bh);
 
         if self.hovered.map(|i| i >= n).unwrap_or(false) {
             self.hovered = None;
@@ -941,7 +1011,7 @@ impl Dock {
             self.tray_rects, self.hovered_tray
         );
 
-        // 定位：沿 dock_anchor 贴对应的屏幕边。
+        // 定位：沿 dock_anchor 贴对应的屏幕边（底板对齐屏幕，留白伸向屏幕内侧）。
         // 水平（下/上）按"屏幕矩形"居中；垂直（左/右）竖向居中。
         let mi = crate::window::primary_monitor();
         let bottom = if crate::hide::is_active() { mi.rcMonitor.bottom } else { mi.rcWork.bottom };
@@ -949,10 +1019,12 @@ impl Dock {
         let (x, y) = match anchor {
             crate::settings::DockAnchor::Bottom => (
                 mon.left + (mon.right - mon.left - w) / 2,
-                bottom - h - (cfg::DOCK_BOTTOM_MARGIN as f32 * self.scale) as i32,
+                bottom - (cfg::DOCK_BOTTOM_MARGIN as f32 * self.scale) as i32 - h,
             ),
+            // 上/左锚：底板原点就是窗口原点，窗口直接贴边
             crate::settings::DockAnchor::Top => (mon.left + (mon.right - mon.left - w) / 2, mon.top),
             crate::settings::DockAnchor::Left => (mon.left, mon.top + (mon.bottom - mon.top - h) / 2),
+            // 右锚：底板右缘 = 窗口右缘 - 留白 → 窗口 x = 屏幕右缘 - 窗宽
             crate::settings::DockAnchor::Right => (mon.right - w, mon.top + (mon.bottom - mon.top - h) / 2),
         };
         unsafe {
@@ -963,7 +1035,8 @@ impl Dock {
         // 让 Shell_NotifyIconGetRect 认 Dock 为新托盘宿主），把每个图标屏幕矩形告诉宿主，
         // 并按真实槽位中心重建 tray_targets（悬停/点击投消息用这个坐标）。
         if self.tray.hosted() {
-            crate::trayhost::set_tray_host_size(x, y, w, h);
+            // 报底板矩形（不含内侧透明留白），Shell 的托盘命中才落在真实图标区
+            crate::trayhost::set_tray_host_size(x + bx, y + by, bw, bh);
             self.sync_host_layout(x, y);
         }
 
@@ -975,10 +1048,10 @@ impl Dock {
     /// 集合或亮/灭帧没变就不动版本号，胶囊那边靠版本号判断要不要重绘。
     fn publish_flash(&mut self) {
         let now = Instant::now();
-        // 微信提示音：每次闪烁都响。`it.flash_at` 在每次亮→灭时刷新，
-        // 拿它当"这一闪"的身份，比上一轮快照的 key 集合精确得多——
-        // 原来的边沿检测把连续闪烁的后续闪全吞了。按 key 各自记，
-        // 双开微信两个图标互不干扰。
+        // 微信提示音按"闪烁轮次"响：`it.flash_at` 在每次亮→灭时刷新，
+        // 拿它当"这一闪"的身份。同一轮连续闪烁（相邻两闪 ~500ms）整轮
+        // 只响开头一声；停闪超过 1 秒再闪才算新一轮、再响一声。
+        // 按图标 key 各自记，双开微信两个图标互不干扰。
         let mut wx_new_keys: Vec<String> = Vec::new();
         let mut snap: Vec<FlashIcon> = Vec::new();
         let mut sounded = SOUND_FLASH_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -990,11 +1063,42 @@ impl Dock {
                     continue;
                 }
                 let key = it.key();
-                if settings::wechat_sound() && notify::is_wechat(&it.name, &it.exe) {
-                    // 这次灭帧（这一闪）还没响过 → 响一声并记下时刻
-                    if sounded.get(&key) != Some(&t) {
+                if notify::is_wechat(&it.name, &it.exe) {
+                    // 微信闪一下 = 新消息：让 UIA 读取线程立刻重读一轮，卡片跟提示音同步。
+                    // on_flash 内部按 key + 闪烁时刻去重，同一帧重复调用只唤醒一次。
+                    crate::banner::on_flash(&key, t);
+                    // 上报「还在闪」：横幅窗口据此决定闪烁横幅什么时候收起
+                    crate::banner::flash_seen(&key);
+                    let pid = it.host.as_ref().map(|h| h.pid).unwrap_or(0);
+                    if settings::wechat_cards() {
+                        // UIA 卡片开着：只有读不到会话列表的实例（微信 4.x 多开
+                        // 只有第一个实例的树有内容，实测 4.2.0）需要兜底横幅
+                        if pid != 0 && !crate::wechatmsg::pid_readable(pid) {
+                            crate::banner::on_flash_card(&key, t, pid, &it.name);
+                        }
+                    } else {
+                        // UIA 卡片关着（默认模式）：闪烁直接弹「有新消息」横幅，
+                        // 点击跳到对应微信窗口；图标不闪了横幅随之收起
+                        crate::banner::on_flash_card(&key, t, pid, &it.name);
+                    }
+                    // 提示音：只在「开始闪的第一声」响。以 `it.flash_at`（这次亮→灭
+                    // 的时刻）为闪烁身份：同一轮连续闪烁里相邻两闪间隔约 500ms
+                    // （< FLASH_SOUND_GAP_MS），整轮只响开头一声；停止闪烁 1 秒
+                    // 后再次闪烁 → 间隔 ≥ 1 秒，算新一轮，再响一声。
+                    // 按图标 key 各记各的，双开微信互不干扰。
+                    if settings::wechat_sound() && !settings::wechat_cards() {
+                        let new_burst = match sounded.get(&key) {
+                            Some(prev) => t
+                                .checked_duration_since(*prev)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0)
+                                >= FLASH_SOUND_GAP_MS,
+                            None => true,
+                        };
                         sounded.insert(key.clone(), t);
-                        wx_new_keys.push(key.clone());
+                        if new_burst {
+                            wx_new_keys.push(key.clone());
+                        }
                     }
                 }
                 let px = ((it.rgba.len() / 4) as f32).sqrt().round() as i32;
@@ -1213,11 +1317,17 @@ impl Dock {
         unsafe {
             let _ = GetWindowRect(self.hwnd, &mut wr);
         }
+        // 底板在屏幕上的边缘（窗口含内侧透明留白，弹层要贴底板而不是贴窗）
+        let (bx, by, bw, bh) = self.board;
+        let board_l = wr.left + bx;
+        let board_t = wr.top + by;
+        let board_r = board_l + bw;
+        let board_b = board_t + bh;
         let (x, y) = match settings::dock_anchor() {
             crate::settings::DockAnchor::Bottom => (clamp_x(cx - w / 2), ty - h - gap),
-            crate::settings::DockAnchor::Top => (clamp_x(cx - w / 2), wr.bottom + gap),
-            crate::settings::DockAnchor::Left => (wr.right + gap, clamp_y(cy - h / 2)),
-            crate::settings::DockAnchor::Right => (wr.left - w - gap, clamp_y(cy - h / 2)),
+            crate::settings::DockAnchor::Top => (clamp_x(cx - w / 2), board_b + gap),
+            crate::settings::DockAnchor::Left => (board_r + gap, clamp_y(cy - h / 2)),
+            crate::settings::DockAnchor::Right => (board_l - w - gap, clamp_y(cy - h / 2)),
         };
         unsafe {
             let _ = SetWindowPos(self.tip, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
@@ -1254,21 +1364,39 @@ impl Dock {
             .map_or(false, |r| x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3])
     }
 
-    /// 显示桌面 / 还原（等价 Win+D）。用 Shell 的 ToggleDesktop，
-    /// 桌面图标也会跟着收起/展开，和系统行为一致；自身窗口不受影响。
+    /// 显示桌面 / 还原（等价 Win+D）。
+    ///
+    /// 之前走 `IShellDispatch4::ToggleDesktop`，实测部分环境下（原生任务栏被
+    /// 接管隐藏后）点了没反应；改成直接发一次 Win+D 系统组合键，行为与用户
+    /// 亲手按键盘完全一致。桌面天气卡片自己负责在被收起后恢复（见 weathercard.rs）。
     fn toggle_desktop(&self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+            VK_LWIN,
+        };
+        const VK_D: u16 = 0x44; // 'D'
+        let key = |vk: u16, up: bool| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk),
+                    wScan: 0,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
         unsafe {
-            match CoCreateInstance::<_, IShellDispatch4>(&Shell, None, CLSCTX_ALL) {
-                Ok(d) => {
-                    if let Err(e) = d.ToggleDesktop() {
-                        crate::tlog!("[dock] ToggleDesktop 失败：{e}");
-                    } else {
-                        crate::vlog!("[dock] 返回桌面（ToggleDesktop）");
-                    }
-                }
-                Err(e) => crate::tlog!("[dock] Shell.Application 创建失败：{e}"),
-            }
+            let inputs = [
+                key(VK_LWIN.0, false),
+                key(VK_D, false),
+                key(VK_D, true),
+                key(VK_LWIN.0, true),
+            ];
+            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
         }
+        crate::vlog!("[dock] 返回桌面（Win+D）");
     }
 
     /// 重建"用户指定了图标"的托盘项像素缓存（设置版本或图标尺寸变了才做）
@@ -1429,11 +1557,17 @@ impl Dock {
         let mon = crate::window::primary_monitor().rcMonitor;
         let clamp_x = |x: i32| x.clamp(mon.left + 4, (mon.right - w - 4).max(mon.left + 4));
         let clamp_y = |y: i32| y.clamp(mon.top + 4, (mon.bottom - h - 4).max(mon.top + 4));
+        // 底板在屏幕上的边缘（窗口含内侧透明留白）
+        let (bx, by, bw, bh) = self.board;
+        let board_l = wr.left + bx;
+        let board_t = wr.top + by;
+        let board_r = board_l + bw;
+        let board_b = board_t + bh;
         match settings::dock_anchor() {
             crate::settings::DockAnchor::Bottom => (clamp_x(cx - w / 2), clamp_y(top - h - gap)),
             crate::settings::DockAnchor::Top => (clamp_x(cx - w / 2), clamp_y(bottom + gap)),
-            crate::settings::DockAnchor::Left => (clamp_x(wr.right + gap), clamp_y(cy - h / 2)),
-            crate::settings::DockAnchor::Right => (clamp_x(wr.left - w - gap), clamp_y(cy - h / 2)),
+            crate::settings::DockAnchor::Left => (clamp_x(board_r + gap), clamp_y(cy - h / 2)),
+            crate::settings::DockAnchor::Right => (clamp_x(board_l - w - gap), clamp_y(cy - h / 2)),
         }
     }
 
@@ -1703,21 +1837,12 @@ pub fn running_app_list() -> Vec<(String, String)> {
     out
 }
 
-/// 切到一个窗口：还原（最小化过）+ 绕过前台锁把它拉到最前。
+/// 切到一个窗口：还原（最小化过）+ 把它拉到最前。
 /// Dock 图标点击、窗口列表选择共用这一条。
+/// 老实现用 AttachThreadInput 抢前台——会把目标进程的输入队列挂到本线程上，
+/// detach 失败时目标就再也收不到鼠标/键盘（见 `window::activate_window`）。
 fn activate_hwnd(hwnd: HWND) {
-    unsafe {
-        if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-        }
-        // 绕过前台锁：临时把本线程输入队列挂到当前前台线程
-        let fg = GetForegroundWindow();
-        let tid_fg = GetWindowThreadProcessId(fg, None);
-        let tid_me = GetCurrentThreadId();
-        let _ = AttachThreadInput(tid_me, tid_fg, true);
-        let _ = SetForegroundWindow(hwnd);
-        let _ = AttachThreadInput(tid_me, tid_fg, false);
-    }
+    crate::window::activate_window(hwnd);
 }
 
 /// 窗口标题（悬停提示用；空标题返回 None）

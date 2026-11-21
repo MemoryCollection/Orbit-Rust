@@ -15,8 +15,8 @@ use std::time::Instant;
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, glass_board, widget_icon, SoftBackend};
-use crate::render::{FlashView, PillShape, WidgetItem};
+use crate::egui_soft::{argb, clock_font, glass_board, island_board, widget_icon, SoftBackend};
+use crate::render::{ear_size, FlashView, PillShape, WidgetItem};
 
 // ---------- 对外接口 ----------
 
@@ -124,7 +124,9 @@ impl PillUi {
         self.soft.set_scale(scale);
 
         // ---- 布局预量宽（走 SoftBackend 的独立度量通道：pass 之前也能量） ----
-        let time_font = egui::FontId::proportional(cfg::TIME_SIZE);
+        // 时间 + 日期走时钟字体（= 粗体族）：MiSans 模式下用 MiSans Semibold，
+        // 文件缺失时自动回落系统默认粗体字体。
+        let time_font = clock_font(cfg::TIME_SIZE);
         let txt_font = egui::FontId::proportional(cfg::WIDGET_TEXT_SIZE);
         let icon_font = egui::FontId::proportional(cfg::WIDGET_ICON_CELL * 0.85);
         let cw = self.soft.text_width(v.clock, time_font.clone());
@@ -162,7 +164,15 @@ impl PillUi {
         }
         total += cfg::PAD_X;
 
-        let w = (total * scale).ceil() as i32;
+        // 吸顶刘海 / 吸底：贴边那条边的两角张开成"耳"（见 `render::ear_size`），
+        // 窗口比条身左右各宽一只耳朵；悬浮模式窗口 = 条身，ear = 0
+        let (ew, eh) = ear_size(cfg::PILL_H);
+        let ear = match v.shape {
+            PillShape::Float => 0.0,
+            PillShape::Island | PillShape::Bottom => ew,
+        };
+
+        let w = ((total + 2.0 * ear) * scale).ceil() as i32;
         let h = (cfg::PILL_H * scale).ceil() as i32;
         let (fw, fh) = (w as f32 / scale, h as f32 / scale);
 
@@ -180,32 +190,33 @@ impl PillUi {
         // Context 内部是 Arc，clone 出来共享同一上下文（闭包里只读它）
         let ctx = self.soft.ctx().clone();
 
-        let out = ctx.run_ui(input, |ui| {
+        let mut out = ctx.run_ui(input, |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
                     let p = ui.painter().clone();
-                    let r = (fh / 2.0).min(255.0);
-                    let (nw, ne, sw, se) = match v.shape {
-                        PillShape::Float => (r, r, r, r),
-                        PillShape::Island => (0.0, 0.0, r, r),
-                        PillShape::Bottom => (r, r, 0.0, 0.0),
-                    };
-                    let bg_rect =
-                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
-                    let bg_cr = egui::CornerRadius {
-                        nw: nw as u8,
-                        ne: ne as u8,
-                        sw: sw as u8,
-                        se: se as u8,
-                    };
-                    glass_board(&p, bg_rect, bg_cr);
+                    // 圆角半径：统一设置，不超过条高一半（14 默认 = 圆角矩形）
+                    let rb = crate::settings::corner_radius_for(fh);
+                    match v.shape {
+                        PillShape::Float => {
+                            let bg_rect = egui::Rect::from_min_size(
+                                egui::pos2(0.0, 0.0),
+                                egui::vec2(fw, fh),
+                            );
+                            glass_board(&p, bg_rect, egui::CornerRadius::same(rb.round() as u8));
+                        }
+                        // 吸顶 / 吸底：耳朵 + 条身一条剪影填充（拼两块会露接缝）
+                        PillShape::Island => island_board(&p, fw, fh, ew, eh, rb, true),
+                        PillShape::Bottom => island_board(&p, fw, fh, ew, eh, rb, false),
+                    }
 
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         // egui 会在每个控件后面自动加 `item_spacing`（默认 8 点），
                         // 和这里手写的间距叠在一起就会显得"图标之间空隙很大"，
                         // 而且宽度公式算不出来（宽度短一截，最右边被裁）。全部交给 add_space。
                         ui.spacing_mut().item_spacing.x = 0.0;
+                        // 贴边模式的窗口比条身宽：内容整体让开耳朵，仍按条身排版
+                        ui.add_space(ear);
                         ui.add_space(cfg::PAD_X);
                         let cx = ui.cursor().left();
                         p.text(
@@ -297,7 +308,7 @@ impl PillUi {
         self.prev_flash_hover = hov_f;
 
         // ---- 纹理增量 ----
-        self.soft.update_textures(&out.textures_delta);
+        self.soft.update_textures(&mut out.textures_delta);
 
         // ---- 变化检测：内容 / 尺寸 / 悬停 / 事件，任一变了才算真要上屏 ----
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -318,6 +329,8 @@ impl PillUi {
             mix(&mut hash, &[f.dim as u8]);
         }
         mix(&mut hash, &v.alpha.to_bits().to_le_bytes());
+        // 圆角半径是全局设置：改了必须重画（否则内容哈希不变会误判成"没变"）
+        mix(&mut hash, &crate::settings::corner_radius().to_bits().to_le_bytes());
         // scale 变了必须上屏：即使宽高凑巧没变，命中矩形与光栅化密度都已不同
         mix(&mut hash, &scale.to_bits().to_le_bytes());
         mix(&mut hash, &[matches!(v.shape, PillShape::Float) as u8, matches!(v.shape, PillShape::Island) as u8]);

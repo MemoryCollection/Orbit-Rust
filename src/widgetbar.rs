@@ -244,6 +244,8 @@ pub fn sync(f: &Frame) {
     let gap = (cfg::WIDGET_BAR_GAP as f32 * s).round() as i32;
     let hh = (cfg::PILL_H * s).ceil() as i32;
     let (px, py, pw, _) = f.pill;
+    // 贴边模式的胶囊窗口比条身左右各宽一只"耳"：模块条按条身算间隙
+    let ear = crate::render::ear_w_phys(s);
     let min_x = m.left + 6;
     let max_x = m.right - 6;
 
@@ -268,14 +270,14 @@ pub fn sync(f: &Frame) {
         let mut xs = vec![0i32; list.len()];
         match side {
             Side::Left => {
-                let mut x = (px - gap - total).max(min_x);
+                let mut x = (px + ear - gap - total).max(min_x);
                 for k in (0..list.len()).rev() {
                     xs[k] = x;
                     x += widths[k] + gap;
                 }
             }
             Side::Right => {
-                let mut x = px + pw + gap;
+                let mut x = px + pw - ear + gap;
                 if x + total > max_x {
                     x = (max_x - total).max(min_x);
                 }

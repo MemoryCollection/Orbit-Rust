@@ -19,7 +19,7 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, PostQuitMessage, RegisterClassW,
+    GetSystemMetrics, GetWindowLongPtrW, IsWindow, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SendNotifyMessageW, SetWindowLongPtrW, SetWindowPos,
     TranslateMessage, GWL_STYLE, HWND_BROADCAST, HWND_TOPMOST, SM_CXSCREEN, WNDCLASSW,
     WM_COPYDATA, WM_DESTROY, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW,
@@ -415,6 +415,10 @@ const NIF_ICON: u32 = 0x2;
 fn apply((dm, icon): (u32, Icon)) {
     let Some(tab) = TABLE.lock().unwrap().clone() else { return };
     let mut st = tab.lock().unwrap();
+    // 每次入库前先清掉窗口已销毁的条目：任务管理器每次刷新 CPU 图表都会用新的
+    // 通知窗口重复 ADD 一条「任务管理器」，旧窗口随后销毁但不发 NIM_DELETE，
+    // 不清就会在 Dock 托盘里堆出十几个同名图标（实测 12 条）。
+    prune_dead_locked(&mut st);
     match dm {
         NIM_DELETE => {
             st.icons.retain(|i| !i.same(&icon));
@@ -428,6 +432,16 @@ fn apply((dm, icon): (u32, Icon)) {
             }
         }
         NIM_ADD | NIM_MODIFY => {
+            // 任务管理器刷新 CPU 图表时用新窗口 ADD 一个 tip=「任务管理器」的占位图标，
+            // 稳定后 MODIFY 成「CPU xx%」。占位不入库（用户要求最简策略），
+            // 等它换成正式名字后走下面「未匹配 MODIFY 补入库」路径进来。
+            let taskmgr_placeholder = icon.tip == "任务管理器";
+            if taskmgr_placeholder {
+                crate::tlog!(
+                    "[trayhost] 跳过任务管理器占位图标 dm={} hwnd={:#x} uid={}",
+                    dm, icon.hwnd, icon.uid
+                );
+            }
             // 微信类图标的每次变更都记一行，用来实测"空白-图标"闪烁走的是哪条通道
             let is_msg = icon.exe.contains("weixin") || icon.exe.contains("wechat") || icon.tip.contains("微信");
             if is_msg {
@@ -445,7 +459,7 @@ fn apply((dm, icon): (u32, Icon)) {
                         i.hicon = icon.hicon;
                     }
                 }
-                if !icon.tip.is_empty() {
+                if !icon.tip.is_empty() && !taskmgr_placeholder {
                     i.tip = icon.tip;
                 }
                 if icon.msg >= 0x0400 {
@@ -463,17 +477,61 @@ fn apply((dm, icon): (u32, Icon)) {
                 i.pid = icon.pid;
                 i.seq = icon.seq;
                 st.generation += 1;
-            } else if dm == NIM_ADD {
+            } else if dm == NIM_ADD && !taskmgr_placeholder {
+                let (tip, hwnd, uid, msg, ver, guid) =
+                    (icon.tip.clone(), icon.hwnd, icon.uid, icon.msg, icon.ver, icon.guid);
+                // 同一 exe 已经有一条（且没被 same() 匹配上）→ 记录 identity，
+                // 用来区分"多开（不同 hwnd/guid）"和"幽灵重注册（窗口已换）"
+                let dup = st.icons.iter().filter(|i| i.exe == icon.exe).count();
+                if dup > 0 {
+                    crate::tlog!(
+                        "[trayhost] 重复 ADD exe={} tip={} hwnd={:#x} uid={} guid={:?} 已有{}条",
+                        icon.exe, tip, hwnd, uid, guid, dup
+                    );
+                }
+                st.icons.push(icon);
+                st.generation += 1;
+                crate::vlog!("[trayhost] ADD {} hwnd={:#x} uid={} msg={:#x} v{} guid={:?}",
+                    tip, hwnd, uid, msg, ver, guid);
+            } else if dm == NIM_MODIFY && !taskmgr_placeholder && !icon.tip.is_empty() {
+                // 未匹配上的 MODIFY：ADD 被拦掉（任务管理器占位）或漏掉的图标，
+                // 带着 tip 落库补进来。hicon/msg/ver/guid 都在 NOTIFYICONDATA 里，直接建。
                 let (tip, hwnd, uid, msg, ver, guid) =
                     (icon.tip.clone(), icon.hwnd, icon.uid, icon.msg, icon.ver, icon.guid);
                 st.icons.push(icon);
                 st.generation += 1;
-                crate::vlog!("[trayhost] ADD {} hwnd={:#x} uid={} msg={:#x} v{} guid={:?}",
+                crate::vlog!("[trayhost] MODIFY 补入库 {} hwnd={:#x} uid={} msg={:#x} v{} guid={:?}",
                     tip, hwnd, uid, msg, ver, guid);
             }
         }
         _ => {}
     }
+}
+
+/// hwnd 是否仍是一个活着的窗口（message-only 窗口也算活）
+fn is_live(hwnd: u32) -> bool {
+    hwnd != 0 && unsafe { IsWindow(HWND(hwnd as *mut c_void)).as_bool() }
+}
+
+/// 清掉托管表里窗口已销毁的条目（幽灵托盘图标）。
+/// 任务管理器每次刷新 CPU 图表都会用新的通知窗口重新 ADD，旧窗口销毁时
+/// 不发 NIM_DELETE，不清理会堆出十几个「任务管理器」图标，其中只有最后
+/// 一条（tip 变成「CPU xx%」的那条）是活的。已持有表锁时用 _locked 版本。
+fn prune_dead_locked(st: &mut State) {
+    let before = st.icons.len();
+    st.icons.retain(|i| i.hwnd == 0 || is_live(i.hwnd));
+    let gone = before - st.icons.len();
+    if gone > 0 {
+        st.generation += 1;
+        crate::tlog!("[trayhost] 清理失效图标 {} 条（通知窗口已销毁）", gone);
+    }
+}
+
+/// Dock 轮询时调用（2s 一次）：没有新注册也能把幽灵图标清掉
+pub fn prune_dead_icons() {
+    let Some(tab) = TABLE.lock().unwrap().clone() else { return };
+    let Ok(mut st) = tab.lock() else { return };
+    prune_dead_locked(&mut st);
 }
 
 /// 回答 dwData=3：WINNOTIFYICONIDENTIFIER{dwMagic,dwMessage,cbSize,dwPadding,hWnd,uID,guidItem}
@@ -562,6 +620,17 @@ pub fn table() -> Option<Arc<Mutex<State>>> {
 /// 托盘托管是否处于活动状态。
 pub fn is_active() -> bool {
     TABLE.lock().unwrap().is_some()
+}
+
+/// 当前托管表里所有图标的进程 PID 去重列表（Dock 托盘实际显示的图标所属进程）。
+/// 微信这类多进程应用用它过滤辅助子进程：托盘没图标的进程不用去枚举 UIA。
+pub fn hosted_pids() -> Vec<u32> {
+    let Some(tab) = TABLE.lock().unwrap().clone() else { return Vec::new() };
+    let Ok(st) = tab.lock() else { return Vec::new() };
+    let mut v: Vec<u32> = st.icons.iter().map(|i| i.pid).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// 给定 hwnd 是否是我们创建的假托盘窗口（隐藏真任务栏时必须排除它）。

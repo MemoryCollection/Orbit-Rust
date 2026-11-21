@@ -45,6 +45,7 @@ pub fn ellipsize(soft: &SoftBackend, text: &str, max_w: f32, font: f32) -> Strin
 
 /// 画整条音乐条。w/h 是物理像素尺寸，scale 是 pixels_per_point。
 /// cover 是 decode_cover 解码后的正方形 straight RGBA，rotate_cover 在这里调用。
+/// 形状固定为四角圆角胶囊（不跟随顶部胶囊的吸顶/吸底"耳朵"）。
 pub fn paint(
     soft: &mut SoftBackend,
     w: i32, h: i32, scale: f32, text: &str, font: f32,
@@ -62,15 +63,15 @@ pub fn paint(
     let soft_ref = &mut *soft;
     // ppp 每帧走 RawInput（见 egui_soft::input 的注释），否则缩放 ≠ 1.0 时整版错位
     let input = soft_ref.input(fw, fh);
-    let out = ctx.run_ui(
+    let mut out = ctx.run_ui(
         input,
         |ui| {
             let p = ui.painter().clone();
-            // 圆角底，与顶部胶囊同一画法
+            // 圆角胶囊底，与顶部胶囊同一画法
             glass_board(
                 &p,
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
-                egui::CornerRadius::same((fh / 2.0).min(255.0) as u8),
+                egui::CornerRadius::same(crate::settings::corner_radius_for(fh).round() as u8),
             );
 
             let (cx0, cy0, d) = cover_box(fh);
@@ -151,6 +152,6 @@ pub fn paint(
         },
     );
 
-    soft.update_textures(&out.textures_delta);
+    soft.update_textures(&mut out.textures_delta);
     soft.rasterize(out.shapes, out.pixels_per_point, w, h)
 }

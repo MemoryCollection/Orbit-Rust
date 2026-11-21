@@ -123,6 +123,9 @@ pub fn show(v: &View) {
     let (px, py, pw, ph) = v.pill;
     let gap = (cfg::LYRIC_GAP as f32 * scale) as i32;
 
+    // 音乐条不再跟随胶囊的吸顶/吸底形状：永远是四角圆角的独立胶囊，
+    // 吸顶刘海只有顶部胶囊本身做（2026-11-21 用户要求去掉音乐条的吸顶模式）
+
     // 该侧可用宽度：左右贴边时给胶囊让出位置，下方按整屏居中（物理像素）
     let avail = match v.pos {
         LyricPos::Left => px - gap - m.left - 6,

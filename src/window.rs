@@ -21,8 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::clipboard::{self, Clipboard};
-use crate::clock;
-use crate::config as cfg;
+use crate::clock;use crate::config as cfg;
 use crate::dock::{self, FlashIcon};
 use crate::hide;
 use crate::lyric::Lyrics;
@@ -160,6 +159,12 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     let mail_changed = app.mail.tick();
                     if weather_changed || music_changed || clip_changed || mail_changed {
                         dirty = true;
+                    }
+                    // 天气快照更新：推给右上角透明卡片（天气已从胶囊移出）
+                    if weather_changed {
+                        if let Some(s) = &app.weather.snap {
+                            crate::weathercard::update(s);
+                        }
                     }
                     // settings.txt 被改过（手改）就热更新；设置页面改值走版本号
                     let file_changed = settings::reload_if_changed();
@@ -312,6 +317,15 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 }
                 LRESULT(0)
             }
+            // 设置页点「应用/还原」后主动投来：立即按新版本重绘，不等 500ms 轮询
+            m if m == crate::appmsg::WM_SETTINGS_APPLIED => {
+                app.seen_settings = settings::version();
+                if app.panel.is_some() {
+                    app.reload_panel();
+                }
+                app.render();
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, msg, w, l),
         }
     }
@@ -361,13 +375,16 @@ impl App {
     pub fn init(&mut self, hwnd: HWND) {
         settings::init();
         self.seen_settings = settings::version();
+        // 登记 HWND：设置页点「应用」后主动投消息过来，立即重绘（不用等轮询）
+        crate::appmsg::register_pill(hwnd);
         unsafe {
             self.hwnd = hwnd;
             self.scale = GetDpiForWindow(hwnd) as f32 / 96.0;
             self.last_time = now_parts();
             // 退出热键：Ctrl+Alt+O
             let _ = RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT, 'O' as u32);
-            // 设置页面：Ctrl+Alt+,
+            // 设置页面：Ctrl+Alt+,（Win 键由 startmenu.rs 的低级键盘钩子接管，
+            // RegisterHotKey 拦不住系统开始菜单——它靠松键触发）
             let _ = RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT, 0xBC /* VK_OEM_COMMA */);
         }
     }
@@ -493,25 +510,18 @@ impl App {
     /// 从胶囊往外排，每个分离模块单独一条（`slot` = 同侧的第几个，1 起计）。
     fn build_widgets(&self) -> Widgets {
         let mut all: Vec<(WidgetKind, WidgetItem)> = Vec::new();
-        if cfg::SHOW_WEATHER {
-            if let Some(s) = &self.weather.snap {
-                all.push((
-                    WidgetKind::Weather,
-                    WidgetItem {
-                        icon: weather::glyph(s.code, s.day).to_string(),
-                        icon_argb: weather_color(s.code, s.day),
-                        text: format!("{}°", s.temp),
-                        icon_kind: 0,
-                    },
-                ));
-            }
-        }
-        if cfg::SHOW_MAIL && (!self.mail.items.is_empty() || self.mail.error.is_some()) {
-            // 平时只有图标；识别到验证码显示验证码；有未读但没有验证码就提示有新邮件
-            let (text, argb) = match self.mail.badge() {
+        // 天气已从胶囊移出，改为桌面右上角常驻透明卡片（见 weathercard.rs）。
+        // 这里不再把天气塞进胶囊 / 左右模块条；数据仍由 self.weather.tick() 拉取。
+        // 邮件模块按需出现：只有验证码或未读时才占位。
+        // 之前只要邮箱拉到过列表（哪怕全读完）或配置出错就常驻一个灰信封，
+        // 用户要求"没有新邮件时隐藏"，所以 Badge::None 直接不进 all。
+        let mail_badge = self.mail.badge();
+        if cfg::SHOW_MAIL && !matches!(&mail_badge, Badge::None) {
+            // 识别到验证码显示验证码；有未读但没有验证码就提示有新邮件
+            let (text, argb) = match mail_badge {
                 Badge::Code(code) => (code, cfg::cur().sun),
                 Badge::Unread => ("新邮件".to_string(), cfg::cur().accent),
-                Badge::None => (String::new(), cfg::cur().icon_dim),
+                Badge::None => unreachable!(),
             };
             // 图标用矢量信封（见 egui_soft::widget_icon），`icon` 只用来占格
             all.push((
@@ -792,7 +802,11 @@ impl App {
         }
 
         let pos = self.music.position_ms().max(0) as u64;
-        let text = match self.lyrics.line_text(pos) {
+        // 歌词提前量（默认 1s，设置页按 0.1 秒调，可正可负）：
+        // 按"播放位置 + 提前量"取句——正值提前、负值延后
+        let lead_ms = (settings::lyric_lead() * 1000.0).round() as i64;
+        let at = (pos as i64 + lead_ms).max(0) as u64;
+        let text = match self.lyrics.line_text(at) {
             // 有词就显示当前这句；前奏（第一句之前）与整首无词时退回歌名
             Some(t) => t.to_string(),
             None => self.music.title_line().unwrap_or_default(),
@@ -826,9 +840,15 @@ impl App {
         self.set_anim(playing);
     }
 
-    /// 某一侧的锚矩形：该侧有分离模块条就用条的矩形，否则用胶囊本身
+    /// 某一侧的锚矩形：该侧有分离模块条就用条的矩形，否则用胶囊本身。
+    /// 胶囊吸顶/吸底时窗口比条身左右各宽一只"耳"，这里返回**条身**矩形，
+    /// 让音乐条按视觉边缘算间隙（耳朵本身是透明的）
     fn side_anchor(&self, side: BarSide) -> (i32, i32, i32, i32) {
-        widgetbar::rect(side).unwrap_or((self.pos.0, self.pos.1, self.pill.0, self.pill.1))
+        if let Some(r) = widgetbar::rect(side) {
+            return r;
+        }
+        let ear = render::ear_w_phys((self.scale * settings::pill_scale()).max(0.5));
+        (self.pos.0 + ear, self.pos.1, self.pill.0 - 2 * ear, self.pill.1)
     }
 
     /// 封面旋转定时器：只在播放时开着，省掉暂停时的空转
@@ -1069,4 +1089,48 @@ pub fn primary_monitor() -> MONITORINFO {
         let _ = GetMonitorInfoW(hmon, &mut mi);
     }
     mi
+}
+
+/// 把一个窗口安全地还原并拉到前台（Dock 点图标、横幅跳微信共用）。
+///
+/// **绝不要用 `AttachThreadInput` 抢前台**：它会把目标窗口所在线程的输入
+/// 队列挂到调用线程上。调用线程一旦退出（或 detach 失败、返回值没人看），
+/// 目标进程的鼠标/键盘输入就整个楔死——2026-11-21 实测：横幅跳微信后
+/// 微信完全无法操作（点会话、点最小化都没反应），连系统级前台切换也卡住。
+///
+/// 前台锁的正规解法：系统只允许「最近收到过用户输入」的线程调
+/// `SetForegroundWindow`。先注入一次无副作用的 ALT 按下/抬起满足这个条件
+/// （和用户真的碰了一下键盘等价），失败再退回 `SwitchToThisWindow`
+/// （Alt+Tab 走的同一条路径）。全程不碰别的进程的输入队列。
+pub fn activate_window(hwnd: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
+    };
+    if hwnd.is_invalid() {
+        return;
+    }
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let key = |up: bool| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_MENU,
+                    wScan: 0,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let _ = SendInput(&[key(false), key(true)], std::mem::size_of::<INPUT>() as i32);
+        if !SetForegroundWindow(hwnd).as_bool() {
+            SwitchToThisWindow(hwnd, true);
+        }
+    }
 }

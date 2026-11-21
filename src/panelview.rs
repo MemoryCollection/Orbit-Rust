@@ -87,7 +87,7 @@ pub fn paint_list(
     let ctx = s.ctx().clone();
     // ppp 每帧走 RawInput（见 egui_soft::input 的注释），否则缩放 ≠ 1.0 时整版错位
     let input = s.input(fw, fh);
-    let out = ctx.run_ui(
+    let mut out = ctx.run_ui(
         input,
         |ui| {
             let p = ui.painter().clone();
@@ -193,7 +193,7 @@ pub fn paint_list(
             }
         },
     );
-    soft.update_textures(&out.textures_delta);
+    soft.update_textures(&mut out.textures_delta);
     let rgba = soft.rasterize(out.shapes, out.pixels_per_point, w, h);
     PanelPainted { rgba, hits: to_px(&hits, scale) }
 }
@@ -227,7 +227,7 @@ pub fn paint_weather(
     let ctx = s.ctx().clone();
     // ppp 每帧走 RawInput（见 egui_soft::input 的注释），否则缩放 ≠ 1.0 时整版错位
     let input = s.input(fw, fh);
-    let out = ctx.run_ui(
+    let mut out = ctx.run_ui(
         input,
         |ui| {
             let p = ui.painter().clone();
@@ -340,7 +340,7 @@ pub fn paint_weather(
             hits.push((refresh_rect, 0));
         },
     );
-    soft.update_textures(&out.textures_delta);
+    soft.update_textures(&mut out.textures_delta);
     let rgba = soft.rasterize(out.shapes, out.pixels_per_point, w, h);
     PanelPainted { rgba, hits: to_px(&hits, scale) }
 }
