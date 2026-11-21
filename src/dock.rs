@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use windows::core::{w, Interface, PCWSTR, PWSTR};
@@ -85,6 +85,10 @@ pub struct FlashIcon {
 
 static FLASH_SET: Mutex<Vec<FlashIcon>> = Mutex::new(Vec::new());
 static FLASH_VER: AtomicU64 = AtomicU64::new(0);
+/// 每个图标 key 上次已播放提示音的那次闪烁时刻（`it.flash_at`）。
+/// 用它去重：每次亮→灭（新消息的一闪）都响一声，同一帧不重复。
+static SOUND_FLASH_AT: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 快照版本号：正在闪烁的图标集合（或亮/灭帧）变化时 +1
 pub fn flash_version() -> u64 {
@@ -971,14 +975,13 @@ impl Dock {
     /// 集合或亮/灭帧没变就不动版本号，胶囊那边靠版本号判断要不要重绘。
     fn publish_flash(&mut self) {
         let now = Instant::now();
-        // 微信提示音：拿"上一轮快照里在闪的键"对比，图标从"没在闪"变"在闪"
-        // 的那一下响一声。按 key 逐个判断——微信双开两个图标各算各的提醒。
-        let was_flashing: HashSet<String> = FLASH_SET
-            .lock()
-            .map(|v| v.iter().map(|f| f.key.clone()).collect())
-            .unwrap_or_default();
+        // 微信提示音：每次闪烁都响。`it.flash_at` 在每次亮→灭时刷新，
+        // 拿它当"这一闪"的身份，比上一轮快照的 key 集合精确得多——
+        // 原来的边沿检测把连续闪烁的后续闪全吞了。按 key 各自记，
+        // 双开微信两个图标互不干扰。
         let mut wx_new_keys: Vec<String> = Vec::new();
         let mut snap: Vec<FlashIcon> = Vec::new();
+        let mut sounded = SOUND_FLASH_AT.lock().unwrap_or_else(|e| e.into_inner());
         if settings::show_tray() {
             for &i in &self.tray_shown {
                 let Some(it) = self.tray.items.get(i) else { continue };
@@ -987,11 +990,12 @@ impl Dock {
                     continue;
                 }
                 let key = it.key();
-                if settings::wechat_sound()
-                    && !was_flashing.contains(&key)
-                    && notify::is_wechat(&it.name, &it.exe)
-                {
-                    wx_new_keys.push(key.clone());
+                if settings::wechat_sound() && notify::is_wechat(&it.name, &it.exe) {
+                    // 这次灭帧（这一闪）还没响过 → 响一声并记下时刻
+                    if sounded.get(&key) != Some(&t) {
+                        sounded.insert(key.clone(), t);
+                        wx_new_keys.push(key.clone());
+                    }
                 }
                 let px = ((it.rgba.len() / 4) as f32).sqrt().round() as i32;
                 snap.push(FlashIcon {

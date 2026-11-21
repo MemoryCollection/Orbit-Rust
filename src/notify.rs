@@ -4,8 +4,8 @@
 //! 实现：`include_bytes!` 把 mp3 编译进 exe；首次播放时释放到
 //! `<exe>/data/wechat_notify.mp3`，然后走 MCI（`mciSendStringW`，DirectShow
 //! 后端，免第三方解码库）。alias 打开一次复用，之后每次触发 seek 回头再播。
-//! 闪烁是 250ms 亮/灭交替，调用侧只认"从没在闪变在闪"的那一下，这里再加
-//! 最小间隔保护，一轮提醒最多响一声。
+//! 闪烁是 250ms 亮/灭交替，调用侧认每次"亮→灭"（`flash_at` 刷新）触发一声，
+//! 连续消息每闪都响；这里只做极短的重入兜底。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,8 +19,10 @@ use windows::Win32::Media::Multimedia::mciSendStringW;
 
 /// 嵌入的提示音（约 36 KB）
 static SOUND_MP3: &[u8] = include_bytes!("../assets/wechat_notify.mp3");
-/// 两次播放的最小间隔（毫秒）：同一轮新消息提醒只响一声
-const MIN_GAP_MS: u64 = 3000;
+/// 播放之间的极短兜底间隔（毫秒）：调用侧已用每次闪烁的 flash_at 精确去重，
+/// 这里只防同一帧重入（比如 render 和 70ms 定时器在同一灭帧各调一次）。
+/// 微信一闪约 250ms，两次闪烁间隔 ~500ms，200ms 兜底不会吞掉下一次闪烁。
+const MIN_GAP_MS: u64 = 200;
 /// MCI alias（进程内唯一）
 const ALIAS: &str = "orbit_notify";
 
@@ -47,8 +49,8 @@ fn sound_path() -> PathBuf {
     crate::store::path("wechat_notify.mp3")
 }
 
-/// 播放提示音。调用侧已在"图标开始闪"的那一刻触发，这里按图标 key 再加
-/// 间隔保护——同一个实例的一轮提醒最多响一声，双开的两个实例互不干扰。
+/// 播放提示音。调用侧每次闪烁（亮→灭）触发一次，连续消息每闪都响；
+/// 这里按图标 key 做 200ms 重入兜底，双开的两个实例互不干扰。
 pub fn play_wechat(key: &str) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
