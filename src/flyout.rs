@@ -483,3 +483,265 @@ fn exe_stem_of(pid: u32) -> Option<String> {
         Some(stem.to_lowercase())
     }
 }
+
+// ---------- 右键菜单重定位 ----------
+//
+// 右键 Dock 上的托盘图标时，注入的右键坐标就是图标中心，应用弹出的原生菜单
+// （#32768 类窗口）因此落在 Dock 上——而 Dock 是 topmost 分层窗口，菜单会被
+// 压住一角。这里在注入右键后盯住该进程的菜单窗口，把它挪到**紧贴 Dock 边缘**
+// 的位置（不再和 Dock 重叠）：沿 Dock 长轴继续跟鼠标，短轴贴到 Dock 内侧。
+
+/// 菜单出现前的等待（注入 → 弹菜单通常 <100ms，留足余量）
+const MENU_FIND_MS: u64 = 3000;
+/// 菜单开着就守着（用户点别处菜单就没了，超时只是兜底）
+const MENU_KEEPALIVE_MS: u64 = 15_000;
+/// 菜单窗口尺寸下限（子菜单/单条菜单可能很窄）
+const MENU_MIN_W: i32 = 20;
+const MENU_MIN_H: i32 = 16;
+
+/// 右键托盘图标后启动：盯住该进程接下来弹出的 #32768 菜单并摆到 Dock 旁边。
+/// `anchor` 是被右键的图标中心（≈ 鼠标位置），菜单沿 Dock 长轴跟它对齐。
+pub fn watch_menu(pid: u32, icon_hwnd: HWND, capsule: RECT, anchor: (i32, i32), label: &str) {
+    if pid == 0 || pid == unsafe { windows::Win32::System::Threading::GetCurrentProcessId() } {
+        return;
+    }
+    if capsule.right - capsule.left < 40 || capsule.bottom - capsule.top < 20 {
+        return;
+    }
+    let Some(stem) = exe_stem_of(pid) else { return };
+    // 系统外壳图标的菜单是 Windows 自己的，不能动
+    if matches!(
+        stem.as_str(),
+        "explorer" | "shellexperiencehost" | "startmenuexperiencehost"
+    ) {
+        return;
+    }
+    let key = if icon_hwnd.0.is_null() {
+        usize::MAX - pid as usize
+    } else {
+        icon_hwnd.0 as usize
+    };
+    // cancel() 刚把 hover 守位吊销（GENERATIONS 里删了 key），这里重新领一代
+    let generation = {
+        let mut g = GENERATIONS.lock().unwrap();
+        let e = g.entry(key).or_insert(0);
+        *e = e.wrapping_add(1);
+        *e
+    };
+    let watch_id = WATCH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let label = label.to_string();
+    crate::tlog!(
+        "[flyout] menu#{watch_id} pid={pid} stem={stem} gen={generation} anchor={anchor:?}"
+    );
+    std::thread::spawn(move || run_menu(pid, key, stem, capsule, anchor, watch_id, generation, label));
+}
+
+fn run_menu(
+    pid: u32,
+    key: usize,
+    stem: String,
+    capsule: RECT,
+    anchor: (i32, i32),
+    watch_id: u64,
+    generation: usize,
+    label: String,
+) {
+    let _claims = ClaimGuard(watch_id);
+    // ---- 等菜单出现 ----
+    let mut found = HWND::default();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(MENU_FIND_MS) {
+        if !is_current(key, generation) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(POLL_MS));
+        if let Some(h) = find_menu(pid, &stem) {
+            found = h;
+            claim(found, watch_id);
+            break;
+        }
+    }
+    if found.0.is_null() {
+        return; // 没弹菜单（或弹的不是原生菜单），没得摆
+    }
+
+    // ---- 摆好并守位（菜单开着期间别让它漂回去）----
+    let deadline = Instant::now() + Duration::from_millis(MENU_KEEPALIVE_MS);
+    let mut nudges = 0u32;
+    let mut reported = false;
+    while Instant::now() < deadline {
+        if !is_current(key, generation) {
+            return;
+        }
+        unsafe {
+            // 菜单关了（点掉/按 Esc）就收工；菜单不会销毁重建，不用宽限期
+            if !IsWindow(found).as_bool() || !IsWindowVisible(found).as_bool() {
+                return;
+            }
+            let mut cur = RECT::default();
+            if GetWindowRect(found, &mut cur).is_err() {
+                return;
+            }
+            let w = cur.right - cur.left;
+            let h = cur.bottom - cur.top;
+            if w < MENU_MIN_W || h < MENU_MIN_H {
+                std::thread::sleep(Duration::from_millis(POLL_MS));
+                continue; // 刚创建还没量好尺寸
+            }
+            let (x, y) = menu_target(w, h, capsule, anchor);
+            if (cur.left - x).abs() <= DRIFT && (cur.top - y).abs() <= DRIFT {
+                if !reported && nudges > 0 {
+                    crate::vlog!("[flyout] {label} 右键菜单已贴到 Dock 旁 ({x},{y}) {w}x{h}");
+                    reported = true;
+                }
+                std::thread::sleep(Duration::from_millis(140));
+                continue;
+            }
+            if nudges >= MAX_NUDGES {
+                return;
+            }
+            nudges += 1;
+            let _ = SetWindowPos(
+                found,
+                HWND::default(),
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+            );
+            if !reported {
+                crate::tlog!("[flyout] {label} 右键菜单 → ({x},{y}) {w}x{h}");
+                reported = true;
+            }
+            std::thread::sleep(Duration::from_millis(120));
+        }
+    }
+}
+
+/// 该进程（或同名兄弟进程）当前可见的右键弹窗：原生菜单（#32768）或与悬停
+/// 弹窗同判据的小 tool window（WorkBuddy 右键弹的是自己的 Qt 卡片，不是
+/// #32768）。取面积最小的——主菜单先弹出来，子菜单/辅助窗口常伴生，挑小的。
+fn find_menu(pid: u32, stem: &str) -> Option<HWND> {
+    struct Ctx<'a> {
+        pid: u32,
+        stem: &'a str,
+        best: HWND,
+        best_area: i64,
+        names: HashMap<u32, String>,
+    }
+
+    unsafe extern "system" fn cb(h: HWND, l: LPARAM) -> BOOL {
+        let ctx = &mut *(l.0 as *mut Ctx);
+        unsafe {
+            if !IsWindowVisible(h).as_bool() {
+                return BOOL(1);
+            }
+            let mut wpid = 0u32;
+            GetWindowThreadProcessId(h, Some(&mut wpid));
+            if wpid == 0 || wpid == std::process::id() {
+                return BOOL(1);
+            }
+            if wpid != ctx.pid {
+                let name = ctx
+                    .names
+                    .entry(wpid)
+                    .or_insert_with(|| exe_stem_of(wpid).unwrap_or_default());
+                if !name.starts_with(ctx.stem) {
+                    return BOOL(1);
+                }
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(h, &mut r).is_err() {
+                return BOOL(1);
+            }
+            let w = r.right - r.left;
+            let hh = r.bottom - r.top;
+            if w < MENU_MIN_W || hh < MENU_MIN_H || w > MAX_W || hh > MAX_H {
+                return BOOL(1);
+            }
+            let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
+            if style & WS_MAXIMIZE.0 != 0 {
+                return BOOL(1);
+            }
+            let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+            if ex & WS_EX_APPWINDOW.0 != 0 {
+                return BOOL(1);
+            }
+            let mut cls = [0u16; 256];
+            let n = GetClassNameW(h, &mut cls);
+            let cls = String::from_utf16_lossy(&cls[..n as usize]).to_lowercase();
+            let is_menu = cls == "#32768";
+            let is_tool = ex & WS_EX_TOOLWINDOW.0 != 0 || cls.contains("tool");
+            if !is_menu && !is_tool {
+                return BOOL(1);
+            }
+            let area = w as i64 * hh as i64;
+            if area < ctx.best_area {
+                ctx.best_area = area;
+                ctx.best = h;
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut ctx = Ctx {
+        pid,
+        stem,
+        best: HWND::default(),
+        best_area: i64::MAX,
+        names: HashMap::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    if ctx.best.0.is_null() {
+        None
+    } else {
+        Some(ctx.best)
+    }
+}
+
+/// 菜单该摆在哪：沿 Dock 长轴对齐鼠标锚点，短轴紧贴 Dock 边缘（不重叠）。
+/// 竖排 Dock → 菜单在内侧（右锚贴左边、左锚贴右边），垂直居中于锚点；
+/// 横排 Dock → 菜单在 Dock 上方（顶部锚则在下方），水平居中于锚点。均夹回工作区。
+fn menu_target(w: i32, h: i32, capsule: RECT, anchor: (i32, i32)) -> (i32, i32) {
+    unsafe {
+        let mon = MonitorFromPoint(
+            windows::Win32::Foundation::POINT { x: anchor.0, y: anchor.1 },
+            MONITOR_DEFAULTTONEAREST,
+        );
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let work = if !mon.is_invalid() && GetMonitorInfoW(mon, &mut info).as_bool() {
+            info.rcWork
+        } else {
+            return (anchor.0 - w / 2, anchor.1 - h / 2);
+        };
+        let vertical = capsule.bottom - capsule.top > capsule.right - capsule.left;
+        let (x, y);
+        if vertical {
+            // 内侧：Dock 在屏幕右半 → 菜单摆左边；在左半 → 摆右边
+            let right_docked = (capsule.left + capsule.right) / 2 >= (work.left + work.right) / 2;
+            let cx = if right_docked {
+                capsule.left - w - GAP
+            } else {
+                capsule.right + GAP
+            };
+            x = cx.clamp(work.left + GAP, work.right - GAP - w);
+            y = (anchor.1 - h / 2).clamp(work.top + GAP, work.bottom - GAP - h);
+        } else {
+            let below = capsule.top < (work.top + work.bottom) / 2;
+            let cy = if below {
+                capsule.bottom + GAP
+            } else {
+                capsule.top - h - GAP
+            };
+            y = cy.clamp(work.top + GAP, work.bottom - GAP - h);
+            x = (anchor.0 - w / 2).clamp(work.left + GAP, work.right - GAP - w);
+        }
+        (x, y)
+    }
+}

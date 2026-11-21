@@ -278,6 +278,11 @@ pub const TRAY_FORWARD_HOVER: bool = true;
 /// 移植自 C# 版 Orbit 的 `HoverFlyoutRelocator`，实现见 `src/flyout.rs`。
 pub const TRAY_RELOCATE_FLYOUT: bool = true;
 
+/// 右键托盘图标后，应用弹的原生菜单（#32768）就落在注入坐标（= Dock 图标上），
+/// 而 Dock 是 topmost，菜单会被压住一部分。打开这个就在菜单出现时把它挪到
+/// 紧贴 Dock 边缘的位置（跟随鼠标方向），实现见 `src/flyout.rs::watch_menu`。
+pub const TRAY_RELOCATE_MENU: bool = true;
+
 // ---------- 悬停提示条（托盘/任务图标 tooltip）----------
 
 /// 提示条字号

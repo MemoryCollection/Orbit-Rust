@@ -415,8 +415,17 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     match dock.tray_targets.get(&c).copied() {
                         Some(t) => {
                             crate::vlog!("[dock] 右键托盘#{idx}（回调消息）");
-                            // 同左键：右键弹出的菜单也是应用的真 UI，守位线程必须先停
+                            // 同左键：右键弹出的菜单也是应用的真 UI，悬停守位线程必须先停
                             flyout::cancel(t.hwnd, t.pid);
+                            // 但菜单本身会弹在注入坐标（= Dock 图标上），被 topmost 的
+                            // Dock 压住一角——改由菜单守位线程把它挪到 Dock 旁边
+                            if cfg::TRAY_RELOCATE_MENU {
+                                let mut cap = RECT::default();
+                                if unsafe { GetWindowRect(hwnd, &mut cap) }.is_ok() {
+                                    let label = dock.flyout_label(idx);
+                                    flyout::watch_menu(t.pid, t.hwnd, cap, c, &label);
+                                }
+                            }
                             traymsg::right_click(&t, c);
                         }
                         None => {
@@ -650,18 +659,22 @@ impl Dock {
         }
     }
 
+    /// 守位日志用的图标名（托盘显示下标 → 真实条目名）
+    fn flyout_label(&self, idx: usize) -> String {
+        self.tray_shown
+            .get(idx)
+            .and_then(|&real| self.tray.items.get(real))
+            .map(|it| it.name.clone())
+            .unwrap_or_default()
+    }
+
     /// 应用在悬停时会自己弹一个小预览窗，位置在旧托盘角；把它摆到 Dock 上方。
     /// 真正的活儿在后台线程里（`flyout::watch`），这里只把 Dock 的屏幕矩形递过去。
     fn watch_flyout(&self, t: traymsg::Target, idx: usize) {
         if !cfg::TRAY_RELOCATE_FLYOUT {
             return;
         }
-        let label = self
-            .tray_shown
-            .get(idx)
-            .and_then(|&real| self.tray.items.get(real))
-            .map(|it| it.name.clone())
-            .unwrap_or_default();
+        let label = self.flyout_label(idx);
         let mut cap = RECT::default();
         if unsafe { GetWindowRect(self.hwnd, &mut cap) }.is_err() {
             return;
