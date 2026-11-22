@@ -252,7 +252,19 @@ pub fn sync(f: &Frame) {
         let mut widths = Vec::with_capacity(list.len());
         for b in &list {
             let items: Vec<WidgetItem> = b.items.iter().map(|(_, it)| it.clone()).collect();
-            widths.push((crate::widgetbarview::bar_width(&items) * s).ceil() as i32);
+            // 文本宽度（验证码 / "新邮件"）要用 SoftBackend 的度量通道实测，
+            // 才能随内容自适应变长。复用槽位自己的后端（懒创建），并先 set_scale：
+            // 度量用的字体/像素比和 draw_bar 画的时候保持一致，量出来才准。
+            let i = side.idx() * SLOTS + (b.slot.clamp(1, cfg::WIDGET_BAR_MAX_SLOT) as usize - 1);
+            VIEW.with(|c| {
+                let mut slot = c[i].borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(SoftBackend::new());
+                }
+                let soft = slot.as_mut().unwrap();
+                soft.set_scale(s);
+                widths.push((crate::widgetbarview::bar_width(soft, &items) * s).ceil() as i32);
+            });
         }
         let total: i32 = widths.iter().sum::<i32>() + gap * (list.len() as i32 - 1).max(0);
 

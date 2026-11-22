@@ -1973,6 +1973,25 @@ impl SettingsApp {
     fn detail_dock(&mut self, ui: &mut egui::Ui) {
         section(ui, "Dock");
 
+        // 内建「系统控制」按钮开关（默认隐藏）
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let on = settings::sys_panel();
+            if toggle_btn(ui, on, "系统控制") {
+                settings::set_sys_panel(!on);
+                crate::tlog!(
+                    "[settings] 系统控制入口 → {}",
+                    if settings::sys_panel() { "显示" } else { "隐藏" }
+                );
+            }
+            ui.label(
+                egui::RichText::new("Dock 上的内建按钮：音量 / 亮度 / WiFi / 蓝牙（Orbit 图标）")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+        ui.add_space(6.0);
+
         section(ui, "托盘图标");
         ui.label(
             egui::RichText::new("点一下切换显示 / 隐藏；被隐藏的托盘图标会转发给系统托盘")

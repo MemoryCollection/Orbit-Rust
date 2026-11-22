@@ -169,6 +169,8 @@ static AUTOSTART: AtomicU32 = AtomicU32::new(UNLOADED);
 static GUARDIAN: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 伪造托盘点击/悬停（traymsg 回调消息投递）：关闭后完全交给已转发的 Explorer 托盘
 static TRAY_FAKE_INPUT: AtomicU32 = AtomicU32::new(UNLOADED);
+/// Dock 内建「系统控制」按钮（音量/亮度/WiFi/蓝牙）：默认隐藏，设置页 Dock 区可开
+static SYS_PANEL: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 图标指定：键（托盘图标键 / `app:<exe>`）→ 取图标的 exe/.lnk 全路径。
 /// 有些程序注册的托盘 hIcon 只有 16px，放大到 Dock 尺寸必然糊，用户可以指定一个
 /// 图标清晰的 exe 顶替它。
@@ -1469,6 +1471,23 @@ pub fn set_tray_fake_input(on: bool) {
     bump();
 }
 
+/// Dock 上的内建「系统控制」按钮。默认隐藏；设置页 → Dock 里打开。
+pub fn sys_panel() -> bool {
+    match SYS_PANEL.load(Ordering::Relaxed) {
+        UNLOADED => false,
+        c => c == 2,
+    }
+}
+
+pub fn set_sys_panel(on: bool) {
+    if sys_panel() == on {
+        return;
+    }
+    SYS_PANEL.store(bool_code(on), Ordering::Relaxed);
+    save();
+    bump();
+}
+
 // ---------- 通知通道（每个消息源独立）----------
 
 /// 微信消息走哪条通知通道（默认 Orbit 横幅）
@@ -1847,6 +1866,8 @@ fn save() {
     vals.push(("autostart", on_off(autostart()).to_string()));
     vals.push(("guardian", on_off(guardian()).to_string()));
     vals.push(("tray_fake_input", on_off(tray_fake_input()).to_string()));
+    // Dock 内建「系统控制」按钮（默认隐藏，开着才写 1 也行，统一落键便于设置页回显）
+    vals.push(("sys_panel", on_off(sys_panel()).to_string()));
     // 通知通道（每个来源独立）
     vals.push(("notify_wechat", notify_wechat().as_str().to_string()));
     vals.push(("notify_tray", notify_tray().as_str().to_string()));
@@ -2198,6 +2219,8 @@ guardian=1
 # 伪造托盘点击/悬停（向目标窗口投它注册时的回调消息）。默认开；
 # 关掉后完全交给已转发给 Explorer 的托盘处理，用于透明转发 A/B 测试
 tray_fake_input=1
+# Dock 内建「系统控制」按钮（音量/亮度/WiFi/蓝牙，Orbit 图标）。默认隐藏，1 = 显示
+sys_panel=0
 # ===== 通知（每个消息源独立选择通道）=====
 # 通道：off=不通知 / orbit=Orbit 横幅 / windows=Windows 系统通知
 notify_wechat=orbit
@@ -2373,6 +2396,7 @@ fn load() {
     let mut auto = true;
     let mut guard_on = true;
     let mut fake_input = cfg::TRAY_FAKE_INPUT;
+    let mut sys_on = false;
     // 新键 `alpha` 优先；老键 pill_alpha / dock_alpha 只作迁移兜底
     let mut alpha_new: Option<f32> = None;
     let mut alpha_legacy = 1.0f32;
@@ -2521,6 +2545,11 @@ fn load() {
             "tray_fake_input" => {
                 if let Some(b) = parse_bool(v) {
                     fake_input = b;
+                }
+            }
+            "sys_panel" => {
+                if let Some(b) = parse_bool(v) {
+                    sys_on = b;
                 }
             }
             "weather_text_scale" => {
@@ -2752,6 +2781,7 @@ fn load() {
     AUTOSTART.store(bool_code(auto), Ordering::Relaxed);
     GUARDIAN.store(bool_code(guard_on), Ordering::Relaxed);
     TRAY_FAKE_INPUT.store(bool_code(fake_input), Ordering::Relaxed);
+    SYS_PANEL.store(bool_code(sys_on), Ordering::Relaxed);
     // 新键
     NOTIFY_WECHAT.store(nw, Ordering::Relaxed);
     NOTIFY_TRAY.store(nt, Ordering::Relaxed);

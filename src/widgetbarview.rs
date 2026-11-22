@@ -16,13 +16,17 @@ pub struct BarPainted {
 }
 
 /// 模块条逻辑宽度（与 paint 布局严格一致），乘 scale 得物理像素。
-pub fn bar_width(widgets: &[WidgetItem]) -> f32 {
+/// 文本宽度必须实测：验证码 / "新邮件"长短不一，胶囊要随内容自适应变长。
+/// `soft` 的度量通道与 pass 内部布局逐像素一致；调用前先 `set_scale(scale)`，
+/// 否则 DPI/胶囊大小设置 ≠ 1.0 时量出来的宽度和实际绘制对不上。
+pub fn bar_width(soft: &mut SoftBackend, widgets: &[WidgetItem]) -> f32 {
     if widgets.is_empty() {
         return 0.0;
     }
+    let txt_font = egui::FontId::proportional(cfg::WIDGET_TEXT_SIZE);
     let mut w = 2.0 * cfg::WIDGET_BAR_PAD_X;
     for (i, item) in widgets.iter().enumerate() {
-        // item_w（图标格 + 间距 + 文本）
+        // item_w（图标格 + 间距 + 实测文本宽）
         let mut iw = 0.0;
         if !item.icon.is_empty() {
             iw += cfg::WIDGET_ICON_CELL;
@@ -30,6 +34,7 @@ pub fn bar_width(widgets: &[WidgetItem]) -> f32 {
                 iw += cfg::WIDGET_ICON_GAP;
             }
         }
+        iw += soft.text_width(&item.text, txt_font.clone());
         w += iw;
         w += 2.0 * cfg::WIDGET_PAD_X;
         if i + 1 < widgets.len() {

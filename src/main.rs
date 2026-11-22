@@ -36,6 +36,7 @@ mod settings;
 mod settingsui;
 mod startmenu;
 mod store;
+mod syspanel;
 mod widgetbarview;
 mod theme;
 mod trace;

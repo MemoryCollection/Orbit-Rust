@@ -135,6 +135,8 @@ enum Target {
     Lnk(PathBuf),
     /// 运行中窗口句柄
     Window(HWND),
+    /// 内建「系统控制」按钮（音量/亮度/WiFi/蓝牙，Orbit 图标）
+    SysPanel,
 }
 
 struct DockItem {
@@ -914,6 +916,30 @@ impl Dock {
             });
         }
 
+        // 内建「系统控制」按钮（音量 / 亮度 / WiFi / 蓝牙）：默认隐藏，
+        // 设置页 → Dock 里打开。exe 对齐 powershell.exe——面板在跑时运行项
+        // 去重把它归到这个按钮上，再点就是"切到面板窗口"而不是再开一个。
+        if settings::sys_panel() {
+            let ps_key = crate::syspanel::process_key();
+            pinned_exes.push(ps_key.clone());
+            let wins = groups.get(&ps_key).cloned().unwrap_or_default();
+            let rgba = crate::syspanel::icon(px);
+            if rgba.is_empty() {
+                crate::tlog!("[dock] 内建系统控制按钮取不到图标，跳过");
+            } else {
+                items.push(DockItem {
+                    name: "系统控制".to_string(),
+                    tip: "系统控制（音量 / 亮度 / WiFi / 蓝牙）".to_string(),
+                    norm: String::new(),
+                    exe: ps_key.clone(),
+                    running: !wins.is_empty(),
+                    target: Target::SysPanel,
+                    wins,
+                    rgba,
+                });
+            }
+        }
+
         // 运行中应用（exe / AUMID 去重，已钉选的跳过）
         for (key, hwnd) in &run_map {
             if pinned_exes.iter().any(|p| !p.is_empty() && p == key) {
@@ -973,6 +999,7 @@ impl Dock {
                 let key = match &it.target {
                     Target::Lnk(p) => format!("lnk:{}", p.display()),
                     Target::Window(h) => format!("win:{:?}", h.0 as usize),
+                    Target::SysPanel => "syspanel".to_string(),
                 };
                 (it.name.clone(), key)
             })
@@ -1626,18 +1653,22 @@ impl Dock {
             }
             _ => {}
         }
-        if let Target::Lnk(path) = &item.target {
-            let wide = to_wide(path.as_os_str());
-            unsafe {
-                ShellExecuteW(
-                    HWND::default(),
-                    w!("open"),
-                    PCWSTR(wide.as_ptr()),
-                    PCWSTR::null(),
-                    PCWSTR::null(),
-                    SW_SHOWNORMAL,
-                );
+        match &item.target {
+            Target::Lnk(path) => {
+                let wide = to_wide(path.as_os_str());
+                unsafe {
+                    ShellExecuteW(
+                        HWND::default(),
+                        w!("open"),
+                        PCWSTR(wide.as_ptr()),
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                        SW_SHOWNORMAL,
+                    );
+                }
             }
+            Target::SysPanel => crate::syspanel::launch(),
+            Target::Window(_) => {}
         }
     }
 

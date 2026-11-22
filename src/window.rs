@@ -448,11 +448,14 @@ impl App {
             unsafe {
                 let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, out.w, out.h, SWP_NOACTIVATE);
             }
-            // 分离出去的模块条跟着胶囊贴过去（没有内容的那条自动隐藏）
-            self.sync_bars(&bars);
             // 胶囊宽度/位置变了（换了 widget、改了字号），音乐条跟着重新贴一次
             self.tick_bar();
         }
+        // 分离出去的模块条跟着胶囊贴过去（没有内容的那条自动隐藏）。
+        // 不能放进上面的 changed 分支：邮件模块分离到侧边条时，新邮件只改
+        // 模块条内容、胶囊本体没变（changed=false），不放外面的话侧边条
+        // 要等时钟跳一下才更新，宽度也就一直卡在旧值。
+        self.sync_bars(&bars);
         // 交互事件（widget/闪烁图标的点击与悬停进出）按旧语义分发
         for e in events {
             match e {
