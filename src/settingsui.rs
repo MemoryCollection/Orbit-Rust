@@ -1950,18 +1950,7 @@ impl SettingsApp {
 
     fn detail_dock(&mut self, ui: &mut egui::Ui) {
         section(ui, "Dock");
-        ui.label(
-            egui::RichText::new("Dock 位置、界面透明度和 Dock 大小在「常规设置 → 外观」里调，这里只管托盘与固定图标")
-                .size(11.5)
-                .weak(),
-        );
-        ui.label(
-            egui::RichText::new("Dock 大小会连同 Dock 高度、槽位和托盘图标等比缩放；圆角在「顶部胶囊 → 圆角」里统一调整。")
-                .size(11.5)
-                .weak(),
-        );
 
-        ui.add_space(10.0);
         section(ui, "托盘图标");
         ui.label(
             egui::RichText::new("点一下切换显示 / 隐藏；被隐藏的托盘图标会转发给系统托盘")
