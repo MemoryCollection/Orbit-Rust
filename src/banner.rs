@@ -22,11 +22,12 @@ use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetWindowLongPtrW, GetWindowRect, PostMessageW, RegisterClassW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, GWLP_USERDATA, HMENU,
-    HWND_TOPMOST, HTCLIENT, HTTRANSPARENT, IDC_ARROW, LoadCursorW, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, WM_CREATE, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_TIMER, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WNDCLASSW, WM_APP,
+    CreateWindowExW, DefWindowProcW, FindWindowW, GetWindowLongPtrW, GetWindowRect, PostMessageW,
+    RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW,
+    GWLP_USERDATA, HMENU, HWND_TOPMOST, HTCLIENT, HTTRANSPARENT, IDC_ARROW, LoadCursorW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_CREATE, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST,
+    WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WNDCLASSW, WM_APP,
 };
 
 use crate::config as cfg;
@@ -267,30 +268,24 @@ pub fn show(notice: BannerNotice) {
     }
 }
 
-/// 设置页「横幅大小」滑块的实时预览：弹一张样例卡（不响、4 秒后自动消失；
-/// 继续拖动会原位换成新尺寸，不会堆出一摞卡）。不走通知通道开关——
-/// 通道设成 Windows 通知 / 关也能看到预览。
+/// 设置页「横幅大小」滑块的实时预览入口。
+///
+/// 设置页跑在**独立子进程**里，没有横幅窗口——所以这里只做一件事：按类名找到
+/// 主进程的横幅窗口，把滑条值随消息带过去（`WM_BANNER_PREVIEW`），由主进程
+/// 写入设置内存并弹预览卡。直接在本进程弹卡是弹不出来的（窗口根本不存在）。
 pub fn show_preview() {
-    let notice = BannerNotice {
-        tag: "预览".to_string(),
-        badge: format!("{:.0}%", (settings::banner_scale() * 100.0).round()),
-        main: "横幅大小预览".to_string(),
-        sub: "拖动滑块调整大小，松手后几秒自动消失".to_string(),
-        silent: true,
-        pid: 0,
-        secs: Some(4),
-        flash_key: None,
-        source: "other",
-        preview: true,
-    };
-    let h = hwnd();
-    let raw = Box::into_raw(Box::new(notice));
+    let v = settings::banner_scale_setting();
     unsafe {
-        if h.is_invalid()
-            || PostMessageW(h, WM_BANNER, WPARAM(0), LPARAM(raw as isize)).is_err()
-        {
-            drop(Box::from_raw(raw)); // 窗口还没建好：别泄漏
+        let h = FindWindowW(w!("ORBIT_WECARD"), PCWSTR::null()).unwrap_or_default();
+        if h.is_invalid() {
+            return;
         }
+        let _ = PostMessageW(
+            h,
+            crate::appmsg::WM_BANNER_PREVIEW,
+            WPARAM(0),
+            LPARAM(v.to_bits() as isize),
+        );
     }
 }
 
@@ -433,40 +428,35 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
             WM_BANNER => {
                 if l.0 != 0 {
                     let notice = Box::from_raw(l.0 as *mut BannerNotice);
-                    // 每次弹出都播一次提示音（微信卡片按 wechat_sound 设置可静音）
-                    if !notice.silent {
-                        crate::notify::play_banner();
-                    }
-                    // 闪烁触发的横幅登记为「展示中」，闪烁持续期间不再重复弹
-                    if let Some(key) = notice.flash_key.as_ref() {
-                        if let Ok(mut live) = LIVE_FLASH_CARDS.lock() {
-                            live.insert(key.clone(), ());
-                        }
-                    }
-                    // 预览卡：先摘掉旧的预览卡再入队——滑块拖动时原位换新尺寸，
-                    // 不会越拖堆得越高
-                    if notice.preview {
-                        c.cards.retain(|card| !card.notice.preview);
-                    }
-                    // 新横幅追加到队尾（屏幕下方），旧的留在上面，不替换当前显示内容。
-                    // 停留秒数：模块自己给的优先，否则用该来源的「横幅秒数」（0 = 常驻）
-                    let secs = notice
-                        .secs
-                        .unwrap_or_else(|| settings::banner_secs_for(notice.source));
-                    c.cards.push_back(Card {
-                        notice: *notice,
-                        at: Instant::now(),
-                        ms: (secs as u128).saturating_mul(1000),
-                    });
-                    while c.cards.len() > MAX_CARDS {
-                        if let Some(dropped) = c.cards.pop_front() {
-                            c.unregister(dropped.flash_key());
-                        }
-                    }
-                    c.hovered = false;
-                    c.place(h);
-                    c.render(h);
-                    let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+                    c.accept(h, *notice);
+                }
+                LRESULT(0)
+            }
+            // 设置页子进程发来的「横幅大小」预览请求（lParam = 滑条原始值 f32 bits）。
+            // 子进程没有横幅窗口，预览必须由主进程画；先把缩放写进本进程的设置内存
+            // （子进程的 preview 只改它自己的内存，主进程本来就看不到），再弹预览卡
+            m if m == crate::appmsg::WM_BANNER_PREVIEW => {
+                let v = f32::from_bits(l.0 as u32);
+                if v.is_finite()
+                    && v >= settings::BANNER_SCALE_MIN
+                    && v <= settings::BANNER_SCALE_MAX
+                {
+                    settings::preview_banner_scale(v);
+                    c.accept(
+                        h,
+                        BannerNotice {
+                            tag: "预览".to_string(),
+                            badge: format!("{:.0}%", (settings::banner_scale_setting() * 100.0).round()),
+                            main: "横幅大小预览".to_string(),
+                            sub: "拖动滑块调整大小，松手后几秒自动消失".to_string(),
+                            silent: true,
+                            pid: 0,
+                            secs: Some(4),
+                            flash_key: None,
+                            source: "other",
+                            preview: true,
+                        },
+                    );
                 }
                 LRESULT(0)
             }
@@ -615,6 +605,45 @@ fn inside_round(x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
 }
 
 impl Banner {
+    /// 接收一条横幅：响提示音、登记闪烁、预览卡原位替换，然后入队重排显示。
+    /// `WM_BANNER`（真实横幅）与 `WM_BANNER_PREVIEW`（设置页预览）共用。
+    fn accept(&mut self, h: HWND, notice: BannerNotice) {
+        // 每次弹出都播一次提示音（微信卡片按 wechat_sound 设置可静音）
+        if !notice.silent {
+            crate::notify::play_banner();
+        }
+        // 闪烁触发的横幅登记为「展示中」，闪烁持续期间不再重复弹
+        if let Some(key) = notice.flash_key.as_ref() {
+            if let Ok(mut live) = LIVE_FLASH_CARDS.lock() {
+                live.insert(key.clone(), ());
+            }
+        }
+        // 预览卡：先摘掉旧的预览卡再入队——滑块拖动时原位换新尺寸，
+        // 不会越拖堆得越高
+        if notice.preview {
+            self.cards.retain(|card| !card.notice.preview);
+        }
+        // 新横幅追加到队尾（屏幕下方），旧的留在上面，不替换当前显示内容。
+        // 停留秒数：模块自己给的优先，否则用该来源的「横幅秒数」（0 = 常驻）
+        let secs = notice
+            .secs
+            .unwrap_or_else(|| settings::banner_secs_for(notice.source));
+        self.cards.push_back(Card {
+            notice,
+            at: Instant::now(),
+            ms: (secs as u128).saturating_mul(1000),
+        });
+        while self.cards.len() > MAX_CARDS {
+            if let Some(dropped) = self.cards.pop_front() {
+                self.unregister(dropped.flash_key());
+            }
+        }
+        self.hovered = false;
+        self.place(h);
+        self.render(h);
+        let _ = unsafe { ShowWindow(h, SW_SHOWNOACTIVATE) };
+    }
+
     /// 从「展示中」登记里摘掉一条闪烁横幅（横幅被收起/点掉/到期时调用）
     fn unregister(&self, key: Option<&str>) {
         if let Some(k) = key {

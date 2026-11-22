@@ -20,6 +20,10 @@ pub const WM_SETTINGS_APPLIED: u32 = WM_APP + 0x72;
 /// 跨进程投递到胶囊窗口，主进程收到后走正常抓取流程。
 pub const WM_GRAB_UIA: u32 = WM_APP + 0x73;
 
+/// 设置页（独立子进程）发来的横幅大小预览请求：lParam = 滑条原始值 f32 bits。
+/// 跨进程投递到横幅窗口（ORBIT_WECARD），主进程收到后写入设置内存并弹预览卡。
+pub const WM_BANNER_PREVIEW: u32 = WM_APP + 0x74;
+
 /// 胶囊主窗口 HWND（raw isize 存，避免跨线程持有 HWND）
 static PILL_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Dock 窗口 HWND
