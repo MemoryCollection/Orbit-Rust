@@ -63,7 +63,8 @@ pub struct View<'a> {
     /// 托盘闪烁图标（排在最右）
     pub flash: &'a [FlashView<'a>],
     pub shape: PillShape,
-    /// 整体透明度 0..1（烘焙由 window.rs 做，这里只参与变化检测）
+    /// 界面透明度 0..1（真正乘像素在上屏前 `render::premultiplied_rgba_to_bgra`，
+    /// 这里只参与变化检测：滑条一动就得重画）
     pub alpha: f32,
 }
 
@@ -163,7 +164,7 @@ impl PillUi {
         let (ew, eh) = ear_size(cfg::PILL_H);
         let ear = match v.shape {
             PillShape::Float => 0.0,
-            PillShape::Island | PillShape::Bottom => ew,
+            PillShape::Island => ew,
         };
 
         let w = ((total + 2.0 * ear) * scale).ceil() as i32;
@@ -199,9 +200,8 @@ impl PillUi {
                             );
                             glass_board(&p, bg_rect, egui::CornerRadius::same(rb.round() as u8));
                         }
-                        // 吸顶 / 吸底：耳朵 + 条身一条剪影填充（拼两块会露接缝）
+                        // 吸顶刘海：耳朵 + 条身一条剪影填充（拼两块会露接缝）
                         PillShape::Island => island_board(&p, fw, fh, ew, eh, rb, true),
-                        PillShape::Bottom => island_board(&p, fw, fh, ew, eh, rb, false),
                     }
 
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {

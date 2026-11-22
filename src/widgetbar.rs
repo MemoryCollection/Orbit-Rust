@@ -72,8 +72,6 @@ thread_local! {
     /// 当前悬停的 widget 下标（-1 = 没有）
     static HOVER: [Cell<isize>; BARS] = [const { Cell::new(-1) }; BARS];
     static SCALE: [Cell<f32>; BARS] = [const { Cell::new(1.0) }; BARS];
-    /// 该条的透明度（与胶囊一致）
-    static ALPHA: [Cell<f32>; BARS] = [const { Cell::new(1.0) }; BARS];
     /// 条的屏幕矩形（隐藏时宽高为 0）
     static RECT: [Cell<(i32, i32, i32, i32)>; BARS] =
         [const { Cell::new((0, 0, 0, 0)) }; BARS];
@@ -87,7 +85,7 @@ thread_local! {
 }
 
 /// 用第 i 条窗口的 egui 后端画一帧，并把预乘 RGBA 上屏。
-/// 返回 widget 命中矩形（物理像素）。透明度烘焙在这里统一做。
+/// 返回 widget 命中矩形（物理像素）。界面透明度只作用在板面底色上（`cfg::ui_bg_effective`）。
 fn draw_bar(i: usize, hw: HWND, w: i32, h: i32, scale: f32, widgets: &[WidgetItem], hovered: Option<usize>) -> Vec<[f32; 4]> {
     VIEW.with(|c| {
         let mut slot = c[i].borrow_mut();
@@ -97,16 +95,8 @@ fn draw_bar(i: usize, hw: HWND, w: i32, h: i32, scale: f32, widgets: &[WidgetIte
         let soft = slot.as_mut().unwrap();
         let out = crate::widgetbarview::paint(soft, w, h, scale, widgets, hovered);
         if !out.rgba.is_empty() {
-            let mut rgba = out.rgba;
-            let alpha = ALPHA.with(|a| a[i].get());
-            if alpha < 0.999 {
-                let k = alpha.clamp(0.0, 1.0);
-                for j in (3..rgba.len()).step_by(4) {
-                    rgba[j] = ((rgba[j] as f32) * k).round() as u8;
-                }
-            }
-            // egui 软件后端输出已是预乘 RGBA，直接换 BGRA 上屏
-            let bgra = render::premultiplied_rgba_to_bgra(&rgba);
+            // egui 软件后端输出已是预乘 RGBA；透明度已在画底色时按滑条压过 alpha
+            let bgra = render::premultiplied_rgba_to_bgra(&out.rgba);
             render::present(hw, &bgra, w, h);
         }
         out.rects
@@ -336,7 +326,6 @@ fn show(
     let hovered = HOVER.with(|c| c[i].get());
 
     SCALE.with(|c| c[i].set(scale));
-    ALPHA.with(|c| c[i].set(alpha));
     ITEMS.with(|c| *c[i].borrow_mut() = items.to_vec());
     RECT.with(|c| c[i].set(rect));
     KEY.with(|c| c[i].set((side.idx() as u8 + 1, slot)));

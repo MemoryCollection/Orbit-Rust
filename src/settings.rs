@@ -10,9 +10,12 @@
 //! - `module_order`       顶部胶囊模块的排列（拖动排序写回）：`weather,mail,clipboard`
 //! - `weather_mode` / `mail_mode` / `clipboard_mode`
 //!   模块摆哪：`pill`（留在胶囊里）/ `left`（分离到胶囊左侧一条）/ `right` / `off`（隐藏）
-//! - `pill_alpha`         胶囊（含分离模块条）整体透明度 0.2 ~ 1.0，默认 1.0。
-//!                         拉到 100% 时底色**强制实底**（半透明主题也变不透明），
-//!                         见 `config::pill_bg_effective`
+//! - `alpha`              **界面透明度**（统一一个值，0.2 ~ 1.0，默认 1.0）：胶囊（含分离
+//!                         模块条 / 音乐条）/ Dock / 展开面板 / 开始菜单 / 横幅一起调，
+//!                         天气卡片不受影响。**只调板面底色的 alpha，文字和图标不参与**：
+//!                         拉到 100% 底色完全不透明，拉低只让背景透出桌面，
+//!                         见 `config::bg_alpha` / `config::ui_bg_effective`。
+//!                         老版本的 `pill_alpha` / `dock_alpha` 仍会被读取并合并成这一条。
 //! - `pill_scale`         胶囊（含模块条 / 音乐条）整体大小 0.8 ~ 1.35，默认 1.0。
 //!                         1.0 = 滑条 100%，实际倍率是"老的基准 × 0.85"
 //! - `icon_scale`         Dock 图标（连同 Dock 高度与托盘图标）大小 0.8 ~ 1.35，默认 1.0。
@@ -25,7 +28,8 @@
 //!                         老版本的 `glass`/`liquid`/`mica`/`paper`/`neon`/`terminal`
 //!                         会被 `legacy_theme_key` 就近映射到新 key
 //! - `pill_anchor`        胶囊位置/形状：`float`（悬浮顶部，默认）/ `island`（吸顶刘海，
-//!                          贴屏幕顶、顶边两角张开成"耳"）/ `bottom`（吸底，底部对称处理）
+//!                          贴屏幕顶、顶边两角张开成"耳"）。老值 `bottom`（吸底）已取消，
+//!                          读到就按 `float` 处理
 //! - `dock_anchor`        底部 Dock 位置：`bottom`（默认）/ `top` / `left` / `right`
 //! - `weather_source`     天气数据源：`amap`（高德，默认）/ `open_meteo`
 //! - `amap_key`           高德 Web 服务 key（空 = 回落编译期默认）
@@ -74,7 +78,9 @@ pub const CORNER_MIN: f32 = 0.0;
 pub const CORNER_MAX: f32 = 22.0;
 /// 圆角半径默认值：圆角矩形（不是胶囊）
 const CORNER_DEFAULT: f32 = 14.0;
-/// 胶囊透明度上下限（再低就看不清了）；滑条量程直接用这两个值
+/// 界面透明度上下限（再低就看不清了）；滑条量程直接用这两个值。
+/// 一个值管所有 Orbit 界面（天气卡片除外）：胶囊 / 模块条 / 音乐条 / Dock /
+/// 展开面板 / 开始菜单 / 横幅。
 pub const ALPHA_MIN: f32 = 0.2;
 pub const ALPHA_MAX: f32 = 1.0;
 /// 胶囊（含模块条 / 音乐条）整体缩放上下限。1.0 = 基准尺寸。
@@ -111,8 +117,8 @@ static MAIL_MODE: AtomicU32 = AtomicU32::new(UNLOADED);
 static CLIPBOARD_MODE: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 时钟格式串
 static CLOCK_FORMAT: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
-/// 胶囊透明度（f32 位型）/ 锚位编码 / Dock 锚位编码
-static PILL_ALPHA: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 界面透明度（f32 位型，0.2 ~ 1.0；胶囊 / Dock / 面板 / 开始菜单 / 横幅共用）
+static UI_ALPHA: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 胶囊缩放 / Dock 图标缩放（f32 位型）
 static PILL_SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
 static ICON_SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
@@ -148,7 +154,8 @@ static HIDE_TRAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// `None` = 用户还没在设置页改过 → 由 dock 回落到系统任务栏的钉选
 static DOCK_PINS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 /// 开始菜单快捷方式（(名称, 程序路径)，按顺序显示）。
-/// `None` = 用户还没在设置页改过 → 默认只有「命令提示符 (cmd)」
+/// `None` = 用户还没在设置页改过 → 默认只有「命令提示符 (cmd)」。
+/// 设置页的「快速添加 → 任务管理器」（`taskmgr_path`）也是往这里 push 一条。
 static START_PINS: Mutex<Option<Vec<(String, String)>>> = Mutex::new(None);
 /// 开机启动（0 = 未加载，1 = 关，2 = 开；注册表 HKCU Run 键，见 guard.rs）
 static AUTOSTART: AtomicU32 = AtomicU32::new(UNLOADED);
@@ -174,6 +181,8 @@ static BANNER_TRAY_SECS: AtomicU32 = AtomicU32::new(UNLOADED);
 static BANNER_CLIPBOARD_SECS: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 提示音模式：0 = 关，1 = 单次，2 = 循环 2 次，3 = 循环 3 次，4 = 直到消息消失。见 `SoundMode`
 static SOUND_MODE: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 接管 Windows 通知中心（0 = 未加载/关，2 = 开；默认关）
+static NOTIFY_TAKEOVER: AtomicU32 = AtomicU32::new(UNLOADED);
 
 // ---------- 邮件多账号 ----------
 /// 多账号列表：每个账号 `host|port|user|pass`，账号间用 `;` 分隔。
@@ -185,8 +194,6 @@ static MAIL_VERIFIED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 // ---------- 剪切板 / Dock / 开始菜单 ----------
 /// 剪切板模块常驻置顶文字（在面板顶部固定显示一条）
 static CLIPBOARD_PINNED_TEXT: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
-/// Dock 透明度（f32 位型，0.2 ~ 1.0，独立于胶囊）
-static DOCK_ALPHA: AtomicU32 = AtomicU32::new(UNLOADED);
 /// Win 键接管开始菜单（0 = 未加载，1 = 关，2 = 开，默认开）
 static START_HOOK: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 开始菜单每行快捷方式数量（1 ~ 8，默认 4）
@@ -464,10 +471,12 @@ pub fn set_module_mode(name: &str, m: ModuleMode) {
     bump();
 }
 
-// ---------- 胶囊 ----------
+// ---------- 界面透明度 ----------
 
-pub fn pill_alpha() -> f32 {
-    match PILL_ALPHA.load(Ordering::Relaxed) {
+/// 界面透明度（0.2 ~ 1.0，默认 1.0）：一个值管所有 Orbit 界面——胶囊（含分离
+/// 模块条 / 音乐条）/ Dock / 展开面板 / 开始菜单 / 横幅；天气卡片不受影响。
+pub fn ui_alpha() -> f32 {
+    match UI_ALPHA.load(Ordering::Relaxed) {
         UNLOADED => 1.0,
         bits => f32::from_bits(bits),
     }
@@ -476,18 +485,18 @@ pub fn pill_alpha() -> f32 {
 /// 拖动滑条时的**即时预览**：只改内存 + 通知重绘，不写盘。
 ///
 /// 滑条每移一点就 `save()` 会不停重写 settings.txt（还要跟主线程的文件监视打架），
-/// 所以拖动过程只走这里，松手时再 `persist_pill_alpha()` 落盘。
-pub fn preview_pill_alpha(v: f32) {
+/// 所以拖动过程只走这里，松手时再 `persist_ui_alpha()` 落盘。
+pub fn preview_ui_alpha(v: f32) {
     let v = v.clamp(ALPHA_MIN, ALPHA_MAX);
-    if (v - pill_alpha()).abs() < 1e-4 {
+    if (v - ui_alpha()).abs() < 1e-4 {
         return;
     }
-    PILL_ALPHA.store(v.to_bits(), Ordering::Relaxed);
+    UI_ALPHA.store(v.to_bits(), Ordering::Relaxed);
     bump();
 }
 
 /// 把当前透明度落盘（滑条松手 / 键盘微调后调用）
-pub fn persist_pill_alpha() {
+pub fn persist_ui_alpha() {
     save();
     bump();
 }
@@ -607,8 +616,6 @@ pub enum PillAnchor {
     Float,
     /// 吸顶刘海：贴屏幕顶，顶部两角方形
     Island,
-    /// 吸底：贴屏幕底，底部两角方形
-    Bottom,
 }
 
 impl PillAnchor {
@@ -616,15 +623,13 @@ impl PillAnchor {
         match self {
             PillAnchor::Float => 1,
             PillAnchor::Island => 2,
-            PillAnchor::Bottom => 3,
         }
     }
 
     fn from_code(c: u32) -> Self {
         match c {
             2 => PillAnchor::Island,
-            3 => PillAnchor::Bottom,
-            _ => PillAnchor::Float,
+            _ => PillAnchor::Float, // 老值 3 = 吸底，已取消
         }
     }
 
@@ -632,7 +637,8 @@ impl PillAnchor {
         match s.trim().to_lowercase().as_str() {
             "float" | "free" | "悬浮" | "浮动" => Some(PillAnchor::Float),
             "island" | "notch" | "刘海" | "吸顶" => Some(PillAnchor::Island),
-            "bottom" | "吸底" | "底部" => Some(PillAnchor::Bottom),
+            // 老配置里的「吸底」：形状已取消，按悬浮处理（不让整条设置失效）
+            "bottom" | "吸底" | "底部" => Some(PillAnchor::Float),
             _ => None,
         }
     }
@@ -641,7 +647,6 @@ impl PillAnchor {
         match self {
             PillAnchor::Float => "float",
             PillAnchor::Island => "island",
-            PillAnchor::Bottom => "bottom",
         }
     }
 }
@@ -1339,6 +1344,28 @@ pub fn set_start_pins(list: Vec<(String, String)>) {
     }
 }
 
+/// 任务管理器 exe 的完整路径（设置页「快速添加 → 任务管理器」用）。
+///
+/// 系统里没有「任务管理器」的开始菜单快捷方式，想加到 Orbit 开始菜单只能自己填路径。
+/// 32 位进程看到的 `System32` 会被重定向到 `SysWOW64`（那里没有 Taskmgr.exe），
+/// 所以再退一步试 `Sysnative`；都找不到就返回 `None`，设置页据此禁用入口。
+pub fn taskmgr_path() -> Option<PathBuf> {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+    ["System32", "Sysnative"]
+        .iter()
+        .map(|sub| PathBuf::from(&windir).join(sub).join("Taskmgr.exe"))
+        .find(|p| p.is_file())
+}
+
+/// 开始菜单快捷方式最多显示几行（每行数量可配，行数固定两行）
+pub const START_MAX_ROWS: usize = 2;
+
+/// 开始菜单最多能显示几条快捷方式（每行数量 × 2 行）。
+/// 设置页按这个上限禁用「添加」，`startmenu::max_tiles` 也走这里，两边不会算岔。
+pub fn start_max_pins() -> usize {
+    start_cols() * START_MAX_ROWS
+}
+
 /// 开机启动（写注册表 HKCU\...\Run；注册表的实际增删见 guard.rs，
 /// 启动时 sync_autostart() 会按这里的值对齐注册表）
 pub fn autostart() -> bool {
@@ -1502,6 +1529,25 @@ pub fn notify_channel_for(src: &str) -> NotifyChannel {
     }
 }
 
+// ---------- 接管系统通知（通知中心）----------
+
+/// 接管 Windows 通知中心：开着时 `notifycenter` 线程监听全系统 Toast，
+/// 改在 Orbit 横幅里展示，并从通知中心撤掉（见 `notifycenter.rs`）。
+pub fn notify_takeover() -> bool {
+    match NOTIFY_TAKEOVER.load(Ordering::Relaxed) {
+        UNLOADED => false,
+        c => c == 2,
+    }
+}
+pub fn set_notify_takeover(on: bool) {
+    if notify_takeover() == on {
+        return;
+    }
+    NOTIFY_TAKEOVER.store(bool_code(on), Ordering::Relaxed);
+    save();
+    bump();
+}
+
 // ---------- 提示音模式 ----------
 
 pub fn sound_mode() -> SoundMode {
@@ -1603,21 +1649,6 @@ pub fn set_clipboard_pinned_text(s: String) {
         })
         .unwrap_or(false);
     if changed { save(); bump(); }
-}
-
-// ---------- Dock 透明度 ----------
-
-pub fn dock_alpha() -> f32 {
-    match DOCK_ALPHA.load(Ordering::Relaxed) {
-        UNLOADED => 1.0,
-        v => f32::from_bits(v).clamp(ALPHA_MIN, ALPHA_MAX),
-    }
-}
-pub fn set_dock_alpha(v: f32) {
-    let v = v.clamp(ALPHA_MIN, ALPHA_MAX);
-    if (dock_alpha() - v).abs() < 1e-4 { return; }
-    DOCK_ALPHA.store(v.to_bits(), Ordering::Relaxed);
-    save(); bump();
 }
 
 // ---------- 开始菜单：Win 键接管 / 每行列数 ----------
@@ -1727,7 +1758,7 @@ fn save() {
         ("weather_mode", mode("weather")),
         ("mail_mode", mode("mail")),
         ("clipboard_mode", mode("clipboard")),
-        ("pill_alpha", trim_num(pill_alpha())),
+        ("alpha", trim_num(ui_alpha())),
         ("pill_scale", trim_num(pill_scale_raw())),
         ("icon_scale", trim_num(icon_scale_raw())),
         ("corner_radius", trim_num(corner_radius())),
@@ -1776,12 +1807,13 @@ fn save() {
     vals.push(("banner_tray_secs", banner_secs_tray().to_string()));
     vals.push(("banner_clipboard_secs", banner_secs_clipboard().to_string()));
     vals.push(("sound_mode", sound_mode().as_str().to_string()));
+    // 接管系统通知中心
+    vals.push(("notify_takeover", on_off(notify_takeover()).to_string()));
     // 邮件多账号（`;` 分隔账号，每个 `host|port|user|pass`）
     let accounts: Vec<String> = mail_accounts().iter().map(|a| a.encode()).collect();
     vals.push(("mail_accounts", accounts.join(";")));
     vals.push(("mail_verified", mail_verified().join(";")));
     vals.push(("clipboard_pinned", clipboard_pinned_text()));
-    vals.push(("dock_alpha", trim_num(dock_alpha())));
     vals.push(("start_hook", on_off(start_hook()).to_string()));
     vals.push(("start_cols", start_cols().to_string()));
     let overs: Vec<String> = icon_overrides()
@@ -1880,7 +1912,7 @@ struct Snap {
     weather_mode: ModuleMode,
     mail_mode: ModuleMode,
     clipboard_mode: ModuleMode,
-    pill_alpha: f32,
+    alpha: f32,
     pill_scale: f32,
     icon_scale: f32,
     theme: usize,
@@ -1910,10 +1942,10 @@ struct Snap {
     banner_tray_secs: u32,
     banner_clipboard_secs: u32,
     sound_mode: SoundMode,
+    notify_takeover: bool,
     mail_accounts: Vec<MailAccount>,
     mail_verified: Vec<String>,
     clipboard_pinned: String,
-    dock_alpha: f32,
     start_hook: bool,
     start_cols: usize,
 }
@@ -1925,7 +1957,7 @@ fn snapshot() -> Snap {
         weather_mode: module_mode("weather"),
         mail_mode: module_mode("mail"),
         clipboard_mode: module_mode("clipboard"),
-        pill_alpha: pill_alpha(),
+        alpha: ui_alpha(),
         pill_scale: pill_scale(),
         icon_scale: icon_scale(),
         theme: crate::theme::index(),
@@ -1955,10 +1987,10 @@ fn snapshot() -> Snap {
         banner_tray_secs: banner_secs_tray(),
         banner_clipboard_secs: banner_secs_clipboard(),
         sound_mode: sound_mode(),
+        notify_takeover: notify_takeover(),
         mail_accounts: mail_accounts(),
         mail_verified: mail_verified(),
         clipboard_pinned: clipboard_pinned_text(),
-        dock_alpha: dock_alpha(),
         start_hook: start_hook(),
         start_cols: start_cols(),
     }
@@ -2054,8 +2086,9 @@ module_order=weather,mail,clipboard
 weather_mode=left
 mail_mode=right
 clipboard_mode=right
-# 胶囊透明度（0.2 ~ 1.0，含分离出去的模块条）
-pill_alpha=1.0
+# 界面透明度（0.2 ~ 1.0）：胶囊（含分离模块条 / 音乐条）/ Dock / 展开面板 /
+# 开始菜单 / 横幅一起调，天气卡片不受影响；100% 时底色强制实底
+alpha=1.0
 # 胶囊整体大小 / Dock 图标大小（1.0 = 滑条 100%，0.8 ~ 1.35；设置页里有滑条和「重置」）
 pill_scale=1
 icon_scale=1
@@ -2065,7 +2098,7 @@ corner_radius=14
 # 外观主题（每套都有深色 + 浅色）：calm_light/calm_dark（平静极简）/
 # glass2_light/glass2_dark（玻璃拟态 2.0）/ m3_light/m3_dark（Material 3）
 theme=calm_light
-# 胶囊位置形状：float（悬浮顶部，默认）/ island（吸顶刘海）/ bottom（吸底）
+# 胶囊位置形状：float（悬浮顶部，默认）/ island（吸顶刘海）
 pill_anchor=float
 # Dock 靠屏幕哪条边：bottom（默认）/ top / left / right
 dock_anchor=bottom
@@ -2124,6 +2157,9 @@ banner_clipboard_secs=6
 # 提示音模式：off=关 / once=单次 / twice=循环2次 / thrice=循环3次 / until=直到消息消失
 # （旧的 wechat_sound 仅作兼容，提示音实际由 sound_mode 决定）
 sound_mode=once
+# 接管 Windows 通知中心（1 = 开）：系统通知改在 Orbit 横幅里显示，并从通知中心撤掉；
+# 首次开启会向系统申请「通知监听」授权（未打包 exe 可能被拒，被拒时只在日志里提示）
+notify_takeover=0
 # ===== 邮件多账号（同时监听）=====
 # 每个账号 host|port|user|pass，账号间用 ; 分隔；非空时优先于上面的 imap_* 单账号
 mail_accounts=
@@ -2132,8 +2168,6 @@ mail_verified=
 # ===== 剪切板 =====
 # 剪切板面板常驻置顶文字（固定显示一条）
 clipboard_pinned=
-# Dock 透明度（0.2 ~ 1.0，独立于胶囊）
-dock_alpha=1.0
 # ===== 开始菜单 =====
 # Win 键接管开始菜单（1 = 接管，默认；0 = 交还系统）
 start_hook=1
@@ -2156,11 +2190,25 @@ fn append_missing() {
     let p = path();
     let Ok(raw) = std::fs::read_to_string(&p) else { return };
     let mut add = String::new();
+    // 键是否已存在按行首 `key=` 判断：不能用 `raw.contains(key)`——新键 `alpha` 是
+    // 老键 `pill_alpha` / `dock_alpha` 的子串，contains 会误判成"已经有这个键"
+    let has = |k: &str| {
+        let pat = format!("{k}=");
+        raw.lines().any(|l| l.trim_start().starts_with(pat.as_str()))
+    };
+    // `alpha` 这个新键要特殊对待：老文件里只有 pill_alpha / dock_alpha，而 load 里
+    // 新键优先——补一行 `alpha=1.0` 会把两个旧值迁移出来的结果整个盖掉。
+    // 只要文件里还有老键，就不补 alpha（等 save() 改写时再落键）。
+    let legacy_alpha = has("pill_alpha") || has("dock_alpha");
     for (key, line) in [
         ("clock_format", "# 顶部胶囊时钟格式串（strftime 风格，占位符见 docs）\nclock_format=%H:%M %m月%d日 %a\n"),
         ("module_order", "# 顶部胶囊模块排列（拖动排序写回）\nmodule_order=weather,mail,clipboard\n"),
         ("weather_mode", "# 模块摆哪：pill / left / right / off\nweather_mode=left\nmail_mode=right\nclipboard_mode=right\n"),
-        ("pill_alpha", "# 胶囊透明度（0.2 ~ 1.0）\npill_alpha=1.0\n"),
+        (
+            "alpha",
+            "# 界面透明度（0.2 ~ 1.0）：胶囊 / 模块条 / 音乐条 / Dock / 面板 / 开始菜单 / 横幅共用\n\
+             # 天气卡片不受影响；100% 时底色强制实底。老键 pill_alpha / dock_alpha 仍兼容读取\nalpha=1.0\n",
+        ),
         (
             "pill_scale",
             "# 胶囊 / Dock 图标大小（1.0 = 滑条 100%，0.8 ~ 1.35；设置页有滑条和「重置」）\n\
@@ -2176,7 +2224,7 @@ fn append_missing() {
             "# 外观主题：calm_light/calm_dark（平静极简）/ glass2_light/glass2_dark（玻璃 2.0）\n\
              # m3_light/m3_dark（Material 3）；设置页里点色块切换\ntheme=calm_light\n",
         ),
-        ("pill_anchor", "# 胶囊位置形状：float / island（吸顶刘海）/ bottom（吸底）\npill_anchor=float\n"),
+        ("pill_anchor", "# 胶囊位置形状：float / island（吸顶刘海）\npill_anchor=float\n"),
         ("dock_anchor", "# Dock 靠屏幕哪条边：bottom / top / left / right\ndock_anchor=bottom\n"),
         ("weather_source", "# 天气数据源：amap / open_meteo\nweather_source=amap\namap_key=\n"),
         ("imap_host", "# 邮箱 IMAP 账号（留空回落 data/mail.txt）\nimap_host=\nimap_port=\nimap_user=\nimap_pass=\n"),
@@ -2213,7 +2261,8 @@ fn append_missing() {
         ),
         (
             "sound_mode",
-            "# 提示音模式：off / once / twice / thrice / until（直到消息消失）\nsound_mode=once\n",
+            "# 提示音模式：off / once / twice / thrice / until（直到消息消失）\nsound_mode=once\n\
+             # 接管 Windows 通知中心（1 = 开）\nnotify_takeover=0\n",
         ),
         (
             "mail_accounts",
@@ -2221,14 +2270,13 @@ fn append_missing() {
              mail_accounts=\nmail_verified=\n",
         ),
         ("clipboard_pinned", "# 剪切板面板常驻置顶文字\nclipboard_pinned=\n"),
-        ("dock_alpha", "# Dock 透明度（0.2 ~ 1.0，独立于胶囊）\ndock_alpha=1.0\n"),
         (
             "start_hook",
             "# 开始菜单：Win 键接管（1 = 接管，默认）/ 每行个数（1 ~ 8）\n\
              start_hook=1\nstart_cols=4\n",
         ),
     ] {
-        if !raw.contains(key) {
+        if !has(key) && !(key == "alpha" && legacy_alpha) {
             add.push_str(line);
         }
     }
@@ -2269,7 +2317,9 @@ fn load() {
     let mut auto = true;
     let mut guard_on = true;
     let mut fake_input = cfg::TRAY_FAKE_INPUT;
-    let mut alpha = 1.0f32;
+    // 新键 `alpha` 优先；老键 pill_alpha / dock_alpha 只作迁移兜底
+    let mut alpha_new: Option<f32> = None;
+    let mut alpha_legacy = 1.0f32;
     let mut pscale = 1.0f32;
     let mut iscale = 1.0f32;
     let mut corner = CORNER_DEFAULT;
@@ -2296,8 +2346,8 @@ fn load() {
     let mut mail_accs: Vec<MailAccount> = Vec::new();
     let mut mail_ver: Vec<String> = Vec::new();
     let mut clip_pin = String::new();
-    let mut dalpha = 1.0f32;
     let mut shook = true;
+    let mut takeover = false;
     let mut scols = 4usize;
     for line in raw.lines() {
         let line = line.trim();
@@ -2332,9 +2382,17 @@ fn load() {
                     modes.push((k.trim_end_matches("_pos").to_string(), m, w));
                 }
             }
-            "pill_alpha" => {
+            "alpha" => {
                 if let Some(n) = parse_num(v) {
-                    alpha = n.clamp(ALPHA_MIN, ALPHA_MAX);
+                    alpha_new = Some(n.clamp(ALPHA_MIN, ALPHA_MAX));
+                }
+            }
+            // 老键：合并成一个界面透明度（胶囊/模块条取 pill_alpha，Dock 取 dock_alpha，
+            // 两个都有时取最小值，免得升级后某块界面突然变实）
+            "pill_alpha" | "dock_alpha" => {
+                if let Some(n) = parse_num(v) {
+                    let n = n.clamp(ALPHA_MIN, ALPHA_MAX);
+                    alpha_legacy = alpha_legacy.min(n);
                 }
             }
             "pill_scale" => {
@@ -2484,6 +2542,9 @@ fn load() {
             "sound_mode" => {
                 if let Some(m) = SoundMode::parse(v) { sm = m.code(); }
             }
+            "notify_takeover" => {
+                if let Some(b) = parse_bool(v) { takeover = b; }
+            }
             "mail_accounts" => {
                 mail_accs = v.split(';').filter_map(MailAccount::parse).collect();
             }
@@ -2495,9 +2556,6 @@ fn load() {
                     .collect();
             }
             "clipboard_pinned" => clip_pin = v.to_string(),
-            "dock_alpha" => {
-                if let Some(n) = parse_num(v) { dalpha = n.clamp(ALPHA_MIN, ALPHA_MAX); }
-            }
             "start_hook" => {
                 if let Some(b) = parse_bool(v) { shook = b; }
             }
@@ -2566,7 +2624,8 @@ fn load() {
     if let Ok(mut v) = MODULE_ORDER.lock() {
         *v = order;
     }
-    PILL_ALPHA.store(alpha.to_bits(), Ordering::Relaxed);
+    let alpha = alpha_new.unwrap_or(alpha_legacy);
+    UI_ALPHA.store(alpha.to_bits(), Ordering::Relaxed);
     PILL_SCALE.store(pscale.to_bits(), Ordering::Relaxed);
     ICON_SCALE.store(iscale.to_bits(), Ordering::Relaxed);
     CORNER.store(corner.to_bits(), Ordering::Relaxed);
@@ -2640,10 +2699,10 @@ fn load() {
     BANNER_TRAY_SECS.store(bt + 1, Ordering::Relaxed);
     BANNER_CLIPBOARD_SECS.store(bc + 1, Ordering::Relaxed);
     SOUND_MODE.store(sm, Ordering::Relaxed);
+    NOTIFY_TAKEOVER.store(bool_code(takeover), Ordering::Relaxed);
     if let Ok(mut v) = MAIL_ACCOUNTS.lock() { *v = mail_accs; }
     if let Ok(mut v) = MAIL_VERIFIED.lock() { *v = mail_ver; }
     if let Ok(mut v) = CLIPBOARD_PINNED_TEXT.lock() { *v = clip_pin; }
-    DOCK_ALPHA.store(dalpha.to_bits(), Ordering::Relaxed);
     START_HOOK.store(bool_code(shook), Ordering::Relaxed);
     START_COLS.store(scols as u32, Ordering::Relaxed);
 }
@@ -2705,6 +2764,9 @@ mod tests {
         assert_eq!(LyricPos::parse(" 下方 "), Some(LyricPos::Bottom));
         assert_eq!(LyricPos::parse("middle"), None);
         assert_eq!(PillAnchor::parse("刘海"), Some(PillAnchor::Island));
+        // 老配置里的「吸底」已取消：读到就当悬浮，别让整条设置失效
+        assert_eq!(PillAnchor::parse("吸底"), Some(PillAnchor::Float));
+        assert_eq!(PillAnchor::parse("bottom"), Some(PillAnchor::Float));
         assert_eq!(DockAnchor::parse("TOP"), Some(DockAnchor::Top));
         assert_eq!(DockAnchor::parse("右侧"), Some(DockAnchor::Right));
         assert_eq!(ModuleMode::parse("隐藏"), Some(ModuleMode::Off));
@@ -2717,6 +2779,7 @@ mod tests {
         assert_eq!(LyricPos::from_code(99), LyricPos::Right);
         assert_eq!(DockAnchor::from_code(9), DockAnchor::Bottom);
         assert_eq!(PillAnchor::from_code(9), PillAnchor::Float);
+        assert_eq!(PillAnchor::from_code(3), PillAnchor::Float); // 老值 3 = 吸底
         assert_eq!(ModuleMode::from_code(9), ModuleMode::Pill);
     }
 

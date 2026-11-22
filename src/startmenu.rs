@@ -73,10 +73,9 @@ const PAD: f32 = 16.0;
 const TILE: f32 = 88.0;
 /// 格子间距
 const TILE_GAP: f32 = 12.0;
-/// 最多显示行数（每行数量 × 2）
-const MAX_ROWS: usize = 2;
+/// 最多显示几条快捷方式（每行数量 × 2 行，上限定义在 settings 里）
 fn max_tiles() -> usize {
-    crate::settings::start_cols().clamp(1, 8) * MAX_ROWS
+    crate::settings::start_max_pins()
 }
 /// 上栏与下栏之间的间隔（含分隔线）
 const GRID_BAR_GAP: f32 = 12.0;
@@ -815,8 +814,11 @@ fn paint(
                 egui::pos2(power_x, power_y),
                 egui::vec2(card_w, card_h),
             );
-            // 实底 + 细描边 + 一点柔光，盖住下面的格子
-            p.rect_filled(card, egui::CornerRadius::same(10), argb(cfg::opaque(t.panel_bg)));
+            // 实底 + 细描边 + 一点柔光，盖住下面的格子。
+            // 底色跟着「界面透明度」走，但比板面再深一档（+40），否则底下的格子会透上来。
+            let card_bg = cfg::bg_alpha(t.panel_bg);
+            let card_a = (((card_bg >> 24) + 40).min(255) << 24) | (card_bg & 0x00FF_FFFF);
+            p.rect_filled(card, egui::CornerRadius::same(10), argb(card_a));
             p.rect_stroke(
                 card,
                 egui::CornerRadius::same(10),

@@ -95,7 +95,7 @@ pub fn paint_list(
             p.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
                 egui::CornerRadius::same(cfg::cur().panel_radius as u8),
-                argb(cfg::cur().panel_bg),
+                argb(cfg::bg_alpha(cfg::cur().panel_bg)),
             );
             // 按胶囊的画法：只铺底不描边（描边羽化溢出窗口边界会成白边）
 
@@ -234,7 +234,7 @@ pub fn paint_weather(
             // 底板（按胶囊的画法：只铺底不描边，描边羽化会溢出窗口成白边）
             p.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
-                egui::CornerRadius::same(cfg::cur().panel_radius as u8), argb(cfg::cur().panel_bg));
+                egui::CornerRadius::same(cfg::cur().panel_radius as u8), argb(cfg::bg_alpha(cfg::cur().panel_bg)));
 
             // 标题：当地 + 天气（强调色）
             let t1w = tw(s, "当地", 15.0 * k);

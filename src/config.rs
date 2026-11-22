@@ -6,35 +6,25 @@
 
 pub use crate::theme::cur;
 
-/// 考虑「透明度滑条」之后的胶囊/Dock/模块条底色。
+/// 按「界面透明度」调过的**板面底色**（只改 alpha 字节，RGB 原样）。
 ///
-/// 滑条拉到 100%（`>= 0.999`）时**强制实底**（alpha = 0xFF）：主题自带的半透明底色
-/// （玻璃 2.0 / Material 3 的 `pill_bg` alpha 是 0xC0~0xF0）在 100% 时不该再透出桌面。
-/// 低于 100% 时保持主题原色——平铺的半透明是主题设计的一部分，叠加的压暗由
-/// `window.rs` 的整帧 alpha 乘法负责。
+/// 这里的语义是「背景有多不透明」：滑条 100% → 底色完全不透明（主题自带的
+/// 半透明 `pill_bg` / `panel_bg` 也不再透出桌面），滑条 50% → 板面半透明。
 ///
-/// 只动**底色**的 alpha：文字、图标、描边颜色一律不碰，保证任何时候都可读。
-pub fn pill_bg_effective() -> u32 {
-    let bg = crate::theme::cur().pill_bg;
-    if crate::settings::pill_alpha() >= 0.999 {
-        opaque(bg)
-    } else {
-        bg
+/// **文字、图标、描边一律不参与**：它们照原色画在板面之上，所以拉低滑条只会让
+/// 「背景」透出桌面，字和图标始终清晰可读。
+pub fn bg_alpha(c: u32) -> u32 {
+    let a = crate::settings::ui_alpha().clamp(0.0, 1.0);
+    if a >= 0.999 {
+        return opaque(c);
     }
+    let alpha = ((a * 255.0).round() as u32).min(0xFF);
+    (alpha << 24) | (c & 0x00FF_FFFF)
 }
 
-/// 考虑 Dock 独立透明度滑条之后的 Dock 底色。
-/// 与胶囊分开：dock_alpha 拉满强制实底；否则把主题底色的 alpha 按
-/// dock_alpha 比例压低（主题本来就半透明时叠加）。
-pub fn dock_bg_effective() -> u32 {
-    let bg = crate::theme::cur().pill_bg;
-    let a = crate::settings::dock_alpha();
-    if a >= 0.999 {
-        return opaque(bg);
-    }
-    let cur_a = (bg >> 24) & 0xFF;
-    let new_a = ((cur_a as f32) * a).round().clamp(0.0, 255.0) as u32;
-    (new_a << 24) | (bg & 0x00FF_FFFF)
+/// 胶囊 / 模块条 / 音乐条 / Dock / 开始菜单 / 横幅的板面底色（主题 `pill_bg`）。
+pub fn ui_bg_effective() -> u32 {
+    bg_alpha(cur().pill_bg)
 }
 
 /// 只把 alpha 字节提到 0xFF，RGB 原样保留

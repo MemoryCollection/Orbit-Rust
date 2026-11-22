@@ -155,8 +155,6 @@ pub enum PillShape {
     Float,
     /// 吸顶刘海：顶部两角向外张开（耳），底部半圆
     Island,
-    /// 吸底：底部两角向外张开（耳），顶部半圆
-    Bottom,
 }
 
 // ---------- 刘海耳（吸顶 / 吸底的边缘过渡） ----------
@@ -653,7 +651,10 @@ fn swap_rb(buf: &mut [u8]) {
     }
 }
 
-/// straight-alpha RGBA → premultiplied BGRA（UpdateLayeredWindow 要求）。
+/// premultiplied RGBA → premultiplied BGRA（UpdateLayeredWindow 要求）。
+///
+/// 只换字节序，不做任何透明度处理：「界面透明度」只作用在**板面底色**上
+/// （`config::bg_alpha`），文字和图标保持原样，这样滑块拉低时只有背景透出桌面。
 pub fn premultiplied_rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; rgba.len()];
     for (i, chunk) in rgba.chunks_exact(4).enumerate() {
@@ -697,4 +698,19 @@ unsafe fn create_font(kind: FontKind, px: f32, font: &mut *mut GpFont) -> bool {
     GdipCreateFont(family, px, style, UnitPixel, font);
     GdipDeleteFontFamily(family);
     !font.is_null()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bgra_swap_keeps_alpha_and_colors() {
+        // 预乘 RGBA（R,G,B,A）→ BGRA：只换字节序，透明度不参与（透明度只作用于板面底色）
+        assert_eq!(
+            premultiplied_rgba_to_bgra(&[100, 50, 25, 200]),
+            vec![25, 50, 100, 200]
+        );
+        assert_eq!(premultiplied_rgba_to_bgra(&[10, 20, 30, 40]), vec![30, 20, 10, 40]);
+    }
 }

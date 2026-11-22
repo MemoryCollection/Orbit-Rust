@@ -26,6 +26,7 @@ mod musicbar;
 mod musicbarview;
 mod net;
 mod notify;
+mod notifycenter;
 mod wintoast;
 mod panel;
 mod panelview;
@@ -79,7 +80,11 @@ fn main() {
     }
     // 默认接管任务栏；--show-taskbar 保留原生任务栏（调试/临时用）
     let hide_taskbar = !args.iter().any(|a| a == "--show-taskbar");
-    tlog!("启动 orbit（hide_taskbar={hide_taskbar}）");
+    tlog!(
+        "启动 orbit（hide_taskbar={hide_taskbar}，开机已运行 {}s，启动来源 {}）",
+        guard::uptime_secs(),
+        if guard::uptime_secs() < 180 { "疑似开机自启" } else { "手动/复活" }
+    );
     app::run(hide_taskbar);
     tlog!("退出");
 }

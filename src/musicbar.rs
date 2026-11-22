@@ -53,6 +53,8 @@ struct Shown {
     hovered: bool,
     cover_id: u64,
     rect: (i32, i32, i32, i32),
+    /// 界面透明度（百分比，只参与"变了要重画"判断）：滑条一动，板面底色要跟着重画
+    alpha: i32,
 }
 
 /// 一帧要显示的内容（由 `App::tick_bar` 组装）
@@ -168,6 +170,7 @@ pub fn show(v: &View) {
             hovered: hovered(),
             cover_id: v.cover_id,
             rect: (x, y, w, hh),
+            alpha: (crate::settings::ui_alpha() * 100.0).round() as i32,
         };
 
         // 命中区 = 封面的圆（物理像素；与 musicbarview::cover_box 同几何）

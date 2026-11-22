@@ -23,7 +23,7 @@ ORBIT_TRACE=1 cargo run --release        # 详细日志写 <exe>/orbit.log
 ```
 
 - 打包：仓库根 `打包exe.bat`；应用图标由 `build.rs`（winresource）+ `tools/icon/make_icon.py` 生成。
-- 数据全部便携式落在 `<exe>/data/`（settings.txt、mail.txt、clipboard.txt 等），不写注册表数据、不碰安装目录之外（开机自启动的 Run 键除外，见 `guard.rs`）。
+- 数据全部便携式落在 `<exe>/data/`（settings.txt、mail.txt、clipboard.txt 等），不写注册表数据、不碰安装目录之外（开机自启动的 Run 键 / 启动文件夹 orbit.lnk / 计划任务 Orbit 除外，见 `guard.rs`）。
 
 ## 3. 当前状态（交接时点）
 
@@ -72,7 +72,7 @@ ORBIT_TRACE=1 cargo run --release        # 详细日志写 <exe>/orbit.log
 2. 托盘相关调试用 `tools/traytest`（不要用微信测，多开会混淆）；各 tools 子 crate 是独立 Cargo 项目，需单独 `cargo run`。
 3. `data/settings.txt` 改文件即时生效（500ms mtime 轮询兜底），设置页改值经 `appmsg::notify_applied()` 即时通知；两路共用 `settings::version()` 判断重绘。
 4. 分层窗口常见坑（预乘 RGBA、ppp 经 `RawInput.viewports` 下发、命中矩形乘 scale 等）见 ARCHITECTURE.md 开头的「常见坑」块——改渲染前先读。
-5. 退出热键 `Ctrl+Alt+O`；强杀后任务栏未归位用 `--restore-taskbar`；守护进程会自动重启 explorer 救回任务栏（`guard.rs`）。
+5. 退出热键 `Ctrl+Alt+O`；强杀后任务栏未归位用 `--restore-taskbar`；守护进程会救回任务栏并**自动复活 orbit**（连续最多 3 次，成功清零计数；次数用尽才重启 explorer，见 `guard.rs`）。
 
 ## 7. 已知限制与路线图
 

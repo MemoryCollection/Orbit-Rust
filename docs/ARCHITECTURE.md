@@ -1,6 +1,6 @@
 # Orbit 架构总览
 
-悬浮任务栏：顶部胶囊（时钟/日期 + 可分离出去的模块条 + 展开面板）+ 胶囊旁的音乐条（旋转封面 + 歌词）+ 底部 Dock（钉选与运行中应用）浮在所有窗口上方，不占用工作区。目标 Win11 23H2 (22631)、主屏、低内存（原生 Win32 + egui 软件后端，无 WebView）。**UI 绘制已全部迁到 egui**：各窗口用 egui 立即模式布局 → epaint 网格 → 公共软件光栅化（`egui_soft`）→ 预乘 RGBA → `render::present()`（UpdateLayeredWindow）；`render.rs` 只剩图标捕获/缩放、封面旋转、文本测量等非绘制能力。胶囊支持整体透明度与三种形状（悬浮 / 吸顶刘海 / 吸底），Dock 支持下/上/左/右四个锚位。
+悬浮任务栏：顶部胶囊（时钟/日期 + 可分离出去的模块条 + 展开面板）+ 胶囊旁的音乐条（旋转封面 + 歌词）+ 底部 Dock（钉选与运行中应用）浮在所有窗口上方，不占用工作区。目标 Win11 23H2 (22631)、主屏、低内存（原生 Win32 + egui 软件后端，无 WebView）。**UI 绘制已全部迁到 egui**：各窗口用 egui 立即模式布局 → epaint 网格 → 公共软件光栅化（`egui_soft`）→ 预乘 RGBA → `render::present()`（UpdateLayeredWindow）；`render.rs` 只剩图标捕获/缩放、封面旋转、文本测量等非绘制能力。胶囊支持统一「界面透明度」（除天气卡片外所有界面共用一个值）与两种形状（悬浮 / 吸顶刘海；吸底已取消），Dock 支持下/上/左/右四个锚位。
 
 ## 模块关系
 
@@ -57,7 +57,7 @@ main.rs → app.rs（启动/消息循环）
 3. `pillui::paint()` 用 egui 统一排版并返回每个 widget 的命中矩形（逻辑点 × scale 转物理像素）；分离出去的那些走 `widgetbarview::paint()`（同一套 widget 排布代码，文本按**垂直中线对齐**）。
 4. 点击按 `WidgetKind` 分发（胶囊内直接命中；模块条经 `WM_WIDGET_CLICK` 带类型号回传）。无数据的 widget 不占位（不会留空白）。
 
-**模块布局 = 排序列表 + 每模块模式**（取代旧的「左1/左2/左3/右1/右2/右3」编码）：`data/settings.txt` 里 `module_order` 是逗号分隔的模块名排序列表（`time,weather,mail,clipboard`，时间日期固定第一不可移动），`weather_mode` / `mail_mode` / `clipboard_mode` 各取 `pill`（留在胶囊里）/ `left` / `right` / `off`（隐藏）。规则：**同侧的模块合并成同一条**，同侧第几个就排第几条（上限 `WIDGET_BAR_MAX_SLOT = 3`，与预建窗口数一致）；`off` 的模块直接丢弃（胶囊/条里都没有）。设置页里这一行是**芯片（Chip）列表**：时间日期芯片固定画在最前（不可拖不可点），其余芯片**可拖动排序**（按下后 SetCapture，拖过相邻芯片中心就交换并即时写 `module_order`）、点击循环切换状态（胶囊 → 左条 → 右条 → 隐藏）。所有模块（含时间日期之外的全部）都能这样隐藏/显示。分离条与胶囊**同高（`PILL_H`）、同底色、同圆角**，条与条、条与胶囊之间都留 `WIDGET_BAR_GAP`；没有内容的那条自动隐藏。分离条窗口带整体透明度（与胶囊 `pill_alpha` 一致，烘焙进像素）。后期新模块只要往 `build_widgets` 的列表里加一项、配一个 `xxx_mode` 键并在 `module_order`/`MODULES` 里登记，就自动获得同样的分离/分组/隐藏能力。
+**模块布局 = 排序列表 + 每模块模式**（取代旧的「左1/左2/左3/右1/右2/右3」编码）：`data/settings.txt` 里 `module_order` 是逗号分隔的模块名排序列表（`time,weather,mail,clipboard`，时间日期固定第一不可移动），`weather_mode` / `mail_mode` / `clipboard_mode` 各取 `pill`（留在胶囊里）/ `left` / `right` / `off`（隐藏）。规则：**同侧的模块合并成同一条**，同侧第几个就排第几条（上限 `WIDGET_BAR_MAX_SLOT = 3`，与预建窗口数一致）；`off` 的模块直接丢弃（胶囊/条里都没有）。设置页里这一行是**芯片（Chip）列表**：时间日期芯片固定画在最前（不可拖不可点），其余芯片**可拖动排序**（按下后 SetCapture，拖过相邻芯片中心就交换并即时写 `module_order`）、点击循环切换状态（胶囊 → 左条 → 右条 → 隐藏）。所有模块（含时间日期之外的全部）都能这样隐藏/显示。分离条与胶囊**同高（`PILL_H`）、同底色、同圆角**，条与条、条与胶囊之间都留 `WIDGET_BAR_GAP`；没有内容的那条自动隐藏。分离条窗口跟随统一「界面透明度」（`settings::ui_alpha`，只压板面底色 alpha，文字图标不动）。后期新模块只要往 `build_widgets` 的列表里加一项、配一个 `xxx_mode` 键并在 `module_order`/`MODULES` 里登记，就自动获得同样的分离/分组/隐藏能力。
 
 > 「鼠标在不在胶囊里」的判断因此要把模块条算进去（`widgetbar::contains`），否则点开面板后鼠标停在条上会被误收起。
 
@@ -128,7 +128,7 @@ main.rs → app.rs（启动/消息循环）
 | `data/mail.txt` | IMAP 账号（host/port/user/pass 授权码），首次运行由 `config.rs` 默认值生成 |
 | `data/mail_read.txt` | 已读邮件的 IMAP UID，一行一个（服务器 `\Seen` 的本地兜底） |
 | `data/clipboard.txt` | 剪贴板历史，每行 `时间 \x1f 固定标记 \x1f 文本`（换行转义 `\x1e`；老格式两字段按未固定读入） |
-| `data/settings.txt` | 可调设置，`key=value` 一行一个：`clock_format`（strftime 格式串，默认 `%Y-%m-%d %H:%M:%S`）、`module_order`（模块排序列表）、`weather_mode` / `mail_mode` / `clipboard_mode`（pill/left/right/off）、`pill_alpha`（0.2~1.0）、`pill_anchor`（float/island/bottom）、`dock_anchor`（bottom/top/left/right）、`weather_text_scale`（0.8~1.8，默认 1.25）、`lyric_position`（right/left/bottom）、`lyric_size`（10~26，默认 14）、`weather_source`（amap/openmeteo）、`amap_key`（设置页写入的高德 key 覆盖）、`mail_host` / `mail_port` / `mail_user` / `mail_pass`（设置页写入的邮箱账号覆盖，留空回落 `mail.txt`）、`show_tray` / `show_desktop_btn`（1/0）、`hide_tray`（要单独隐藏的托盘图标键，`;` 分隔）、`dock_pins`（Dock 固定图标，`;` 分隔的 exe/.lnk 全路径；键不存在 = 沿系统任务栏钉选）、`icon_over`（托盘图标指定，`;` 分隔的 `图标键|图标源路径`，源可以是 exe/dll/ico/png/jpg/bmp）、`pill_scale` / `icon_scale`（胶囊 / Dock 整体倍率，1.0 = 滑条 100%）。老键 `clock_order` / `time_format` / `date_format` / `*_pos` 在读取时自动迁移 |
+| `data/settings.txt` | 可调设置，`key=value` 一行一个：`clock_format`（strftime 格式串，默认 `%Y-%m-%d %H:%M:%S`）、`module_order`（模块排序列表）、`weather_mode` / `mail_mode` / `clipboard_mode`（pill/left/right/off）、`alpha`（0.2~1.0，界面透明度：胶囊/模块条/音乐条/Dock/面板/开始菜单/横幅共用，天气卡片除外；老键 `pill_alpha`/`dock_alpha` 读取时合并迁移）、`pill_anchor`（float/island，老值 bottom 按 float 处理）、`dock_anchor`（bottom/top/left/right）、`weather_text_scale`（0.8~1.8，默认 1.25）、`lyric_position`（right/left/bottom）、`lyric_size`（10~26，默认 14）、`weather_source`（amap/openmeteo）、`amap_key`（设置页写入的高德 key 覆盖）、`mail_host` / `mail_port` / `mail_user` / `mail_pass`（设置页写入的邮箱账号覆盖，留空回落 `mail.txt`）、`show_tray` / `show_desktop_btn`（1/0）、`hide_tray`（要单独隐藏的托盘图标键，`;` 分隔）、`dock_pins`（Dock 固定图标，`;` 分隔的 exe/.lnk 全路径；键不存在 = 沿系统任务栏钉选）、`icon_over`（托盘图标指定，`;` 分隔的 `图标键|图标源路径`，源可以是 exe/dll/ico/png/jpg/bmp）、`pill_scale` / `icon_scale`（胶囊 / Dock 整体倍率，1.0 = 滑条 100%）。老键 `clock_order` / `time_format` / `date_format` / `*_pos` 在读取时自动迁移 |
 
 ### 可调设置（settings.rs）
 - 文件不存在时写入带注释的默认值；老版本文件缺新键会自动补到末尾（`append_missing`），方便直接编辑。
@@ -142,9 +142,9 @@ main.rs → app.rs（启动/消息循环）
 - `save()` 只替换**它管的键**的值，注释、空行、用户自己加的其它键原样保留。
 
 ### 胶囊形状与透明度
-- **`pill_alpha`（0.2~1.0）**：胶囊、分离模块条整体透明度。渲染完 RGBA 后逐像素把 alpha 乘系数再上屏（premultiplied 下只乘 alpha 通道即可），改透明度只是重绘，不另走系统接口。
-- **`pill_anchor`（float / island / bottom）**：胶囊的形状与吸附位置。`float` = 悬浮（四角全圆角，距屏顶 `TOP_MARGIN`）；`island` = 吸顶刘海（**顶部两角直角**贴住屏幕上沿，下面圆角）；`bottom` = 吸底（底部两角直角贴屏幕下沿）。渲染端 `PillShape` 决定 `capsule_path` 的顶部/底部圆角半径，命中测试 `inside_pill` 按同款形状判断（刘海的直角区域也算命中）。
-- **吸附位置的连锁反应**：胶囊吸底时，展开面板自动弹到胶囊**上方**（`panel_top_y` 按 `panel::content_size` 预算高度），托盘悬停卡片也改守位到胶囊**下方**（`flyout::watch` 的 `below = true`），保证任何形状下卡片都不出屏。
+- **`alpha`（0.2~1.0）**：界面透明度，一个值管除天气卡片外的所有自绘界面（胶囊 / 分离模块条 / 音乐条 / Dock / 展开面板 / 开始菜单 / 横幅 / Dock 提示条）。**只调板面底色的 alpha，文字与图标一律不参与**（拉低滑条只让背景透出桌面，字始终清晰可读）。实现：所有板面底色经 `config::bg_alpha`（100% 强制实底，低于 100% 时 alpha 字节 = 滑条 × 255；胶囊/音乐条/模块条/Dock/开始菜单/横幅走 `ui_bg_effective`，面板与 Dock 窗口列表走 `panel_bg`、Dock 提示条走 `tip_bg`，都过同一个函数）；`render::premultiplied_rgba_to_bgra` 只换字节序不做透明度。改透明度只是重绘，不另走系统接口。
+- **`pill_anchor`（float / island）**：胶囊的形状与吸附位置。`float` = 悬浮（四角全圆角，距屏顶 `TOP_MARGIN`）；`island` = 吸顶刘海（**顶部两角直角**贴住屏幕上沿，下面圆角）。`bottom`（吸底）已取消：读到老值按 `float` 处理。渲染端 `PillShape` 决定板面圆角，命中测试 `inside_pill` 按同款形状判断（刘海的直角区域也算命中）。
+- **面板的纵向预算**：展开面板弹在胶囊下方；屏幕剩余高度不够时 `panel_top_y` 改为弹到胶囊**上方**（按 `panel::content_size` 预算高度），保证面板不出屏（老的「吸底时面板朝上」分支随吸底形状一并取消）。
 
 ### Dock 锚位
 **底部 Dock 的命名**：窗口类名 `ORBIT_DOCK`（`src/dock.rs`，结构体 `Dock`），中文叫"底部 Dock"。`dock_anchor` 支持 `bottom`（默认，贴工作区下沿居中）/ `top`（贴主屏上沿）/ `left` / `right`（左右两侧竖排居中）：竖排模式 `dockview::dock_size` 返回 (宽, 高) 互换、`dockview::paint` 用主轴抽象（`cross`/`long`）复用同一套布局，分隔线、悬停底、返回桌面细长条都跟着转向；Dock 在顶部时悬停卡片守位到 Dock 下方（`below`），提示条 `ORBIT_TIP` 也按锚位改到不遮挡的一侧。
@@ -160,12 +160,19 @@ main.rs → app.rs（启动/消息循环）
 
 ### 设置页面（settingsui.rs）
 
-**egui 版**：`eframe`（glow 后端）跑在一条独立后台线程里，主线程的 Win32 消息循环完全不受影响。窗口是无边框小圆角窗（`with_decorations(false)`、`with_taskbar(false)` 不占任务栏，不置顶，打开时 `Focus` 弹到最前），**固定尺寸 940×560**、打开时主屏居中（`OuterPosition` 按系统 DPI 把物理像素换算成逻辑点）。中文字体从系统加载（微软雅黑 → 黑体兜底）追加进 egui 字体族；配色对齐胶囊/面板（`PANEL_BG_ARGB` / `ACCENT_ARGB`）。
+**egui 版**：`eframe`（glow 后端）跑在一条独立后台线程里，主线程的 Win32 消息循环完全不受影响。窗口是无**系统边框**的小圆角窗（`with_decorations(false)`，不置顶，打开时 `Focus` 弹到最前），**固定尺寸 940×560**、打开时主屏居中（`OuterPosition` 按系统 DPI 把物理像素换算成逻辑点）。
+
+窗口是**普通任务栏窗口**（`with_taskbar(true)`）：
+
+- 出现在 **Alt+Tab** 和 Dock 的「运行中应用」里（不占任务栏 = `WS_EX_TOOLWINDOW`，系统与 Dock 的 `enum_proc` 都会把它过滤掉）；
+- 点任务栏 / Dock 上的图标即可把设置页拉回前台（Dock 走 `window::activate_window`；若是原生任务栏则系统自己激活）；
+- 没有系统边框，所以**拖动窗口由自绘标题栏承担**：`header()` 先在整条标题栏矩形上 `ui.interact(..., Sense::drag())`，`drag_started()` 时发 `ViewportCommand::StartDrag` 让系统进入移动循环（含贴边吸附）；按钮在其后加入，egui 命中测试取最上层控件，点「应用/还原/✕」不会被拖动抢走。中文字体从系统加载（微软雅黑 → 黑体兜底）追加进 egui 字体族；配色对齐胶囊/面板（`PANEL_BG_ARGB` / `ACCENT_ARGB`）。
 
 - **线程模型**：eframe 线程**懒启动**（首次 `show()` 才起，避免 eframe 第一帧后强制 `set_visible(true)` 导致设置页开机弹出）；主线程经 `QUEUE`（Mutex 队列）+ `egui::Context::request_repaint` 收发 显示/隐藏 命令，eframe 的 `App::logic`（窗口隐藏时也会被调用）负责消费命令、拦截 Alt+F4（当作收起，`CancelClose`，eframe 常驻不退出）。`is_open` 用 AtomicBool 同步回主线程。winit 事件循环经 `event_loop_builder` 钩子开了 `with_any_thread(true)`（非主线程建 EventLoop 必需）。
 - **打开**：右键 Dock 空白处、右键胶囊、或 `Ctrl+Alt+,`（再按一次 / 点右上 ✕ / 点胶囊 widget 收起）。
-- **布局（分组导航式）**：左栏是 6 个分组按钮（顶部胶囊 / Dock / 音乐条 / 天气 / 邮箱账户 / 模块与托盘），右栏只画选中分组的详细设置，内容超出窗口就组内滚动。
-  - 顶部胶囊：时钟格式**编辑框** + 实时预览（500ms 跟走）、透明度加减、形状三段「悬浮/吸顶刘海/吸底」。
+- **布局（分组导航式）**：左栏 4 个分组按钮（常规设置 / 顶部胶囊 / Dock / 开始菜单），右栏只画选中分组的详细设置，内容超出窗口就组内滚动。
+  - 常规设置：**界面字体**放最上面（MiSans / 系统字体二段）→ **外观**（主题色块 + `胶囊透明度` + `胶囊大小`，这两项原在「顶部胶囊」组，属于外观层面所以挪到主题下面）→ 系统（开机启动 / 退出守护）→ 微信通知接管 → 通知方式 → 横幅时长 → 提示音。
+  - 顶部胶囊：统一圆角、时钟格式**编辑框** + 实时预览；透明度 / 胶囊大小 / Dock 大小 / 胶囊形状 / Dock 位置都在「常规设置 → 外观」，组内顶部有一行指路说明。
   - Dock：位置四段「下/上/左/右」。音乐条：位置三段 + 歌词字号加减。
   - 天气：字号倍率加减、数据源二段「高德/Open-Meteo」+ 高德 Key 编辑框。
   - 邮箱账户：**服务器预设**（QQ/163/Gmail/Outlook 四个 `MAIL_PRESETS`，按已存 host 自动高亮；「自定义」才展开 服务器/端口 编辑框），账号 + 授权码（`password(true)`）两个编辑框，**「测试连通」按钮**——后台线程跑 `mail::test_account`（TCP+TLS 建连 → IMAP LOGIN，复用 `mail.rs` 的 `Conn`），结果（成功/失败原因）回 UI 显示，测试期间按钮禁用并显示「测试中…」。
@@ -280,7 +287,9 @@ main.rs → app.rs（启动/消息循环）
 - **图标表**：`WM_COPYDATA(dwData=1)` 的载荷是 `SHELLTRAYDATA`（`+0` magic `0x34753423`、`+4` dwMessage、`+8` packed `NOTIFYICONDATA`，`cbSize=0x3bc`）。按 x64 打包布局（句柄都是 u32）解析出 `hWnd/uID/GUID/uFlags/uCallbackMessage/hIcon/szTip/uVersion/dwState`，维护 `NIM_ADD/MODIFY/DELETE/SETVERSION` 的图标表。这样 GUID 注册的图标（微信 4.x 第二实例 `F915B2DC-…`）、空 tooltip 的图标都能直接拿到——旧方案里这两个是啃不动的硬骨头。`Icon` 的 pid/exe 从图标宿主 `hWnd` 反查。
 - **透明转发（对齐 Atrium）**：`on_copydata` 收到托盘消息先复制入库，再**原样 `WM_COPYDATA` 转发给真 Explorer 任务栏**（解析失败也转发、不丢图标），保证 Explorer 里图标保持完整；`wndproc` 对 `msg>=0x400` 的私有消息转发后**回传 Explorer 的应答**（不再回 `DefWindowProc` 的 0）。`real_explorer_tray()` 按 **PID** 排除本进程窗口（不再只按 hwnd），避免第三方宿主/多开误判。注意：转发本身**不能**修 `ITaskbarList::HrInit`，因为那个检查发生在调用方进程内、根本不经过窗口消息。
 - **ITaskbarList 兼容（TaskbandHWND 属性）**：HiBitUninstaller 等程序调 `CoCreateInstance(CLSID_TaskbarList).HrInit()` 时报 `E_NOTIMPL(0x80004001)` 并随后空指针崩溃，真正原因是 `HrInit` 要求 `FindWindow("Shell_TrayWnd")` 命中的窗口带 `TaskbandHWND` 窗口属性；我们的假宿主没有这个属性。修复是在假窗口创建后把真任务栏的 `TaskbandHWND` 复制过来（拿不到时退到 `GetShellWindow()`），并由 100ms 守护在 Explorer 重启后刷新。诊断工具 `tools/taskbarlistcheck` 可复现：无此属性时 `HrInit=0x80004001`，给假窗口 `SetPropW("TaskbandHWND", …)` 后立即 `S_OK`。此外 `WM_USER+236`（`TWM_GETTASKSWITCH`）直接回真 Explorer 任务栏句柄，而不是转发后拿回的 0。
-- **第三方宿主检测（traydetect.rs）**：启动前扫 RetroBar/ExplorerPatcher/StartAllBack/StartIsBack/OpenShell/ClassicShell 进程名，以及 `Shell_TrayWnd` 属主非 explorer → 命中则不争抢，退回只读 UIA 模式（不隐藏任务栏、不建假托盘）。守护子进程每 ~4s 探活父进程主窗口，无响应就把 Explorer 任务栏抬到假宿主之前，恢复后再抬回。
+- **第三方宿主检测（traydetect.rs）**：启动前扫 RetroBar/ExplorerPatcher/StartAllBack/StartIsBack/OpenShell/ClassicShell 进程名，以及 `Shell_TrayWnd` 属主非 explorer → 命中则不争抢，退回只读 UIA 模式（不隐藏任务栏、不建假托盘）。守护子进程每 ~4s 探活 orbit 主窗口，无响应就把 Explorer 任务栏抬到假宿主之前，恢复后再抬回。orbit 启动时先等 `Shell_TrayWnd` 出现（最多 30s，开机自启往往早于 explorer 就绪），避免接管空跑。
+- **开机自启（guard.rs，三通道）**：① `HKCU\...\Run` 键；② 启动文件夹快捷方式 `orbit.lnk`（IShellLink 写入）；③ 计划任务 `Orbit`（`schtasks /sc onlogon /delay 0000:05`，根目录建任务需管理员——仅设置页开关时经 `ShellExecute runas` 弹 UAC 创建，启动同步绝不弹）。设计动机：2026-11-22 实测开机后 Run 键被系统层面静默吞掉（HKLM 自启正常执行、注册表开关启用态、无事件错误、火绒日志无拦截记录，原因未定），三通道独立生效、单实例互斥去重，谁先拉起都算数。启动日志打「距开机秒数」帮助对时间线。
+- **复活（guard.rs）**：orbit 退出按 `data/orbit.exit` 标记分类——`clean`（Ctrl+Alt+O 正常退出，守护静默清场）、`panic`（panic 钩子或外部关闭（WM_DESTROY，任务管理器结束任务）已恢复任务栏，不重启 explorer）、无新鲜标记（强杀等异常，先 force_restore）。panic/异常退出都会**复活 orbit**：重新拉起同目录 `orbit.exe`（带 `ORBIT_NO_GUARDIAN=1`，由原守护继续盯），连续最多 3 次（`data/orbit.revive` 计数）；复活出来的 orbit 稳定跑满 60s = 复活成功、计数清零（正常退出/全新启动同样清零），次数用尽才重启 explorer 兜底。守护跑在**独立副本 `orbit-guard.exe`** 里（启动时自动从主程序刷新拷贝），与主程序不同名，任务管理器「结束任务」不会连坐杀掉守护。日志：主进程 `orbit.log`、守护 `orbit-guard.log`，均追加写（超 2MB 轮转），不再每次启动清空（否则开机自启失败的现场日志会被后续启动冲掉，查不到原因）。
 - **伪造输入开关**：`settings::tray_fake_input`（默认开，设置页「系统」区可切）控制 Dock 托盘的点击/悬停是否走 `traymsg` 投回调消息；关掉则退回 UIA 默认动作，用于透明转发 A/B 测试（排查点击闪退/兼容问题）。
 - **占位注册暂存（`State::pending`）**：任务管理器刷新 CPU 图表时先 `NIM_ADD` 一条 tip=「任务管理器」的占位图标，稳定后才 `NIM_MODIFY` 成「CPU xx%」。占位不显示，但**注册信息必须留住**——那条 MODIFY 的载荷里 `uCallbackMessage` 是 0，以前直接当新图标入库，消息号就成了 0（点击投的是 `WM_NULL`，表现为"左键点 CPU 图标叫不出任务管理器"）。现在占位进 `pending`（最多 32 条），后续 MODIFY 补入库时把 `msg/ver/guid` 从占位那条继承回来。
 - **elevated 应用（任务管理器）的唤醒**：`taskmgr.exe` 清单是 `highestAvailable`，管理员账户下以 High 完整性级别运行，Orbit 是 Medium。跨 IL 实测：私有消息被 UIPI 直接丢弃（`PostMessage` → `ACCESS_DENIED`，即使对方 `ChangeWindowMessageFilterEx` 放行了回调消息，任务管理器本人也不响应 `WM_LBUTTONDOWN/UP`/`NIN_SELECT`）、`ShowWindow`/`ShowWindowAsync`/`SetForegroundWindow` 全部无效（最小化窗口纹丝不动）。唯一可靠路径是**再启动一次 `taskmgr.exe`**：它单实例，新进程立刻退出，同时把已有实例的窗口显示出来（等同点开始菜单里的「任务管理器」）。见 `traymsg::is_taskmgr` / `wake_taskmgr`，Dock 左键对任务管理器图标在投完回调后再补这一下。

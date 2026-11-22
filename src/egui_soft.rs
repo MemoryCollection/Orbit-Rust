@@ -593,7 +593,7 @@ pub fn widget_icon(p: &egui::Painter, center: egui::Pos2, cell: f32, kind: u8, c
 /// 叠到壁纸上就是"Dock 外圈一圈没裁干净的白边"（用户实测）。
 /// 玻璃面的立体感靠底色本身的透明度和霓虹内发光，不再靠亮边。
 pub fn glass_board(p: &egui::Painter, board: egui::Rect, cr: egui::CornerRadius) {
-    glass_board_with(p, board, cr, cfg::pill_bg_effective());
+    glass_board_with(p, board, cr, cfg::ui_bg_effective());
 }
 
 /// 与 glass_board 相同，但底色由调用方指定（Dock 用独立的透明度滑条）
@@ -670,7 +670,7 @@ pub fn island_board(
             stroke,
         })
     };
-    p.add(path(argb(cfg::pill_bg_effective()), egui::Stroke::NONE.into()));
+    p.add(path(argb(cfg::ui_bg_effective()), egui::Stroke::NONE.into()));
     if cfg::cur().glow {
         // 内发光：外缘贴剪影、内缘逐圈收进，等价 glass_board 的 glow_edges
         let color = cfg::cur().dock_edge;
@@ -885,6 +885,57 @@ pub fn build_font_definitions() -> egui::FontDefinitions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 画一帧「板面 + 文字」，返回 (整幅 RGBA, 宽, 高)
+    fn paint_board_with_text(w: i32, h: i32) -> Vec<u8> {
+        let mut soft = SoftBackend::new();
+        soft.set_scale(1.0);
+        let ctx = soft.ctx().clone();
+        let input = soft.input(w as f32, h as f32);
+        let mut out = ctx.run_ui(input, |ui| {
+            let p = ui.painter().clone();
+            glass_board_with(
+                &p,
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w as f32, h as f32)),
+                egui::CornerRadius::ZERO,
+                cfg::bg_alpha(0xFF_40_80_C0),
+            );
+            p.text(
+                egui::pos2(6.0, 6.0),
+                egui::Align2::LEFT_TOP,
+                "Ag",
+                egui::FontId::proportional(18.0),
+                egui::Color32::WHITE,
+            );
+        });
+        soft.update_textures(&mut out.textures_delta);
+        soft.rasterize(out.shapes, out.pixels_per_point, w, h)
+    }
+
+    #[test]
+    fn ui_alpha_fades_board_only_not_text() {
+        let prev = settings::ui_alpha();
+        // 40%：板面底色 alpha 应落到 102，文字仍是不透明（255）
+        settings::preview_ui_alpha(0.4);
+        let rgba = paint_board_with_text(120, 40);
+        // 取板面中心（左下角区域远离文字，也不会落在边缘发光带上）
+        let mid = (((39 * 120) + 60) * 4 + 3) as usize;
+        let board = rgba[mid] as u32;
+        assert!(
+            (board as i32 - 102).abs() <= 2,
+            "40% 时板面 alpha 应约 102，实际 {board}（左上角 {}）",
+            rgba[3]
+        );
+        let max_alpha = rgba.chunks_exact(4).map(|px| px[3]).max().unwrap();
+        assert!(max_alpha >= 250, "文字不该跟着变淡，实际最大 alpha {max_alpha}");
+
+        // 100%：板面完全不透明
+        settings::preview_ui_alpha(1.0);
+        let rgba = paint_board_with_text(120, 40);
+        assert_eq!(rgba[mid], 255, "100% 时板面应完全不透明");
+
+        settings::preview_ui_alpha(prev);
+    }
 
     #[test]
     fn shared_font_data_reuses_same_arc() {

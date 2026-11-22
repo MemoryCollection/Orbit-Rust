@@ -32,7 +32,30 @@ unsafe extern "system" fn tip_proc(
 /// 托盘托管句柄（整个进程生命周期内持有，退出时 stop 恢复真托盘）
 static TRAY_HOST: std::sync::Mutex<Option<crate::trayhost::Host>> = std::sync::Mutex::new(None);
 
+/// 等 explorer 的任务栏窗口出现（开机自启的竞态修复）。
+/// Run 键启动早于 shell 就绪时最多等 30s；shell 正常时立即通过。
+fn wait_shell_ready() {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    unsafe {
+        for i in 0..60u32 {
+            if FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).is_ok() {
+                if i > 0 {
+                    crate::tlog!("[orbit] Shell_TrayWnd 就绪（等待了 {}ms）", i * 500);
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        crate::tlog!("[orbit] 等待 Shell_TrayWnd 超时（30s），explorer 可能未启动，按现状继续");
+    }
+}
+
 pub fn run(want_hide_taskbar: bool) {
+    // 开机自启时，Run 键启动往往早于 explorer 建好任务栏。不等就接管会出问题：
+    // hide_all 找不到任务栏（隐藏记录为空、restore 兜不住）、托盘宿主抢注时序错乱，
+    // 表现为"开机自启经常失败"。手动启动 / 复活时 shell 已就绪，这里立即通过。
+    wait_shell_ready();
+
     // 对齐 Atrium：检测到第三方托盘宿主（RetroBar / ExplorerPatcher 等）就不争抢，
     // 不隐藏任务栏、不接管托盘，退回 UIA 只读镜像——避免两个宿主抢 Shell_TrayWnd
     // 导致图标丢失 / 程序错识别。
@@ -42,12 +65,12 @@ pub fn run(want_hide_taskbar: bool) {
         crate::tlog!("[orbit] 第三方托盘宿主存在，本次以只读模式运行（保留原生任务栏）");
     }
 
-    // 任何 panic 退出前先恢复原生任务栏（默认 hook 被替换掉了）
+    // panic 退出前恢复原生任务栏（默认 hook 被替换掉了），并留 panic 标记：
+    // 守护看到 panic 标记不重启 explorer（任务栏已回来），但会复活 orbit（见 guard.rs）
     std::panic::set_hook(Box::new(|info| {
         if let Some(h) = TRAY_HOST.lock().unwrap().take() { h.stop(); }
         hide::restore_all();
-        // 任务栏已恢复，告诉守护子进程不用再动手（见 guard.rs）
-        crate::guard::mark_clean_exit();
+        crate::guard::mark_panic_exit();
         crate::tlog!("[orbit] panic: {info}");
     }));
 
@@ -140,6 +163,8 @@ pub fn run(want_hide_taskbar: bool) {
         settingsui::init(hinstance.into());
         // 通用右下角横幅（微信消息卡片只是其中一种；读取线程在定时器里跟随设置项启停）
         crate::banner::init(hinstance.into());
+        // 接管 Windows 通知中心（开关在设置页；关闭时线程只待命）
+        crate::notifycenter::start();
         // 开始菜单（Win 键弹出；快捷方式在设置页配置）
         crate::startmenu::init(hinstance.into());
         // 桌面右上角当地天气卡片（透明分层窗口，数据由主 App 天气 tick 推送）
@@ -188,8 +213,9 @@ pub fn run(want_hide_taskbar: bool) {
         crate::settingsui::shutdown();
         if let Some(h) = TRAY_HOST.lock().unwrap().take() { h.stop(); }
         hide::restore_all();
-        // 任务栏已恢复，留新鲜标记让守护子进程静默收场
-        crate::guard::mark_clean_exit();
+        // 任务栏已恢复，留收场标记：外部关闭（WM_DESTROY）→ 可复活；
+        // Ctrl+Alt+O 正常退出 → clean，守护静默退出（见 guard.rs）
+        crate::guard::finish_exit();
         drop(Box::from_raw(app_ptr));
     }
 

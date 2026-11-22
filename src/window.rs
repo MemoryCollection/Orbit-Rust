@@ -277,6 +277,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // 窗口被外部销毁（任务管理器结束任务发 WM_CLOSE 等）。Ctrl+Alt+O 的
+                // 正常退出走 WM_QUIT、不销毁窗口，所以到这里就是外部关闭 →
+                // 收尾时留可复活标记，让守护复活而不是当正常退出收场
+                crate::guard::note_external_close();
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -413,7 +417,6 @@ impl App {
         let shape = match settings::pill_anchor() {
             PillAnchor::Float => PillShape::Float,
             PillAnchor::Island => PillShape::Island,
-            PillAnchor::Bottom => PillShape::Bottom,
         };
         let out = self.pill_ui.paint(&crate::pillui::View {
             scale,
@@ -421,7 +424,7 @@ impl App {
             items: &pill_items,
             flash: &flash_views,
             shape,
-            alpha: settings::pill_alpha(),
+            alpha: settings::ui_alpha(),
         });
         let events = out.events;
         if out.changed {
@@ -429,26 +432,17 @@ impl App {
             self.widget_rects = out.widget_rects;
             self.widget_kinds = pill_kinds;
             self.flash = flash;
-            // egui 输出是预乘 RGBA；整体透明度连 RGB 一起乘，再换 BGRA 上屏
-            let mut rgba = out.rgba;
-            let alpha = settings::pill_alpha();
-            if alpha < 0.999 {
-                let k = alpha.clamp(0.0, 1.0);
-                for b in rgba.iter_mut() {
-                    *b = ((*b as f32) * k).round() as u8;
-                }
-            }
-            let bgra = render::premultiplied_rgba_to_bgra(&rgba);
+            // egui 输出是预乘 RGBA；「界面透明度」在换 BGRA 时整帧一起乘
+            let bgra = render::premultiplied_rgba_to_bgra(&out.rgba);
             render::present(self.hwnd, &bgra, out.w, out.h);
 
             // 定位：主屏顶部居中（固定水平位置，不可拖动）；垂直位置由 pill_anchor 决定：
-            // 悬浮 = 顶边往下一点，吸顶刘海 = 贴屏幕顶，吸底 = 贴屏幕底
+            // 悬浮 = 顶边往下一点，吸顶刘海 = 贴屏幕顶
             let mx = primary_monitor().rcMonitor;
             let x = mx.left + (mx.right - mx.left - out.w) / 2;
             let y = match settings::pill_anchor() {
                 PillAnchor::Float => mx.top + cfg::TOP_MARGIN,
                 PillAnchor::Island => mx.top,
-                PillAnchor::Bottom => mx.bottom - out.h,
             };
             self.pos = (x, y);
             unsafe {
@@ -489,7 +483,7 @@ impl App {
             bars: &views,
             scale: self.scale,
             pill,
-            alpha: settings::pill_alpha(),
+            alpha: settings::ui_alpha(),
         });
     }
 
@@ -679,14 +673,17 @@ impl App {
         }
     }
 
-    /// 面板的纵向位置：胶囊悬浮/吸顶时弹在胶囊下方；胶囊吸底时弹在**上方**
-    ///（不然面板会被挤出屏幕）。
+    /// 面板的纵向位置：胶囊贴着屏幕顶（悬浮 / 吸顶刘海）时一律弹在胶囊下方。
+    /// 老的「吸底」形状已取消，面板不会再需要往上弹。
     fn panel_top_y(&self, content: &Content) -> i32 {
-        if settings::pill_anchor() == PillAnchor::Bottom {
-            let (_, ph) = panel::content_size(content, self.scale);
+        let (_, ph) = panel::content_size(content, self.scale);
+        let below = self.pos.1 + self.pill.1 + cfg::PANEL_GAP;
+        let bottom = primary_monitor().rcMonitor.bottom;
+        if below + ph > bottom {
+            // 屏幕太矮（或胶囊离底很近）时优先保证面板完整可见
             (self.pos.1 - cfg::PANEL_GAP - ph).max(primary_monitor().rcMonitor.top + 4)
         } else {
-            self.pos.1 + self.pill.1 + cfg::PANEL_GAP
+            below
         }
     }
 

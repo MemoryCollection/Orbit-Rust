@@ -8,6 +8,7 @@
 //!   「测试连通」通过后打 ✓ 标记并持久化
 //! - 模块芯片：拖动排序、点击循环 胶囊 → 左条 → 右条 → 隐藏
 //! - 托盘图标：两列开关，第 0 格固定是「返回桌面」，下面有「恢复」按钮
+//! - 开始菜单：Win 键接管、每行列数、快捷方式增删排序（拖动行首圆点或 ↑↓，「快速添加」一键加任务管理器）
 //!
 //! 线程模型：设置页跑在**独立子进程**（`orbit.exe --settings-ui`）里——
 //! winit 不允许同一进程重建事件循环，而"关闭即回收内存"必须让整个 eframe
@@ -18,7 +19,9 @@
 //! 写进 `data/settings-runtime.txt`（`publish_runtime`），子进程读快照；
 //! 「应用」「手动拿 UIA」这类动作由子进程 PostMessage 到主进程胶囊窗口完成。
 //!
-//! 设置页不在任务栏显示（`with_taskbar(false)`）。
+//! 设置页是一个**普通窗口**（`with_taskbar(true)`）：出现在 Alt+Tab 与 Dock 的
+//! 运行中应用里，点任务栏图标即可把它拉回前台；没有系统边框，标题栏自己承担
+//! 拖动（`ViewportCommand::StartDrag`）。
 //!
 //! 打开方式：右键 Dock 空白处、右键胶囊、或 Ctrl+Alt+, （再按一次收起）。
 
@@ -330,11 +333,10 @@ pub fn run_child() {
     // 落到这里。）
     crate::settings::init();
     crate::tlog!(
-        "[settings] 子进程已载入本地配置：version={} theme={} pill_alpha={:.2} dock_alpha={:.2}",
+        "[settings] 子进程已载入本地配置：version={} theme={} alpha={:.2}",
         crate::settings::version(),
         crate::settings::theme_index(),
-        crate::settings::pill_alpha(),
-        crate::settings::dock_alpha()
+        crate::settings::ui_alpha()
     );
     load_runtime();
     let options = eframe::NativeOptions {
@@ -345,10 +347,14 @@ pub fn run_child() {
             .with_title(TITLE)
             .with_visible(false)
             .with_resizable(false)
+            // 还是自绘边框（圆角 + 主题色一体），但窗口要能被拖动，
+            // 拖动由标题栏自己发 `StartDrag` 实现（见 `header`）
             .with_decorations(false)
             // 不置顶：打开时 Focus 弹到最前即可（置顶会挡住别的窗口）
-            // Windows：不占任务栏（对齐旧版分层小窗的行为）
-            .with_taskbar(false)
+            // Windows：占任务栏 = 出现在 Alt+Tab 和 Dock 的"运行中应用"里，
+            // 点任务栏图标就能把它拉回前台（不占任务栏时是 WS_EX_TOOLWINDOW，
+            // 两边都会被系统过滤掉）
+            .with_taskbar(true)
             .with_inner_size([WIN_W, WIN_H]),
         // 允许在非主线程建事件循环（保留原行为，子进程里其实是主线程）
         event_loop_builder: Some(Box::new(|builder| {
@@ -729,6 +735,12 @@ impl SettingsApp {
         self.edits.clock = settings::clock_format();
         self.edits.wechat_ignore = settings::wechat_ignore_text();
         self.edits.banner_secs = settings::banner_secs().to_string();
+        // 四个来源的输入框也要一起初始化：以前只填了 banner_secs，另外四个空着 →
+        // 打开页面看到的是 hint 里的「6」，要等点进输入框失焦一次才读本地值
+        self.edits.banner_secs_wechat = settings::banner_secs_wechat().to_string();
+        self.edits.banner_secs_mail = settings::banner_secs_mail().to_string();
+        self.edits.banner_secs_tray = settings::banner_secs_tray().to_string();
+        self.edits.banner_secs_clipboard = settings::banner_secs_clipboard().to_string();
         self.edits.amap = settings::amap_key();
         let (h, p, u, w) = settings::mail_overrides();
         self.edits.host = h.unwrap_or_default();
@@ -750,8 +762,27 @@ impl SettingsApp {
         }
     }
 
-    /// 常规设置：主题 / 字体 / 系统（开机启动、退出守护）/ 通知接管与方式 / 横幅时长 / 提示音
+    /// 常规设置：字体 / 外观（主题 + 胶囊透明度·大小）/ 系统（开机启动、退出守护）
+    /// / 通知接管与方式 / 横幅时长 / 提示音
     fn detail_general(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+        // 字体放最上面：一换字体整页字全变，第一眼就能看出效果
+        section(ui, "界面字体");
+        if let Some(pick) = seg(
+            ui,
+            &["MiSans", "系统字体"],
+            if settings::use_misans() { 0 } else { 1 },
+        ) {
+            settings::set_use_misans(pick == 0);
+            crate::tlog!("[settings] 界面字体 → {}", if settings::use_misans() { "MiSans" } else { "系统字体" });
+        }
+        ui.label(
+            egui::RichText::new("MiSans 随程序目录分发（data/MiSans-Semibold.ttf，缺失时回落系统字体）；系统字体 = 微软雅黑等本机字体")
+                .size(11.5)
+                .weak(),
+        );
+
+        ui.add_space(10.0);
+        ui.add_space(10.0);
         section(ui, "外观");
         // 外观主题：一排小色块，直接用主题自己的底色画，所见即所得
         ui.horizontal(|ui| {
@@ -802,18 +833,100 @@ impl SettingsApp {
             );
         });
 
-        ui.add_space(4.0);
-        section(ui, "界面字体");
-        if let Some(pick) = seg(
-            ui,
-            &["MiSans", "系统字体"],
-            if settings::use_misans() { 0 } else { 1 },
-        ) {
-            settings::set_use_misans(pick == 0);
-            crate::tlog!("[settings] 界面字体 → {}", if settings::use_misans() { "MiSans" } else { "系统字体" });
-        }
+        // 透明度 / 胶囊大小 / 胶囊形状 / Dock 位置：都属于"外观"，统一放在主题下面。
+        // 透明度是**一个值管所有界面**（胶囊 / 模块条 / 音乐条 / Dock / 面板 /
+        // 开始菜单 / 横幅），天气卡片不受影响。
+        ui.add_space(8.0);
+        egui::Grid::new("g_pill_look")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                // 界面透明度：滑条（拖动时只做即时预览，松手才落盘）
+                let mut alpha = settings::ui_alpha();
+                ui.label(row_label("界面透明度"));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    // Slider 的宽度取 spacing.slider_width（add_sized 管不到它）
+                    ui.spacing_mut().slider_width = CTRL_W - 116.0;
+                    let r = ui.add(
+                        egui::Slider::new(&mut alpha, settings::ALPHA_MIN..=settings::ALPHA_MAX)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    if r.changed() {
+                        settings::preview_ui_alpha(alpha);
+                    }
+                    // 松手（或点击轨道、键盘微调这类一次性改动）才写盘
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        settings::persist_ui_alpha();
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}%", settings::ui_alpha() * 100.0))
+                            .size(12.5)
+                            .monospace(),
+                    );
+                });
+                ui.end_row();
+
+                ui.label(row_label("胶囊大小"));
+                scale_row(
+                    ui,
+                    settings::pill_scale_setting(),
+                    settings::PILL_SCALE_MIN,
+                    settings::PILL_SCALE_MAX,
+                    settings::preview_pill_scale,
+                    settings::persist_pill_scale,
+                    || settings::set_pill_scale(1.0),
+                );
+                ui.end_row();
+
+                // Dock 大小（原「Dock」分组里的图标大小）：跟胶囊大小挨着，一起比着调
+                ui.label(row_label("Dock 大小"));
+                scale_row(
+                    ui,
+                    settings::icon_scale_setting(),
+                    settings::ICON_SCALE_MIN,
+                    settings::ICON_SCALE_MAX,
+                    settings::preview_icon_scale,
+                    settings::persist_icon_scale,
+                    || settings::set_icon_scale(1.0),
+                );
+                ui.end_row();
+
+                // 胶囊形状（原「顶部胶囊」分组里的第一项）
+                ui.label(row_label("胶囊形状"));
+                let shape = match settings::pill_anchor() {
+                    PillAnchor::Float => 0,
+                    PillAnchor::Island => 1,
+                };
+                if let Some(i) = seg(ui, &["悬浮胶囊", "吸顶刘海"], shape) {
+                    settings::set_pill_anchor(match i {
+                        1 => PillAnchor::Island,
+                        _ => PillAnchor::Float,
+                    });
+                }
+                ui.end_row();
+
+                // Dock 位置（原「Dock」分组里的第一项）
+                ui.label(row_label("Dock 位置"));
+                let a = match settings::dock_anchor() {
+                    DockAnchor::Bottom => 0,
+                    DockAnchor::Top => 1,
+                    DockAnchor::Left => 2,
+                    DockAnchor::Right => 3,
+                };
+                if let Some(i) = seg(ui, &["下", "上", "左", "右"], a) {
+                    settings::set_dock_anchor(match i {
+                        1 => DockAnchor::Top,
+                        2 => DockAnchor::Left,
+                        3 => DockAnchor::Right,
+                        _ => DockAnchor::Bottom,
+                    });
+                }
+                ui.end_row();
+            });
         ui.label(
-            egui::RichText::new("MiSans 随程序目录分发（data/MiSans-Semibold.ttf，缺失时回落系统字体）；系统字体 = 微软雅黑等本机字体")
+            egui::RichText::new("界面透明度只调这些界面的背景底色（胶囊 / 模块条 / 音乐条 / Dock / 面板 / 开始菜单 / 横幅，天气卡片除外），文字与图标始终不透明；两个「大小」各自只缩放那一块")
                 .size(11.5)
                 .weak(),
         );
@@ -834,7 +947,7 @@ impl SettingsApp {
                 );
             }
             ui.label(
-                egui::RichText::new("开机自启动（写注册表 HKCU\\…\\CurrentVersion\\Run）")
+                egui::RichText::new("开机自启动（Run 键 + 启动文件夹 + 计划任务三通道；计划任务需弹一次 UAC）")
                     .size(11.5)
                     .weak(),
             );
@@ -858,11 +971,12 @@ impl SettingsApp {
             );
         });
         ui.label(
-            egui::RichText::new("守护随 orbit 启动；开关在下次启动 orbit 时生效。正常退出（Ctrl+Alt+O）不会触发重启任务栏")
+            egui::RichText::new("守护随 orbit 启动；开关在下次启动 orbit 时生效。正常退出（Ctrl+Alt+O）不触发复活；异常 / panic 退出时守护会自动复活 orbit（连续最多 3 次，复活成功或正常退出后计数清零）")
                 .size(11.5)
                 .weak(),
         );
 
+        ui.add_space(10.0);
         ui.add_space(10.0);
         section(ui, "通知接管（微信）");
         ui.horizontal(|ui| {
@@ -966,6 +1080,7 @@ impl SettingsApp {
         }
 
         ui.add_space(10.0);
+        ui.add_space(10.0);
         section(ui, "通知方式");
         ui.label(
             egui::RichText::new("每类消息各自选择弹在哪里：Orbit 横幅（右下角卡片）/ Windows 系统通知 / 不通知")
@@ -1004,6 +1119,32 @@ impl SettingsApp {
                     ui.end_row();
                 }
             });
+
+        ui.add_space(10.0);
+        ui.add_space(10.0);
+        section(ui, "接管系统通知");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let on = settings::notify_takeover();
+            if toggle_btn(ui, on, "接管通知中心") {
+                settings::set_notify_takeover(!on);
+                crate::tlog!(
+                    "[settings] 接管系统通知 → {}",
+                    if settings::notify_takeover() { "开启" } else { "关闭" }
+                );
+            }
+            ui.label(
+                egui::RichText::new("其它程序的 Windows 通知改在 Orbit 横幅里显示，并从通知中心撤掉")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+        // 授权结果由主进程的监听线程写进 data/notify-access.txt，子进程读同一份
+        ui.label(
+            egui::RichText::new(crate::notifycenter::access_hint())
+                .size(11.0)
+                .weak(),
+        );
 
         ui.add_space(10.0);
         section(ui, "横幅显示时长");
@@ -1063,6 +1204,7 @@ impl SettingsApp {
             });
 
         ui.add_space(10.0);
+        ui.add_space(10.0);
         section(ui, "提示音");
         let mode = settings::sound_mode();
         let idx = match mode {
@@ -1118,7 +1260,7 @@ impl SettingsApp {
         section(ui, "开始菜单快捷方式");
         ui.label(
             egui::RichText::new(format!(
-                "上栏每行 {} 个（最多两行）；可调整顺序。路径前加 @admin: 表示以管理员权限启动",
+                "上栏每行 {} 个（最多两行）；拖动行首圆点或点 ↑↓ 调整顺序。路径前加 @admin: 表示以管理员权限启动",
                 settings::start_cols()
             ))
             .size(11.5)
@@ -1145,13 +1287,37 @@ impl SettingsApp {
             );
         }
         let n = pins.len();
+        // 拖动排序：全局 payload 记「正在拖哪一行」，拖到别的行上实时交换
+        let dragging = egui::DragAndDrop::payload::<usize>(ui.ctx()).map(|p| *p);
+        let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
         for (i, (name, target)) in pins.iter().enumerate() {
             let admin = target
                 .strip_prefix("@admin:")
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| target.clone());
-            ui.horizontal(|ui| {
+            let row = ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
+                // 拖动把手：2×3 圆点 grip（手绘，不依赖字体字形）。按住拖到目标行即可换位
+                let (hr, hresp) = ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::drag());
+                let dot_color = if dragging == Some(i) {
+                    argb(cfg::cur().accent)
+                } else {
+                    argb(cfg::cur().text_dim)
+                };
+                let c = hr.center();
+                for dx in [-3.0f32, 3.0] {
+                    for dy in [-4.5f32, 0.0, 4.5] {
+                        ui.painter().circle_filled(c + egui::vec2(dx, dy), 1.2, dot_color);
+                    }
+                }
+                let hresp = hresp.on_hover_text("按住拖动调整顺序");
+                if hresp.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), i);
+                }
+                if hresp.drag_stopped() {
+                    egui::DragAndDrop::clear_payload(ui.ctx());
+                }
+                hresp.on_hover_cursor(egui::CursorIcon::Grab);
                 ui.label(
                     egui::RichText::new(format!("{}.", i + 1))
                         .size(11.5)
@@ -1196,7 +1362,65 @@ impl SettingsApp {
                     }
                 });
             });
+            row_rects.push((i, row.response.rect));
         }
+
+        // 拖着走的行悬到另一行上：实时交换顺序（松手即定格）
+        if let Some(src) = dragging {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                if let Some(&(j, _)) = row_rects.iter().find(|(_, r)| r.contains(pos)) {
+                    if j != src {
+                        let mut list = settings::start_pins();
+                        if src < list.len() && j < list.len() {
+                            let item = list.remove(src);
+                            list.insert(j, item);
+                            settings::set_start_pins(list);
+                            egui::DragAndDrop::set_payload(ui.ctx(), j);
+                        }
+                    }
+                }
+            }
+        }
+
+        ui.add_space(6.0);
+        // 常用程序一键添加：Windows 里没有「任务管理器」的开始菜单项，想加到
+        // Orbit 开始菜单只能自己翻路径找 Taskmgr.exe，这里给个现成入口。
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(
+                egui::RichText::new("快速添加")
+                    .size(11.5)
+                    .color(argb(cfg::cur().text_dim)),
+            );
+            let taskmgr = settings::taskmgr_path();
+            let target = taskmgr.as_ref().map(|p| p.to_string_lossy().to_string());
+            let added = target
+                .as_ref()
+                .map_or(false, |t| pins.iter().any(|(_, p)| p.eq_ignore_ascii_case(t)));
+            let full = n >= settings::start_max_pins();
+            let r = ui
+                .add_enabled(
+                    taskmgr.is_some() && !added && !full,
+                    egui::Button::new("任务管理器").small(),
+                )
+                .on_hover_text(if taskmgr.is_none() {
+                    "没找到 Taskmgr.exe"
+                } else if added {
+                    "已经在列表里了"
+                } else if full {
+                    "开始菜单格子已满，先移除一条再加"
+                } else {
+                    "在开始菜单里加一条「任务管理器」快捷方式（Taskmgr.exe）"
+                });
+            if r.clicked() {
+                if let Some(t) = target {
+                    let mut list = settings::start_pins();
+                    list.push(("任务管理器".to_string(), t));
+                    settings::set_start_pins(list);
+                    crate::tlog!("[settings] 开始菜单添加 → 任务管理器");
+                }
+            }
+        });
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -1243,64 +1467,16 @@ impl SettingsApp {
 
     fn detail_pill(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
         section(ui, "顶部胶囊");
+        ui.label(
+            egui::RichText::new("透明度、大小、形状和 Dock 位置都在「常规设置 → 外观」里调，这里只管圆角与胶囊内容")
+                .size(11.5)
+                .weak(),
+        );
+        ui.add_space(6.0);
         egui::Grid::new("g_pill")
             .num_columns(2)
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
-                // 透明度：滑条（拖动时只做即时预览，松手才落盘）
-                let mut alpha = settings::pill_alpha();
-                ui.label(row_label("透明度"));
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    // Slider 的宽度取 spacing.slider_width（add_sized 管不到它）
-                    ui.spacing_mut().slider_width = CTRL_W - 116.0;
-                    let r = ui.add(
-                        egui::Slider::new(&mut alpha, settings::ALPHA_MIN..=settings::ALPHA_MAX)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    );
-                    if r.changed() {
-                        settings::preview_pill_alpha(alpha);
-                    }
-                    // 松手（或点击轨道、键盘微调这类一次性改动）才写盘
-                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                        settings::persist_pill_alpha();
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{:.0}%", settings::pill_alpha() * 100.0))
-                            .size(12.5)
-                            .monospace(),
-                    );
-                });
-                ui.end_row();
-
-                ui.label(row_label("大小"));
-                scale_row(
-                    ui,
-                    settings::pill_scale_setting(),
-                    settings::PILL_SCALE_MIN,
-                    settings::PILL_SCALE_MAX,
-                    settings::preview_pill_scale,
-                    settings::persist_pill_scale,
-                    || settings::set_pill_scale(1.0),
-                );
-                ui.end_row();
-
-                ui.label(row_label("形状"));
-                let shape = match settings::pill_anchor() {
-                    PillAnchor::Float => 0,
-                    PillAnchor::Island => 1,
-                    PillAnchor::Bottom => 2,
-                };
-                if let Some(i) = seg(ui, &["悬浮胶囊", "吸顶刘海", "吸底"], shape) {
-                    settings::set_pill_anchor(match i {
-                        1 => PillAnchor::Island,
-                        2 => PillAnchor::Bottom,
-                        _ => PillAnchor::Float,
-                    });
-                }
-                ui.end_row();
-
                 // 圆角：胶囊 / 音乐条 / 模块条 / Dock 共用（默认 14px = 圆角矩形）
                 ui.label(row_label("圆角"));
                 let mut cr = settings::corner_radius();
@@ -1774,63 +1950,13 @@ impl SettingsApp {
 
     fn detail_dock(&mut self, ui: &mut egui::Ui) {
         section(ui, "Dock");
-        egui::Grid::new("g_dock")
-            .num_columns(2)
-            .spacing([10.0, 8.0])
-            .show(ui, |ui| {
-                ui.label(row_label("位置"));
-                let a = match settings::dock_anchor() {
-                    DockAnchor::Bottom => 0,
-                    DockAnchor::Top => 1,
-                    DockAnchor::Left => 2,
-                    DockAnchor::Right => 3,
-                };
-                if let Some(i) = seg(ui, &["下", "上", "左", "右"], a) {
-                    settings::set_dock_anchor(match i {
-                        1 => DockAnchor::Top,
-                        2 => DockAnchor::Left,
-                        3 => DockAnchor::Right,
-                        _ => DockAnchor::Bottom,
-                    });
-                }
-                ui.end_row();
-
-                // Dock 独立透明度（与顶部胶囊分开）
-                let mut alpha = settings::dock_alpha();
-                ui.label(row_label("透明度"));
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.spacing_mut().slider_width = CTRL_W - 116.0;
-                    let r = ui.add(
-                        egui::Slider::new(&mut alpha, settings::ALPHA_MIN..=settings::ALPHA_MAX)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    );
-                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                        settings::set_dock_alpha(alpha);
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{:.0}%", alpha * 100.0))
-                            .size(12.5)
-                            .monospace(),
-                    );
-                });
-                ui.end_row();
-
-                ui.label(row_label("图标大小"));
-                scale_row(
-                    ui,
-                    settings::icon_scale_setting(),
-                    settings::ICON_SCALE_MIN,
-                    settings::ICON_SCALE_MAX,
-                    settings::preview_icon_scale,
-                    settings::persist_icon_scale,
-                    || settings::set_icon_scale(1.0),
-                );
-                ui.end_row();
-            });
         ui.label(
-            egui::RichText::new("图标大小会连同 Dock 高度、槽位和托盘图标等比缩放；点「重置」回到默认尺寸。圆角在「顶部胶囊 → 圆角」里统一调整。")
+            egui::RichText::new("Dock 位置、界面透明度和 Dock 大小在「常规设置 → 外观」里调，这里只管托盘与固定图标")
+                .size(11.5)
+                .weak(),
+        );
+        ui.label(
+            egui::RichText::new("Dock 大小会连同 Dock 高度、槽位和托盘图标等比缩放；圆角在「顶部胶囊 → 圆角」里统一调整。")
                 .size(11.5)
                 .weak(),
         );
@@ -2024,6 +2150,20 @@ impl SettingsApp {
 
 
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // 没有系统边框，标题栏要自己承担"拖动窗口"：
+        // 在标题栏左段（右侧 ~150px 留给「应用 / 还原 / ✕」按钮）铺一个拖动响应，
+        // 按下去就发 `StartDrag`，交给系统进入移动循环——和拖原生标题栏一个手感
+        // （含贴边吸附）。刻意避开按钮区：压在按钮上按下再拖不会变成拖窗口。
+        let bar = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2((ui.available_width() - 150.0).max(60.0), 28.0),
+        );
+        let drag = ui.interact(bar, ui.make_persistent_id("set_titlebar"), egui::Sense::drag());
+        if drag.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        drag.on_hover_cursor(egui::CursorIcon::Grab);
+
         ui.horizontal(|ui| {
             ui.label(egui_soft::bold("Orbit 设置").size(17.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

@@ -41,6 +41,9 @@ windows = { version = "0.58", features = [
     "Storage_Streams",
     "Data_Xml_Dom",
     "UI_Notifications",
+    "UI_Notifications_Management",
+    "ApplicationModel",
+    "Foundation_Collections",
 ] }
 
 native-tls = "0.2"

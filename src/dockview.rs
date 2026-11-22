@@ -246,7 +246,7 @@ impl DockView {
                 let cr = egui::CornerRadius::same(radius.round() as u8);
                 // 底色 + 内描边（描边内移到 shrink(1.5)，羽化不出窗——
                 // 画在 shrink(0.5) 时会往壁纸溢一圈白边）
-                glass_board_with(&p, board, cr, cfg::dock_bg_effective());
+                glass_board_with(&p, board, cr, cfg::ui_bg_effective());
                 // 迎光面的细反光：水平条画在上缘，竖排条画在左缘；两端内缩掉圆角，
                 // 免得直角的亮线从圆角里探出去
                 if vertical {
@@ -482,7 +482,7 @@ impl DockView {
                 p.rect_filled(
                     egui::Rect::from_min_size(egui::pos2(0.5, 0.5), egui::vec2(fw - 1.0, fh - 1.0)),
                     egui::CornerRadius::same(cfg::cur().tip_radius as u8),
-                    argb(cfg::cur().tip_bg),
+                    argb(cfg::bg_alpha(cfg::cur().tip_bg)),
                 );
                 p.text(
                     egui::pos2(pad_x, pad_y),
@@ -569,7 +569,7 @@ impl DockView {
                 let board = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
                 let rad = egui::CornerRadius::same(cfg::cur().panel_radius.min(12.0) as u8);
                 // 按胶囊的画法：只铺底，不画描边（描边羽化会溢出窗口边界成白边）
-                p.rect_filled(board, rad, argb(cfg::cur().panel_bg));
+                p.rect_filled(board, rad, argb(cfg::bg_alpha(cfg::cur().panel_bg)));
                 for (i, label) in labels.iter().enumerate() {
                     let ry = pad + i as f32 * row_h;
                     let row = egui::Rect::from_min_size(
