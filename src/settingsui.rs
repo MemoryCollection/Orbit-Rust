@@ -1204,6 +1204,28 @@ impl SettingsApp {
             });
 
         ui.add_space(10.0);
+        section(ui, "横幅大小");
+        ui.label(
+            egui::RichText::new("拖动滑块调整右下角横幅的整体大小，屏幕右下角会弹预览卡实时看效果")
+                .size(11.5)
+                .weak(),
+        );
+        scale_row(
+            ui,
+            settings::banner_scale_setting(),
+            settings::BANNER_SCALE_MIN,
+            settings::BANNER_SCALE_MAX,
+            |v| {
+                settings::preview_banner_scale(v);
+                crate::banner::show_preview(); // 拖动即弹样例卡，原位换新尺寸
+            },
+            settings::persist_banner_scale,
+            || {
+                settings::set_banner_scale(1.0);
+                crate::banner::show_preview(); // 重置后也弹一张 100% 的样例卡
+            },
+        );
+
         ui.add_space(10.0);
         section(ui, "提示音");
         let mode = settings::sound_mode();

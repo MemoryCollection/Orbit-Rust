@@ -67,6 +67,9 @@ pub struct BannerNotice {
     /// 消息来源：wechat / mail / tray / clipboard / other。
     /// 用于按来源选通知通道（Orbit 横幅 / Windows 通知 / 关）和横幅时长。
     pub source: &'static str,
+    /// 设置页「横幅大小」滑块的预览样例卡：弹出时把已有的预览卡原位替换
+    /// （不会堆出一摞），不进通知通道、不响
+    pub preview: bool,
 }
 
 impl BannerNotice {
@@ -82,6 +85,7 @@ impl BannerNotice {
             secs: None,
             flash_key: None,
             source: "other",
+            preview: false,
         }
     }
 
@@ -125,6 +129,7 @@ impl BannerNotice {
             secs: None,
             flash_key: None,
             source: "wechat",
+            preview: false,
         }
     }
 }
@@ -180,6 +185,8 @@ struct Banner {
     hovered: bool,
     mouse_tracked: bool,
     size: (i32, i32),
+    /// 上次重排用的缩放（DPI × 横幅大小设置）：变了要整叠重排重绘
+    last_scale: f32,
 }
 
 pub fn init(instance: HINSTANCE) {
@@ -198,6 +205,7 @@ pub fn init(instance: HINSTANCE) {
             hovered: false,
             mouse_tracked: false,
             size: (0, 0),
+            last_scale: 0.0,
         }));
         match CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -248,6 +256,33 @@ pub fn show(notice: BannerNotice) {
         }
         NotifyChannel::Orbit => {}
     }
+    let h = hwnd();
+    let raw = Box::into_raw(Box::new(notice));
+    unsafe {
+        if h.is_invalid()
+            || PostMessageW(h, WM_BANNER, WPARAM(0), LPARAM(raw as isize)).is_err()
+        {
+            drop(Box::from_raw(raw)); // 窗口还没建好：别泄漏
+        }
+    }
+}
+
+/// 设置页「横幅大小」滑块的实时预览：弹一张样例卡（不响、4 秒后自动消失；
+/// 继续拖动会原位换成新尺寸，不会堆出一摞卡）。不走通知通道开关——
+/// 通道设成 Windows 通知 / 关也能看到预览。
+pub fn show_preview() {
+    let notice = BannerNotice {
+        tag: "预览".to_string(),
+        badge: format!("{:.0}%", (settings::banner_scale() * 100.0).round()),
+        main: "横幅大小预览".to_string(),
+        sub: "拖动滑块调整大小，松手后几秒自动消失".to_string(),
+        silent: true,
+        pid: 0,
+        secs: Some(4),
+        flash_key: None,
+        source: "other",
+        preview: true,
+    };
     let h = hwnd();
     let raw = Box::into_raw(Box::new(notice));
     unsafe {
@@ -408,6 +443,11 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                             live.insert(key.clone(), ());
                         }
                     }
+                    // 预览卡：先摘掉旧的预览卡再入队——滑块拖动时原位换新尺寸，
+                    // 不会越拖堆得越高
+                    if notice.preview {
+                        c.cards.retain(|card| !card.notice.preview);
+                    }
                     // 新横幅追加到队尾（屏幕下方），旧的留在上面，不替换当前显示内容。
                     // 停留秒数：模块自己给的优先，否则用该来源的「横幅秒数」（0 = 常驻）
                     let secs = notice
@@ -455,6 +495,17 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                 if w.0 == TIMER_CTRL {
                     sync_reader();
                     flash_tick(); // 顺带检查：不闪了的微信横幅该收了
+                    // 横幅大小设置变了（配置文件改写 / 外部通知）：正在显示的
+                    // 整叠立即按新尺寸重排重绘（预览卡走 WM_BANNER 自己会重排）
+                    let s = c.scale(h);
+                    if (s - c.last_scale).abs() > 1e-4 {
+                        c.last_scale = s;
+                        if !c.cards.is_empty() {
+                            c.hovered = false;
+                            c.place(h);
+                            c.render(h);
+                        }
+                    }
                 } else if w.0 == TIMER_CARD && !c.cards.is_empty() {
                     // 每张按自己的到达时间与秒数独立到期；悬停时整叠暂停；0 秒 = 不自动关闭
                     let hovered = c.hovered;
@@ -575,7 +626,7 @@ impl Banner {
 
     fn scale(&self, h: HWND) -> f32 {
         let dpi = unsafe { GetDpiForWindow(h) } as f32 / 96.0;
-        (settings::pill_scale() * dpi).max(0.6)
+        (settings::banner_scale() * dpi).max(0.6)
     }
 
     fn place(&mut self, h: HWND) {

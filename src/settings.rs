@@ -95,6 +95,11 @@ pub const ICON_SCALE_MIN: f32 = 0.80;
 pub const ICON_SCALE_MAX: f32 = 1.35;
 /// 滑条"100%"对应的实际倍率：Dock 整体收到原来的 95%
 const ICON_SCALE_BASE: f32 = 0.95;
+/// 右下角横幅整体大小上下限：1.0 = 当前默认卡片尺寸（660×138 逻辑点）
+pub const BANNER_SCALE_MIN: f32 = 0.80;
+pub const BANNER_SCALE_MAX: f32 = 1.50;
+/// 滑条"100%"对应的实际倍率：横幅沿用胶囊时代的 85% 基准，100% = 发布版实际大小
+const BANNER_SCALE_BASE: f32 = 0.85;
 /// AtomicU32 的 0 表示"还没加载"
 const UNLOADED: u32 = 0;
 
@@ -122,6 +127,7 @@ static UI_ALPHA: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 胶囊缩放 / Dock 图标缩放（f32 位型）
 static PILL_SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
 static ICON_SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
+static BANNER_SCALE: AtomicU32 = AtomicU32::new(UNLOADED);
 static PILL_ANCHOR: AtomicU32 = AtomicU32::new(UNLOADED);
 static DOCK_ANCHOR: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 统一圆角半径（f32 位型）：胶囊 / 音乐条 / 模块条 / Dock 共用
@@ -585,6 +591,50 @@ pub fn set_icon_scale(v: f32) {
         return;
     }
     ICON_SCALE.store(v.to_bits(), Ordering::Relaxed);
+    save();
+    bump();
+}
+
+/// 横幅滑条上的原始值（1.0 = 滑条 100%，即当前默认卡片尺寸）
+pub fn banner_scale_setting() -> f32 {
+    banner_scale_raw()
+}
+
+fn banner_scale_raw() -> f32 {
+    match BANNER_SCALE.load(Ordering::Relaxed) {
+        UNLOADED => 1.0,
+        bits => f32::from_bits(bits).clamp(BANNER_SCALE_MIN, BANNER_SCALE_MAX),
+    }
+}
+
+/// 右下角横幅的整体缩放（卡片宽高 / 字号 / 内边距一起等比变），1.0 = 滑条 100%。
+/// 实际绘制倍率已经乘上 `BANNER_SCALE_BASE`（100% = 发布版实际大小）
+pub fn banner_scale() -> f32 {
+    banner_scale_raw() * BANNER_SCALE_BASE
+}
+
+/// 滑条拖动中的即时预览（只改内存 + 通知重绘，不写盘）
+pub fn preview_banner_scale(v: f32) {
+    let v = v.clamp(BANNER_SCALE_MIN, BANNER_SCALE_MAX);
+    if (v - banner_scale_raw()).abs() < 1e-4 {
+        return;
+    }
+    BANNER_SCALE.store(v.to_bits(), Ordering::Relaxed);
+    bump();
+}
+
+pub fn persist_banner_scale() {
+    save();
+    bump();
+}
+
+/// 一步到位地设值（「重置」按钮用）：改内存 + 落盘 + 通知重绘
+pub fn set_banner_scale(v: f32) {
+    let v = v.clamp(BANNER_SCALE_MIN, BANNER_SCALE_MAX);
+    if (v - banner_scale_raw()).abs() < 1e-4 {
+        return;
+    }
+    BANNER_SCALE.store(v.to_bits(), Ordering::Relaxed);
     save();
     bump();
 }
@@ -1761,6 +1811,7 @@ fn save() {
         ("alpha", trim_num(ui_alpha())),
         ("pill_scale", trim_num(pill_scale_raw())),
         ("icon_scale", trim_num(icon_scale_raw())),
+        ("banner_scale", trim_num(banner_scale_raw())),
         ("corner_radius", trim_num(corner_radius())),
         ("theme", crate::theme::cur().key.to_string()),
         ("pill_anchor", pill_anchor().as_str().to_string()),
@@ -1915,6 +1966,7 @@ struct Snap {
     alpha: f32,
     pill_scale: f32,
     icon_scale: f32,
+    banner_scale: f32,
     theme: usize,
     pill_anchor: PillAnchor,
     dock_anchor: DockAnchor,
@@ -1960,6 +2012,7 @@ fn snapshot() -> Snap {
         alpha: ui_alpha(),
         pill_scale: pill_scale(),
         icon_scale: icon_scale(),
+        banner_scale: banner_scale(),
         theme: crate::theme::index(),
         pill_anchor: pill_anchor(),
         dock_anchor: dock_anchor(),
@@ -2092,6 +2145,8 @@ alpha=1.0
 # 胶囊整体大小 / Dock 图标大小（1.0 = 滑条 100%，0.8 ~ 1.35；设置页里有滑条和「重置」）
 pill_scale=1
 icon_scale=1
+# 右下角横幅整体大小（1.0 = 默认卡片尺寸，0.8 ~ 1.5；设置页有滑条和「重置」，拖动时右下角弹预览卡）
+banner_scale=1
 # 统一圆角半径（逻辑点，0 = 直角，默认 14 = 圆角矩形）：
 # 顶部胶囊 / 音乐条 / 模块条 / Dock 共用，调到条高一半就是完全胶囊形
 corner_radius=14
@@ -2214,6 +2269,7 @@ fn append_missing() {
             "# 胶囊 / Dock 图标大小（1.0 = 滑条 100%，0.8 ~ 1.35；设置页有滑条和「重置」）\n\
              pill_scale=1\nicon_scale=1\n",
         ),
+        ("banner_scale", "# 右下角横幅整体大小（1.0 = 默认，0.8 ~ 1.5；设置页有滑条和「重置」）\nbanner_scale=1\n"),
         (
             "corner_radius",
             "# 统一圆角半径（逻辑点，0 = 直角，默认 14 = 圆角矩形）：\n\
@@ -2322,6 +2378,7 @@ fn load() {
     let mut alpha_legacy = 1.0f32;
     let mut pscale = 1.0f32;
     let mut iscale = 1.0f32;
+    let mut bscale = 1.0f32;
     let mut corner = CORNER_DEFAULT;
     let mut tkey: String = crate::theme::cur().key.to_string();
     let mut panchor = PillAnchor::Float;
@@ -2403,6 +2460,11 @@ fn load() {
             "icon_scale" => {
                 if let Some(n) = parse_num(v) {
                     iscale = n.clamp(ICON_SCALE_MIN, ICON_SCALE_MAX);
+                }
+            }
+            "banner_scale" => {
+                if let Some(n) = parse_num(v) {
+                    bscale = n.clamp(BANNER_SCALE_MIN, BANNER_SCALE_MAX);
                 }
             }
             "corner_radius" => {
@@ -2628,6 +2690,7 @@ fn load() {
     UI_ALPHA.store(alpha.to_bits(), Ordering::Relaxed);
     PILL_SCALE.store(pscale.to_bits(), Ordering::Relaxed);
     ICON_SCALE.store(iscale.to_bits(), Ordering::Relaxed);
+    BANNER_SCALE.store(bscale.to_bits(), Ordering::Relaxed);
     CORNER.store(corner.to_bits(), Ordering::Relaxed);
     // 主题：所有绘制都走 theme::cur()，存一次索引即可，不必逐个窗口通知
     if let Some(i) = crate::theme::index_of(&tkey) {
