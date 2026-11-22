@@ -22,7 +22,27 @@ Rust + 原生 Win32 + egui 软件光栅化实现——**没有 WebView、没有�
 
 ## 界面预览
 
-<!-- SHOT: 待补最新截图（替换本注释，格式：![说明](docs/images/xxx.png)） -->
+全桌面效果：顶部胶囊（时钟）+ 右侧竖排 Dock + 右上角天气卡片，原生任务栏已接管：
+
+![Orbit 桌面全览](docs/images/desktop.jpg)
+
+各模块细节：
+
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="docs/images/weather-card.png" width="220" alt="天气卡片"><br><sub><b>桌面天气卡片</b>（高德 / Open-Meteo）</sub></td>
+    <td align="center" width="33%"><img src="docs/images/start-menu.png" width="240" alt="开始菜单"><br><sub><b>开始菜单</b>（Win 键接管）</sub></td>
+    <td align="center" width="33%"><img src="docs/images/banner.png" width="260" alt="通知横幅"><br><sub><b>通知横幅</b>（邮件 / 微信，可堆叠）</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/images/clipboard-panel.png" width="240" alt="剪切板面板"><br><sub><b>剪切板模块</b>（胶囊展开面板）</sub></td>
+    <td align="center"><img src="docs/images/dock-side.png" width="110" alt="侧边 Dock"><br><sub><b>侧边 Dock</b>（左 / 右锚位）</sub></td>
+    <td align="center"><img src="docs/images/dock-hover.png" width="110" alt="悬停放大"><br><sub><b>波浪悬停放大</b>（冒出部分可点击）</sub></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="3"><img src="docs/images/mail-module.png" width="300" alt="邮件模块条"><br><sub><b>邮件模块条</b>（未读数 + 验证码抽取）</sub></td>
+  </tr>
+</table>
 
 ## 功能一览
 
@@ -126,6 +146,7 @@ cargo run --release -- --show-taskbar   # 保留原生任务栏运行（调试�
 
 - 面向 **Windows 11**（23H2 为主力目标）与**主显示器**设计，未做多屏适配。
 - 仅支持 x64。
+- 界面在 14 寸 / 1920×1080 笔记本屏上开发与验证，高分辨率 / 高 DPI 屏上的显示效果尚未充分验证，欢迎反馈截图。
 - 微信消息卡片依赖微信客户端 UIA 树，微信版本更新可能影响读取（可随时关闭该功能）。
 
 ## 许可与致谢
