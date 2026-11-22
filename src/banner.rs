@@ -129,11 +129,11 @@ impl BannerNotice {
     }
 }
 
-/// 横幅逻辑尺寸（96 DPI 基准）。宽 = 原 330 + 1/3
-const CARD_W: f32 = 440.0;
-const CARD_H: f32 = 92.0;
+/// 横幅逻辑尺寸（96 DPI 基准）。1.5 倍：宽 440 → 660，高 92 → 138
+const CARD_W: f32 = 660.0;
+const CARD_H: f32 = 138.0;
 /// 堆叠时相邻横幅的间隙；新条在下方，旧的往上递增
-const CARD_GAP: f32 = 8.0;
+const CARD_GAP: f32 = 12.0;
 /// 最多同时显示几条，超出丢最旧的
 const MAX_CARDS: usize = 5;
 const TIMER_CARD: usize = 1;
@@ -541,7 +541,7 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                 let x = pt.x - r.left;
                 let y = pt.y - r.top;
                 let (ww, hh) = c.size;
-                if inside_round(x as f32, y as f32, ww as f32, hh as f32, 14.0) {
+                if inside_round(x as f32, y as f32, ww as f32, hh as f32, 21.0) {
                     LRESULT(HTCLIENT as isize)
                 } else {
                     LRESULT(HTTRANSPARENT as isize)
@@ -590,12 +590,12 @@ impl Banner {
         let mon = crate::window::primary_monitor();
         // Dock 在屏幕底部：横幅抬到 Dock 上方，别盖住图标
         let dock_h = if cfg::SHOW_DOCK && settings::dock_anchor() == settings::DockAnchor::Bottom {
-            (cfg::DOCK_H * settings::icon_scale()).round() as i32 + cfg::DOCK_BOTTOM_MARGIN + 8
+            (cfg::DOCK_H * settings::icon_scale()).round() as i32 + cfg::DOCK_BOTTOM_MARGIN + 48
         } else {
-            10
+            48
         };
         // 距右缘多留一些：整体比原来向左挪一点，不顶着屏幕边
-        let x = (mon.rcMonitor.right - w - 32).max(mon.rcMonitor.left + 8);
+        let x = (mon.rcMonitor.right - w - 64).max(mon.rcMonitor.left + 8);
         let y = (mon.rcMonitor.bottom - dock_h - hh).max(mon.rcMonitor.top + 8);
         unsafe { let _ = SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE); }
     }
@@ -651,32 +651,32 @@ fn paint(soft: &mut SoftBackend, w: i32, h: i32, scale: f32, notices: &[BannerNo
     let mut out = ctx.run_ui(input, |ui| {
         let p = ui.painter().clone();
         let t = cfg::cur();
-        let pad = 16.0;
+        let pad = 24.0;
         let step = CARD_H + CARD_GAP;
         for (i, n) in notices.iter().enumerate() {
             // 最旧在最上面，最新在最下面（靠 Dock）
             let top = i as f32 * step;
             let board = egui::Rect::from_min_size(egui::pos2(0.0, top), egui::vec2(fw, CARD_H));
-            glass_board(&p, board, egui::CornerRadius::same(14));
+            glass_board(&p, board, egui::CornerRadius::same(21));
             p.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(0.0, top + 14.0), egui::vec2(3.0, CARD_H - 28.0)),
-                egui::CornerRadius::same(2),
+                egui::Rect::from_min_size(egui::pos2(0.0, top + 21.0), egui::vec2(4.5, CARD_H - 42.0)),
+                egui::CornerRadius::same(3),
                 argb(t.accent),
             );
             // 顶行：左侧标签 + 右侧小字
             if !n.tag.is_empty() {
-                txt(&p, pad, top + 13.0, &n.tag, 11.0, t.accent);
+                txt(&p, pad, top + 20.0, &n.tag, 16.5, t.accent);
             }
             if !n.badge.is_empty() {
-                let sw = soft_text_width(soft, &n.badge, 11.0);
-                txt(&p, fw - pad - sw, top + 13.0, &n.badge, 11.0, t.text_dim);
+                let sw = soft_text_width(soft, &n.badge, 16.5);
+                txt(&p, fw - pad - sw, top + 20.0, &n.badge, 16.5, t.text_dim);
             }
             // 主行 + 副行
-            let main = ellipsize(soft, &n.main, fw - pad * 2.0 - 4.0, 15.0);
-            txt(&p, pad, top + 33.0, &main, 15.0, t.text);
+            let main = ellipsize(soft, &n.main, fw - pad * 2.0 - 6.0, 22.5);
+            txt(&p, pad, top + 50.0, &main, 22.5, t.text);
             if !n.sub.is_empty() {
-                let sub = ellipsize(soft, &n.sub, fw - pad * 2.0 - 4.0, 12.5);
-                txt(&p, pad, top + 60.0, &sub, 12.5, t.text_dim);
+                let sub = ellipsize(soft, &n.sub, fw - pad * 2.0 - 6.0, 19.0);
+                txt(&p, pad, top + 90.0, &sub, 19.0, t.text_dim);
             }
         }
     });

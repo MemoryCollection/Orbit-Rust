@@ -307,9 +307,11 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let _ = GetWindowRect(hwnd, &mut wr);
                 pt.x -= wr.left;
                 pt.y -= wr.top;
-                // 命中区 = 底板矩形（窗口内侧留白是透明的，必须穿透）
+                // 命中区 = 底板矩形（窗口内侧留白是透明的，必须穿透）。
+                // 例外：悬停放大的图标会冒出底板，落在留白里的那半截视觉上是
+                // 图标本体——点它也要能选中，所以弹出矩形同样算命中区。
                 let (bx, by, bw, bh) = dock.board;
-                if bw > 0
+                let hit = bw > 0
                     && inside_round(
                         (pt.x - bx) as f32,
                         (pt.y - by) as f32,
@@ -321,8 +323,18 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             .max(0.0))
                             * dock.scale
                             * settings::icon_scale(),
-                    )
-                {
+                    );
+                let hit = hit || {
+                    let (app, tray) = dock.popped_rects();
+                    let (px, py) = (pt.x as f32, pt.y as f32);
+                    app.iter()
+                        .chain(tray.iter())
+                        .any(|r| {
+                            px >= r[0] && px <= r[0] + r[2]
+                                && py >= r[1] && py <= r[1] + r[3]
+                        })
+                };
+                if hit {
                     LRESULT(HTCLIENT as isize)
                 } else {
                     LRESULT(HTTRANSPARENT as isize)
@@ -1441,6 +1453,8 @@ impl Dock {
             let s = r[2];
             x >= r[0] && x <= r[0] + s && y >= r[1] && y <= r[1] + s
         })
+        // 静止槽位没点到：再看悬停放大"伸出底板"的那半截
+        .or_else(|| self.pop_hit_at(x, y, false))
     }
 
     fn tray_index_at(&self, x: f32, y: f32) -> Option<usize> {
@@ -1448,6 +1462,45 @@ impl Dock {
             let s = r[2];
             x >= r[0] && x <= r[0] + s && y >= r[1] && y <= r[1] + s
         })
+        // 同上：托盘图标放大后冒出底板的部分也算本体的点击/悬停区
+        .or_else(|| self.pop_hit_at(x, y, true))
+    }
+
+    /// 悬停放大的"弹出矩形"命中：点在某个图标放大后冒出底板的半截上时，
+    /// 返回该图标的下标。`tray` = 查托盘图标（false 查应用图标）。
+    fn pop_hit_at(&self, x: f32, y: f32, tray: bool) -> Option<usize> {
+        let rects = if tray { self.popped_rects().1 } else { self.popped_rects().0 };
+        rects.iter().position(|r| {
+            x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3]
+        })
+    }
+
+    /// 各图标悬停放大后的矩形（物理像素 client 坐标）。
+    ///
+    /// 放大时图标朝屏幕内侧"浮出"，超出底板的部分画在窗口的透明留白里。
+    /// 这半截在视觉上是图标本体，命中测试与点击也要算进去——否则用户点
+    /// 冒出来的那一半会穿透 Dock 点到桌面。与 `dockview::paint` 同一套波浪公式。
+    fn popped_rects(&self) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
+        let (gx, gy) = match settings::dock_anchor() {
+            settings::DockAnchor::Bottom => (0.0, -1.0),
+            settings::DockAnchor::Top => (0.0, 1.0),
+            settings::DockAnchor::Left => (1.0, 0.0),
+            settings::DockAnchor::Right => (-1.0, 0.0),
+        };
+        let se = (self.scale * settings::icon_scale().clamp(0.5, 2.0)).max(0.5);
+        let show_desktop = settings::show_desktop_btn();
+        let mut app = Vec::with_capacity(self.rects.len());
+        for (i, r) in self.rects.iter().enumerate() {
+            let (rise, side) = self.pop_wave(crate::dockview::icon_axis(i, show_desktop));
+            app.push(popped_rect(r, gx, gy, rise, side, se));
+        }
+        let mut tray = Vec::with_capacity(self.tray_rects.len());
+        for (j, r) in self.tray_rects.iter().enumerate() {
+            let (rise, side) =
+                self.pop_wave(crate::dockview::tray_axis(j, self.items.len(), show_desktop));
+            tray.push(popped_rect(r, gx, gy, rise, side, se));
+        }
+        (app, tray)
     }
 
     /// 是否点在右端"返回桌面"细长条上（命中区比细条宽一圈）
@@ -2314,6 +2367,17 @@ pub(crate) fn normalize_name(s: &str) -> String {
 }
 
 /// 圆角矩形命中（四角圆弧外穿透）
+/// 由静止槽位 `[x, y, size]` 算悬停放大后的图标矩形：
+/// 中心沿 `(gx, gy)` 浮出 `rise`，边长放大到 `side`；`se` 为逻辑点 → 物理像素系数。
+/// 与 dockview::paint 画图标的同一套几何（中心 = 槽位中心 + 法向 rise，边长 = isz*mag）。
+fn popped_rect(r: &[f32; 3], gx: f32, gy: f32, rise: f32, side: f32, se: f32) -> [f32; 4] {
+    let s = r[2];
+    let cx = r[0] + s * 0.5 + gx * rise * se;
+    let cy = r[1] + s * 0.5 + gy * rise * se;
+    let half = side * se * 0.5;
+    [cx - half, cy - half, side * se, side * se]
+}
+
 fn inside_round(x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
     if x < 0.0 || x > w || y < 0.0 || y > h {
         return false;
