@@ -18,8 +18,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use windows::core::{BSTR, VARIANT};
-use windows::Win32::Foundation::{BOOL, CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT};
+use windows::core::{BSTR, Interface, VARIANT};
+use windows::Win32::Foundation::{
+    BOOL, CloseHandle, FILETIME, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM,
+};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
@@ -32,13 +34,15 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationCondition,
-    IUIAutomationElement, TreeScope_Descendants, UIA_AutomationIdPropertyId,
-    UIA_ClassNamePropertyId, UIA_NamePropertyId,
+    IUIAutomation2, IUIAutomationElement, TreeScope_Descendants, UIA_AutomationIdPropertyId,
+    UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId, UIA_NamePropertyId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, PostMessageW,
-    ShowWindow, SW_MINIMIZE, WM_SYSCOMMAND,
+    GetClientRect, SetWindowPos, ShowWindow, SW_MINIMIZE, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_SYSCOMMAND, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER,
 };
 
 use crate::banner::BannerNotice;
@@ -48,6 +52,9 @@ const CELL_CLASS: &str = "mmui::ChatSessionCell";
 
 /// 「手动拿 UIA」请求标志：设置页按钮置位，读取线程下一轮全量抓取并消位
 static GRAB_REQ: AtomicBool = AtomicBool::new(false);
+/// 「正在点会话行」标志：这期间让读取线程先别进 UIA，避免两路请求同时压在
+/// 微信 UI 线程上（唤出窗口那一刻读取线程可能还在跑，前台跳过还没来得及生效）
+static OPENING: AtomicBool = AtomicBool::new(false);
 /// 首次成功抓到 UIA 是否已在右下角提示过（避免后台轮询反复弹）
 static GRAB_NOTIFIED: AtomicBool = AtomicBool::new(false);
 
@@ -84,6 +91,23 @@ pub fn pid_readable(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// 本轮被跳过（主窗口在前台）的微信进程：用户自己正在看，读取暂停。
+/// 读取线程每轮刷新，天气卡片据此把该实例显示成「监控暂停」。
+static PAUSED: LazyLock<Mutex<HashSet<u32>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 该 pid 是否因在前台而暂停读取
+pub fn pid_paused(pid: u32) -> bool {
+    PAUSED.lock().map(|m| m.contains(&pid)).unwrap_or(false)
+}
+
+/// 读取线程每轮调用：整组替换前台暂停集合（空 = 没有暂停的实例）
+fn set_paused(pids: &[u32]) {
+    if let Ok(mut m) = PAUSED.lock() {
+        m.clear();
+        m.extend(pids.iter().copied());
+    }
+}
+
 /// 进程创建时间（100ns FILETIME）；取不到返回 0
 fn proc_start(pid: u32) -> u64 {
     unsafe {
@@ -96,44 +120,6 @@ fn proc_start(pid: u32) -> u64 {
         let _ = CloseHandle(p);
         if ok { ((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64 } else { 0 }
     }
-}
-
-/// 微信实例列表：(「微信N（pid X）」, 是否已拿到 UIA)。按进程创建时间排序，
-/// 先开的在前——和 Dock 托盘里「先开的在前」的顺序一致，方便对照。
-/// 2s 缓存：设置页每帧都会调，枚举进程 + GetProcessTimes 不便宜。
-pub fn instances() -> Vec<(String, bool)> {
-    static CACHE: LazyLock<Mutex<Option<(u64, Vec<(String, bool)>)>>> =
-        LazyLock::new(|| Mutex::new(None));
-    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
-    if let Ok(g) = CACHE.lock() {
-        if let Some((at, v)) = g.as_ref() {
-            if now.saturating_sub(*at) < 2000 {
-                return v.clone();
-            }
-        }
-    }
-    let mut procs: Vec<(u32, u64)> = wechat_processes()
-        .into_iter()
-        .map(|pid| (pid, proc_start(pid)))
-        .collect();
-    procs.sort_by_key(|(_, t)| *t);
-    let status = grab_status();
-    let v: Vec<(String, bool)> = procs
-        .iter()
-        .enumerate()
-        .map(|(i, (pid, _))| {
-            let got = status
-                .iter()
-                .find(|(p, _)| *p == *pid)
-                .map(|(_, g)| *g)
-                .unwrap_or(false);
-            (format!("微信{}（pid {}）", i + 1, pid), got)
-        })
-        .collect();
-    if let Ok(mut g) = CACHE.lock() {
-        *g = Some((now, v.clone()));
-    }
-    v
 }
 
 /// 该 pid 在多开实例里的标签（「微信1」/「微信2」，按进程创建时间序）。
@@ -162,6 +148,8 @@ pub struct InstStatus {
     pub uia: bool,
     /// 是否处于实时监视（消息卡片开关开着）
     pub monitoring: bool,
+    /// 主窗口是否在前台（读取暂停中，退到后台自动恢复）
+    pub paused: bool,
 }
 
 /// 各实例状态快照，按启动先后排列（与热键槽位一致）。
@@ -197,7 +185,8 @@ pub fn instance_status() -> Vec<InstStatus> {
             };
             let hotkey_ok = hk.iter().any(|(slot, _, ok)| *slot == i && *ok);
             let uia = grab.iter().any(|(p, g)| p == pid && *g);
-            InstStatus { title, hotkey, hotkey_ok, uia, monitoring }
+            let paused = pid_paused(*pid);
+            InstStatus { title, hotkey, hotkey_ok, uia, monitoring, paused }
         })
         .collect()
 }
@@ -205,6 +194,33 @@ pub fn instance_status() -> Vec<InstStatus> {
 /// 热键写法是否解析不了（写错了就不显示，免得误导）
 fn parse_hotkey_unrecognized(spec: &str) -> bool {
     crate::hotkey::parse_for_check(spec).is_none()
+}
+
+/// 各微信实例 (pid, 绑定热键)：按进程创建先后对应热键列表下标（与热键动作
+/// `toggle(i)` 的槽位一致）。未配置 / 写法不认识的热键为空串。
+/// 设置页账号监控表用；每帧调，枚举进程 + GetProcessTimes 开销与 instance_status 相当。
+pub fn pid_hotkeys() -> Vec<(u32, String)> {
+    let procs: Vec<(u32, u64)> = wechat_processes()
+        .into_iter()
+        .map(|pid| (pid, proc_start(pid)))
+        .collect();
+    let hotkeys = settings::wechat_hotkeys();
+    procs
+        .iter()
+        .enumerate()
+        .map(|(i, (pid, _))| {
+            let (spec, _) = hotkeys
+                .get(i)
+                .map(|e| crate::hotkey::split_binding(e))
+                .unwrap_or(("", None));
+            let hotkey = if spec.is_empty() || parse_hotkey_unrecognized(spec) {
+                String::new()
+            } else {
+                spec.to_string()
+            };
+            (*pid, hotkey)
+        })
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -320,7 +336,7 @@ fn is_main_window(h: HWND) -> bool {
 
 /// 按「实例创建先后」排列的微信主窗口：(pid, hwnd, 窗口标题)。
 /// 标题就是账号名（UIA 树根的名字），热键按名称绑定（`F1=吴东`）靠它匹配。
-/// 顺序和 `instances()`（设置页「微信1/微信2」）完全一致，热键下标才对得上。
+/// 顺序与热键列表下标（`pid_hotkeys()` 同一套进程排序）一致，热键槽位才对得上。
 fn instance_windows_titled() -> Vec<(u32, HWND, String)> {
     let mut procs: Vec<(u32, u64)> = wechat_processes()
         .into_iter()
@@ -354,8 +370,52 @@ fn instance_windows_titled() -> Vec<(u32, HWND, String)> {
 /// 槽位按实例启动先后对应：热键列表第 1 个 = 先启动的微信。
 pub fn toggle(index: usize) {
     let list = instance_windows_titled();
-    let Some((pid, h)) = list.get(index).map(|(p, h, _)| (*p, *h)) else {
+    let Some((pid, _, _)) = list.get(index).map(|(p, h, t)| (*p, *h, t.clone())) else {
         crate::tlog!("[wechatmsg] 热键：没有第 {} 个微信实例", index + 1);
+        return;
+    };
+    toggle_pid(pid);
+}
+
+/// 按账号快照 id 触发（`data/wechat_accounts/<id>`）。账号此刻没登录就什么都不做——
+/// 热键照旧注册着，等它下次登录时同一颗键还能用。
+pub fn toggle_account(acc: &str) {
+    match crate::wechatsnap::logged_in(acc) {
+        Some(pid) => {
+            crate::tlog!("[wechatmsg] 热键（账号 {acc}）→ pid={pid}");
+            toggle_pid(pid);
+        }
+        None => crate::tlog!("[wechatmsg] 热键：账号 {acc} 当前没有运行中的微信"),
+    }
+}
+
+/// 按窗口标题关键词触发（老语法 `F1=名称关键词`）
+pub fn toggle_named(kw: &str) {
+    match instance_windows_titled()
+        .into_iter()
+        .find(|(_, _, t)| t.contains(kw))
+    {
+        Some((pid, _, title)) => {
+            crate::tlog!("[wechatmsg] 热键（标题含 {kw:?}）→ pid={pid} title={title:?}");
+            toggle_pid(pid);
+        }
+        None => crate::tlog!("[wechatmsg] 热键：没有标题含「{kw}」的微信实例"),
+    }
+}
+
+/// 微信主窗口（优先真正的 `mmui::MainWindow`，退而取第一个）
+fn main_hwnd(pid: u32) -> Option<HWND> {
+    let wins = wechat_windows(pid);
+    wins.iter()
+        .copied()
+        .find(|h| is_main_window(*h))
+        .or_else(|| wins.first().copied())
+}
+
+/// 对指定 pid 的微信执行「显示 ↔ 最小化」
+pub fn toggle_pid(pid: u32) {
+    let Some(h) = main_hwnd(pid) else {
+        crate::tlog!("[wechatmsg] 热键：pid={pid} 找不到微信主窗口");
         return;
     };
     unsafe {
@@ -485,9 +545,225 @@ pub fn hit_close_and_minimize(x: i32, y: i32) -> bool {
     true
 }
 
+/// 供 Dock 悬停预览浮窗用的一条未读会话（读取线程每轮整组替换）
+#[derive(Clone, Default)]
+pub struct WxUnread {
+    pub pid: u32,
+    pub chat: String,
+    pub summary: String,
+    pub unread: i32,
+    pub muted: bool,
+}
+
+/// 未读会话快照：Dock 线程在悬停时 clone 一份，不阻塞、不碰 UIA。
+static SNAPSHOT: LazyLock<Mutex<Vec<WxUnread>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 当前所有实例的未读会话（按列表顺序，最多前 8 条）。
+/// 微信在前台时读取线程暂停，快照会变空——那时用户自己就在看微信，不需要预览。
+pub fn unread_snapshot() -> Vec<WxUnread> {
+    SNAPSHOT
+        .lock()
+        .map(|v| v.iter().filter(|r| r.unread > 0).take(8).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// 读取线程每轮末尾调用：整组替换快照
+fn publish_snapshot(rows: &[(String, Row)]) {
+    let out: Vec<WxUnread> = rows
+        .iter()
+        .filter(|(_, r)| r.unread > 0)
+        .map(|(_, r)| WxUnread {
+            pid: r.pid,
+            chat: r.chat.clone(),
+            summary: r.summary.clone(),
+            unread: r.unread,
+            muted: r.muted,
+        })
+        .take(32)
+        .collect();
+    // 保持微信列表自己的顺序（最新的在最前），跟用户在微信里看到的一致
+    if let Ok(mut s) = SNAPSHOT.lock() {
+        *s = out;
+    }
+}
+
+/// 离开作用域时清 OPENING（中途 return 也要清）
+struct OpenGuard;
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        OPENING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 直达会话：唤出该 pid 的微信窗口，再按会话名**单击**会话行。
+///
+/// 只做单击。**绝不**走 `LegacyIAccessible.DoDefaultAction()`——微信把它声明成
+/// "双击"，而双击会把会话弹成独立的小窗口；用户要的是单击切换右侧对话区。
+/// 也不用 `InvokePattern` / `SelectionItemPattern`——实测两个都是"返回成功却不干活"
+/// （Invoke 返回 S_OK，选中行一动不动），Qt 的 UIA 实现只做了一半。
+///
+/// 真正的单击走**后台消息**：会话行中心的屏幕坐标转成微信窗口的客户区坐标，
+/// 直接 PostMessage 一组 `WM_MOUSEMOVE / WM_LBUTTONDOWN / WM_LBUTTONUP`。
+/// 实测有效，而且**真实光标一动不动**、不抢焦点、窗口被遮挡也不受影响——比注入
+/// 真实鼠标事件干净得多（那会让用户看到光标自己跳过去再跳回来）。
+///
+/// **UIA 调用要极度克制**：微信的 UIA provider 跑在它自己的 UI 线程上，每次跨进程
+/// 调用都要排队等它应答。本项目早就实测过"微信在前前台时读 UIA 会卡"（所以读取线程
+/// 专门跳过前台进程），而这条路径恰恰是先把窗口唤到前台再读——所以这里必须
+/// **一次 `FindAllBuildCache` 拿完全部名字+坐标**（1 次 RPC），绝不在循环里逐行
+/// `CurrentName()`/`GetCurrentPatternAs()`，点完更不能再回读（那时微信正在切换
+/// 对话、加载记录，最忙，任何 UIA 请求都会把它的界面卡住几秒）。
+///
+/// 会话名读不到（UIA 里根本没有这一行）时什么也不做——调用方已经把窗口唤出来了，
+/// 表现就是"只唤出微信窗口"。
+///
+/// 整个动作在短命线程里做（自己初始化 MTA + UIA），不占读取线程——
+/// 读取线程在微信刚被唤到前台时会暂停，靠它会等不到。
+pub fn open_session(pid: u32, chat: String) {
+    if pid == 0 || chat.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("wechat-open".into())
+        .spawn(move || unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            OPENING.store(true, Ordering::SeqCst);
+            let _guard = OpenGuard;
+            if !wake_window(pid) {
+                crate::tlog!("[wechatmsg] 直达会话失败：pid={pid} 窗口唤不出");
+                return;
+            }
+            let clicked = click_session(pid, &chat);
+            crate::tlog!("[wechatmsg] 直达会话 pid={pid} chat={chat:?} 单击={clicked}");
+            CoUninitialize();
+        });
+}
+
+/// 唤出微信窗口：可见就置前，收在托盘就点它的托盘图标。
+/// 返回窗口是否已可见（唤不出就别继续点会话了）。
+unsafe fn wake_window(pid: u32) -> bool {
+    let vis = wechat_windows(pid)
+        .into_iter()
+        .find(|h| IsWindowVisible(*h).as_bool());
+    if let Some(h) = vis {
+        crate::window::activate_window(h);
+        // 给 Qt 一点时间完成还原/重排，否则紧接着抓到的元素位置可能还是旧的
+        std::thread::sleep(std::time::Duration::from_millis(220));
+        return true;
+    }
+    crate::dock::click_tray_for_pid(pid);
+    for _ in 0..25 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(h) = wechat_windows(pid)
+            .into_iter()
+            .find(|w| IsWindowVisible(*w).as_bool())
+        {
+            crate::window::activate_window(h);
+            std::thread::sleep(std::time::Duration::from_millis(320));
+            return true;
+        }
+    }
+    false
+}
+
+/// 在可见的微信窗口里按会话名找到那一行，向它的中心投递一次后台单击（不动光标）。
+///
+/// 全程只对微信发起 **1 次** UIA 调用（`FindAllBuildCache`）：名字和坐标都在缓存里，
+/// 循环里读的是本地缓存，不会再有跨进程 RPC。找不到行就直接返回 false（=只唤窗口）。
+unsafe fn click_session(pid: u32, chat: &str) -> bool {
+    let auto: IUIAutomation = match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    // 兜底超时：微信 UI 线程忙时，UIA 默认会无限等下去，那会把我们和微信一起挂住
+    if let Ok(a2) = auto.cast::<IUIAutomation2>() {
+        let _ = a2.SetConnectionTimeout(1500);
+        let _ = a2.SetTransactionTimeout(1500);
+    }
+    let cond = match auto.CreatePropertyCondition(
+        UIA_ClassNamePropertyId,
+        &VARIANT::from(CELL_CLASS),
+    ) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // 批量缓存：Name + BoundingRectangle 一次带回，且不建立完整元素引用
+    // （AutomationElementMode_None），后续读属性全是本地数据
+    let cache = match auto.CreateCacheRequest() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let _ = cache.AddProperty(UIA_NamePropertyId);
+    let _ = cache.AddProperty(UIA_BoundingRectanglePropertyId);
+
+    for h in wechat_windows(pid) {
+        if !IsWindowVisible(h).as_bool() {
+            continue;
+        }
+        // 用与读取线程完全一致的取法（ElementFromHandleBuildCache + FindAllBuildCache），
+        // 确保缓存属性真的被填上；这样点前后总共只对微信发起 1 次批量请求
+        let Ok(root) = auto.ElementFromHandleBuildCache(h, Some(&cache)) else {
+            continue;
+        };
+        let Ok(all) = root.FindAllBuildCache(TreeScope_Descendants, &cond, &cache) else {
+            continue;
+        };
+        let n = all.Length().unwrap_or(0);
+        for i in 0..n {
+            let Ok(e) = all.GetElement(i) else { continue };
+            // 会话名的第一行才是名字，后面是 "[N条] 摘要 / 时间 / 消息免打扰"
+            let name = e.CachedName().map(|b| b.to_string()).unwrap_or_default();
+            let first = name.split('\n').next().unwrap_or("").trim();
+            if first != chat {
+                continue;
+            }
+            let r = e.CachedBoundingRectangle().unwrap_or_default();
+            if r.right <= r.left || r.bottom <= r.top {
+                continue;
+            }
+            let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+            // 换算到客户区坐标，并确认真的落在客户区内（缓存 rect 可能略过期）。
+            // 不走 WindowFromPoint 校验——后台窗口常被别的窗口遮挡，那里命中的是
+            // 遮挡者，会把正常情况误判成"不属于微信"。PostMessage 的目标窗口是明确的。
+            let mut pt = POINT { x: cx, y: cy };
+            if !windows::Win32::Graphics::Gdi::ScreenToClient(h, &mut pt).as_bool() {
+                continue;
+            }
+            let mut rc = RECT::default();
+            if GetClientRect(h, &mut rc).is_err() {
+                continue;
+            }
+            if pt.x < 0 || pt.y < 0 || pt.x >= rc.right || pt.y >= rc.bottom {
+                crate::tlog!("[wechatmsg] 会话行坐标 ({cx},{cy}) 不在微信客户区内，放弃");
+                continue;
+            }
+            // 点完立刻收工：不再碰微信的 UIA 树（这时它正在切换对话，最忙）
+            return click_point(h, pt);
+        }
+    }
+    false
+}
+
+/// 在屏幕坐标上真实单击一次：移过去、按下抬起，点完把鼠标还给用户。
+/// 后台单击：向窗口客户区的 `pt` 投递一组鼠标消息。
+///
+/// 真实光标一动不动 —— 这是关键：用 `SendInput`/`mouse_event` 注入真实事件会把
+/// 光标拖到会话行再拖回来，用户能明显看到鼠标自己乱跑，还会抢焦点。
+/// 实测这组 PostMessage 微信的 Qt 界面完全按单击处理（切换右侧对话、不弹独立窗口）。
+unsafe fn click_point(h: HWND, pt: POINT) -> bool {
+    // 客户区坐标打包进 lParam：低 16 位 x、高 16 位 y
+    let lp = LPARAM(((pt.y as isize) << 16) | (pt.x as isize & 0xFFFF));
+    let a = PostMessageW(h, WM_MOUSEMOVE, WPARAM(0), lp).is_ok();
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let b = PostMessageW(h, WM_LBUTTONDOWN, WPARAM(1), lp).is_ok();
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let c = PostMessageW(h, WM_LBUTTONUP, WPARAM(0), lp).is_ok();
+    crate::tlog!("[wechatmsg] 后台单击会话行 客户区({},{})", pt.x, pt.y);
+    a && b && c
+}
+
 /// 横幅点击跳转：把指定 PID 的微信窗口恢复并置前。多开时按 PID 找到
 /// 对应那一个窗口。
-///
 /// 绝不用 `AttachThreadInput` 抢前台（老实现就栽在这里）：它会把目标进程的
 /// 输入队列挂到本线程上，本线程一退出（或 detach 失败没检查返回值），
 /// 目标的鼠标/键盘输入就整个楔死——2026-11-21 实测：横幅跳微信后微信完全
@@ -517,6 +793,77 @@ pub fn focus(pid: u32) {
         } else {
             crate::dock::click_tray_for_pid(pid);
         }
+    });
+}
+
+/// 「居中」按钮：把指定 pid 的微信主窗口唤醒并移到屏幕工作区正中
+/// （上下、左右都居中，尺寸不变）。唤醒复用热键那套逻辑：
+/// 收进托盘（隐藏）→ 点托盘图标唤出（等窗口出现，最多 2s）；
+/// 最小化 → 还原置前；已可见直接挪。动作放短命线程，不卡设置页 / 横幅线程。
+pub fn center(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("wechat-center".into()).spawn(move || unsafe {
+        // ① 唤醒：先按主窗口挑目标（多开时辅助窗不参乎）
+        let wins = wechat_windows(pid);
+        let picked = wins
+            .iter()
+            .copied()
+            .find(|h| is_main_window(*h))
+            .or_else(|| wins.first().copied());
+        let Some(picked) = picked else {
+            crate::tlog!("[wechatmsg] 居中：pid={pid} 枚举不到微信窗口");
+            return;
+        };
+        // ② 唤醒后的目标窗口：托盘唤出后用实际出现的那个句柄居中
+        let target;
+        if !IsWindowVisible(picked).as_bool() {
+            // 收进托盘：让微信自己把窗口弹出来，再等它可见
+            crate::dock::click_tray_for_pid(pid);
+            let mut shown = None;
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Some(v) = wechat_windows(pid)
+                    .into_iter()
+                    .find(|w| IsWindowVisible(*w).as_bool())
+                {
+                    shown = Some(v);
+                    break;
+                }
+            }
+            let Some(h) = shown else {
+                crate::tlog!("[wechatmsg] 居中：pid={pid} 点托盘后 2s 内窗口没出现");
+                return;
+            };
+            target = h;
+        } else if IsIconic(picked).as_bool() {
+            // 最小化：还原并置前（SetWindowPos 挪最小化窗口只会改它还原后的位置）
+            crate::window::activate_window(picked);
+            target = picked;
+        } else {
+            target = picked;
+        }
+        // ③ 居中：工作区正中（上下、左右），尺寸不变、不动 z 序
+        let mut r = RECT::default();
+        if GetWindowRect(target, &mut r).is_err() {
+            return;
+        }
+        let w = r.right - r.left;
+        let ht = r.bottom - r.top;
+        if w <= 0 || ht <= 0 {
+            return;
+        }
+        let mi = crate::window::primary_monitor();
+        let rc = if mi.rcWork.right > mi.rcWork.left && mi.rcWork.bottom > mi.rcWork.top {
+            mi.rcWork
+        } else {
+            mi.rcMonitor
+        };
+        let x = rc.left + (rc.right - rc.left - w) / 2;
+        let y = rc.top + (rc.bottom - rc.top - ht) / 2;
+        let _ = SetWindowPos(target, HWND::default(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        crate::tlog!("[wechatmsg] 居中微信窗口 pid={pid} → ({x},{y}) 尺寸 {w}x{ht}");
     });
 }
 
@@ -627,6 +974,16 @@ fn update_unread(
                 "[wechatmsg] 新消息 | 标题={} | 内容={} | 未读={} | pid_key={}",
                 r.chat, r.summary, r.unread, key
             );
+            // 只开了「悬停预览」、没开「消息卡片」时，读取线程只为浮窗供数，
+            // 不额外弹卡片——新消息提醒仍走托盘闪烁那条通用横幅，避免两条都弹
+            if !settings::wechat_cards() {
+                if baseline {
+                    unread.insert(key.clone(), r.unread);
+                } else {
+                    rebuilt.insert(key.clone(), r.unread);
+                }
+                continue;
+            }
             let mut notice = BannerNotice::wechat(&r.chat, &r.summary, r.unread, r.pid);
             // 只有常驻卡片（横幅秒数=0）才挂到托盘闪烁上：图标不闪了（消息已读）
             // 随 flash_tick 收起。计时横幅**不能**挂——托盘图标一停闪它就被提前
@@ -754,7 +1111,14 @@ unsafe fn run(wake: HANDLE, stop: Arc<AtomicBool>) {
             baseline = false;
             unread.clear();
             held.clear();
+            set_paused(&[]);
             wait(wake, 2000);
+            continue;
+        }
+        // 正在点会话行：这一轮什么都不读（不动 unread 基线，下次正常读时
+        // 该算新消息的还会算），纯粹避免两路 UIA 请求同时压微信
+        if OPENING.load(Ordering::Relaxed) {
+            wait(wake, 300);
             continue;
         }
         let tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
@@ -779,6 +1143,8 @@ unsafe fn run(wake: HANDLE, stop: Arc<AtomicBool>) {
                 skipped.push(front);
             }
         }
+        // 刷新「监控暂停」集合：天气卡片据此显示前台实例（手动抓取那轮不暂停）
+        set_paused(&skipped);
 
         let mut rows: Vec<(String, Row)> = Vec::new();
         let mut seen = HashSet::new();
@@ -995,6 +1361,8 @@ unsafe fn run(wake: HANDLE, stop: Arc<AtomicBool>) {
         } else {
             baseline = false;
         }
+        // 悬停预览浮窗的数据源：每轮刷新（读不到就是一空组 → 浮窗不显示）
+        publish_snapshot(&rows);
 
         wait(wake, 2000);
     }

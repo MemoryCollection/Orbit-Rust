@@ -203,6 +203,8 @@ pub struct Dock {
     host_targets: Vec<Option<traymsg::Target>>,
     /// 已经对哪个图标发过"悬停进入"（离开时要补 popupclose）
     hover_sent: Option<(i32, i32)>,
+    /// 这次悬停被自绘的微信预览浮窗接管了（没转发给微信，离开时别补 popupclose）
+    hover_owned: bool,
     /// 悬停期间向同一图标转发 WM_MOUSEMOVE 的节流时刻（真托盘大约 150ms 一次）
     last_hover_move: Option<Instant>,
     /// 上次左键按下的时刻（判双击）
@@ -353,13 +355,18 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     // 悬停即显示提示条（托盘名字来自 UIA，任务图标用程序名）
                     dock.update_tip();
                     dock.forward_hover();
+                } else if dock.hover_owned && !crate::wxhover::visible() {
+                    // 浮窗被收起（点掉了 / 到期）但指针还停在微信图标上：重新弹
+                    dock.hover_sent = None;
+                    dock.hover_owned = false;
+                    dock.forward_hover();
                 } else if mouse_moved {
                     // 悬停目标没变但光标在动：波浪放大要跟随光标，逐帧重绘
                     dock.render();
                 }
                 // 指针还停在同一个托盘图标上：像真托盘那样隔一会儿补一条 WM_MOUSEMOVE，
                 // 应用（微信）靠它维持 hover 跟踪，只发一次 enter 不够
-                if tidx.is_some() {
+                if tidx.is_some() && !dock.hover_owned {
                     let now = Instant::now();
                     let due = dock
                         .last_hover_move
@@ -586,6 +593,7 @@ impl Dock {
             tray_scan_result: Arc::new(Mutex::new(HashMap::new())),
             host_targets: Vec::new(),
             hover_sent: None,
+            hover_owned: false,
             last_hover_move: None,
             last_lclick: None,
             seen_settings: 0,
@@ -739,14 +747,45 @@ impl Dock {
             return;
         }
         if let Some(prev) = self.hover_sent.take() {
-            if let Some(t) = self.tray_targets.get(&prev).copied() {
-                crate::vlog!("[dock] 悬停离开 {:?}", prev);
-                traymsg::leave(&t, prev);
+            // 这次悬停本来就没转发给微信（浮窗接管了），别补一条 leave
+            if !self.hover_owned {
+                if let Some(t) = self.tray_targets.get(&prev).copied() {
+                    crate::vlog!("[dock] 悬停离开 {:?}", prev);
+                    traymsg::leave(&t, prev);
+                }
             }
             self.last_hover_move = None;
         }
+        if self.hover_owned {
+            self.hover_owned = false;
+            if want.is_none() {
+                // 可能只是从图标移向浮窗，给个宽限期
+                crate::wxhover::request_hide();
+            } else {
+                // 明确移到别的托盘图标了，立刻收
+                crate::wxhover::hide_now();
+            }
+        }
         let Some(key) = want else { return };
         let Some(i) = self.hovered_tray else { return };
+        // 微信图标 + 开关打开 + 读到了未读：交给自绘预览浮窗，
+        // 不再把 hover 转发给微信（避免微信自己那个 290×152 的小窗和我们的叠在一起）
+        if settings::wechat_hover_preview() {
+            if let Some((pid, c)) = self.wechat_tray_at(i) {
+                let list: Vec<_> = crate::wechatmsg::unread_snapshot()
+                    .into_iter()
+                    .filter(|r| r.pid == pid)
+                    .collect();
+                if !list.is_empty() {
+                    crate::banner::wake(); // 顺带让读取线程刷新一下未读
+                    crate::wxhover::show(list, c);
+                    self.hover_owned = true;
+                    self.hover_sent = Some(key);
+                    crate::vlog!("[dock] 微信悬停 → 自绘预览浮窗 idx={i} pid={pid}");
+                    return;
+                }
+            }
+        }
         crate::tlog!("[dock] 悬停转发开始 key={key:?} idx={i} 已知目标={}", self.tray_targets.contains_key(&key));
         match self.tray_targets.get(&key).copied() {
             Some(t) => {
@@ -800,6 +839,22 @@ impl Dock {
     }
 
     /// 图标中心（屏幕坐标）。坐标用托盘图标自己的矩形，不用真实光标位置
+    /// 第 `idx` 个（显示下标）托盘图标是不是微信：是就返回 (pid, 图标中心)。
+    /// 只看托管注册数据里的真实 exe/pid，不猜；拿不到 pid 就返回 None，
+    /// 调用方会退回"转发给微信、让它弹自己的浮窗"。
+    fn wechat_tray_at(&self, idx: usize) -> Option<(u32, (i32, i32))> {
+        let real = *self.tray_shown.get(idx)?;
+        let it = self.tray.items.get(real)?;
+        let exe = it.exe.to_lowercase();
+        let by_exe = exe.ends_with("weixin.exe") || exe.ends_with("wechat.exe");
+        let by_name = exe.ends_with("explorer.exe") && it.name.contains("微信");
+        if !by_exe && !by_name {
+            return None;
+        }
+        let pid = it.host.as_ref().map(|h| h.pid).filter(|p| *p != 0)?;
+        Some((pid, self.tray_center(idx)))
+    }
+
     fn tray_center(&self, idx: usize) -> (i32, i32) {
         if let Some(&real) = self.tray_shown.get(idx) {
             if let Some(it) = self.tray.items.get(real) {

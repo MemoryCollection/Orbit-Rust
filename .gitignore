@@ -3,6 +3,9 @@
 *.log
 tools/*/target
 tools/_shots/
+# uiadump 取证产物（截图 / 元素树 dump，勿进仓库）
+tools/*/*.bmp
+tools/*/dump_*.txt
 /dist
 
 # 本地运行数据（settings.txt / mail.txt 等）：含邮箱授权码与第三方 key，绝不进仓库

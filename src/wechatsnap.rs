@@ -9,7 +9,9 @@
 //! `mv` 成 `*.locked-<时间戳>` 挪开（运行中实例的句柄跟着旧文件走，不受影响），
 //! 再把快照文件复制回原路径，新启动的微信实例就会读到快照凭证。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use windows::core::{GUID, HSTRING, Interface, PCWSTR};
 use windows::Win32::Foundation::{HGLOBAL, HANDLE};
@@ -22,6 +24,9 @@ use windows::Win32::System::Com::{
     IPersistFile, IStream,
 };
 use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath, ShellLink, IShellLinkW};
 
@@ -41,7 +46,9 @@ pub struct Snapshot {
     pub id: String,
     /// 用户命名的昵称（account.txt 里的 nickname）
     pub nickname: String,
-    pub dir: PathBuf,
+    /// 凭证备份时间（account.txt 里的 backup_time，"YYYY-MM-DD HH:MM:SS"）
+    /// ——列表按它从早到晚排（时间最早的是 1 号）
+    pub backup_time: String,
 }
 
 impl Snapshot {
@@ -106,7 +113,8 @@ pub fn current_account() -> Option<(String, PathBuf)> {
 
 // ---------- 快照列表 / 保存 ----------
 
-/// 扫描快照目录，按 account.txt 里的昵称读出列表
+/// 扫描快照目录，按 account.txt 里的昵称读出列表。
+/// 排序：backup_time 从早到晚（时间最早的是 1 号），没写时间的排最后，同刻按 ID。
 pub fn list() -> Vec<Snapshot> {
     let root = accounts_root();
     let mut out = Vec::new();
@@ -120,19 +128,26 @@ pub fn list() -> Vec<Snapshot> {
             continue;
         };
         let mut nickname = String::new();
+        let mut backup_time = String::new();
         if let Ok(txt) = std::fs::read_to_string(dir.join("account.txt")) {
             for line in txt.lines() {
                 if let Some(v) = line.strip_prefix("nickname=") {
                     nickname = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("backup_time=") {
+                    backup_time = v.trim().to_string();
                 }
             }
         }
         if nickname.is_empty() {
             nickname = id.clone();
         }
-        out.push(Snapshot { id, nickname, dir });
+        out.push(Snapshot { id, nickname, backup_time });
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.sort_by(|a, b| {
+        let ka = if a.backup_time.is_empty() { "9999-99-99" } else { a.backup_time.as_str() };
+        let kb = if b.backup_time.is_empty() { "9999-99-99" } else { b.backup_time.as_str() };
+        (ka, &a.id).cmp(&(kb, &b.id))
+    });
     out
 }
 
@@ -165,7 +180,7 @@ pub fn save(nickname: &str) -> Result<Snapshot, String> {
     )
     .map_err(|e| format!("写 account.txt 失败：{e}"))?;
     crate::tlog!("[wechatsnap] 已保存快照 {nickname}（账号 {id}）");
-    Ok(Snapshot { id, nickname: nickname.to_string(), dir: dst })
+    Ok(Snapshot { id, nickname: nickname.to_string(), backup_time: time })
 }
 
 fn time_str() -> String {
@@ -290,15 +305,90 @@ pub fn restore(id: &str) -> Result<(), String> {
     }
 }
 
-/// 恢复快照凭证并启动微信（快捷方式的目标动作）
+/// 恢复快照凭证并启动微信（快捷方式的目标动作）。
+/// 启动成功后把**本次拉起的 Weixin.exe pid** 写进快照的 account.txt：
+/// 微信用凭证免扫码登录的就是这个进程，只要它还活着且还是 Weixin.exe，
+/// 就说明该账号已登录（见 [`logged_in`]）。
 pub fn launch(id: &str) -> Result<(), String> {
     restore(id)?;
     let exe = wechat_exe().ok_or("找不到 Weixin.exe（可在设置里自定义微信程序路径）")?;
-    std::process::Command::new(&exe)
+    let child = std::process::Command::new(&exe)
         .spawn()
         .map_err(|e| format!("启动微信失败：{e}"))?;
-    crate::tlog!("[wechatsnap] 快照 {id} 凭证已恢复，微信已启动");
+    let pid = child.id();
+    write_pid(id, pid);
+    crate::tlog!("[wechatsnap] 快照 {id} 凭证已恢复，微信已启动 pid={pid}");
     Ok(())
+}
+
+// ---------- 登录状态（account.txt 里的 pid） ----------
+
+/// 把登录 pid 写进快照的 account.txt（保留其余行；没有 pid= 行就追加）
+fn write_pid(id: &str, pid: u32) {
+    let p = accounts_root().join(id).join("account.txt");
+    let mut lines: Vec<String> = std::fs::read_to_string(&p)
+        .map(|s| s.lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default();
+    lines.retain(|l| !l.starts_with("pid="));
+    lines.push(format!("pid={pid}"));
+    let _ = std::fs::write(&p, lines.join("\n") + "\n");
+}
+
+/// account.txt 里记录的登录 pid（没记录过 = None）
+pub fn stored_pid(id: &str) -> Option<u32> {
+    let txt = std::fs::read_to_string(accounts_root().join(id).join("account.txt")).ok()?;
+    for line in txt.lines() {
+        if let Some(v) = line.strip_prefix("pid=") {
+            return v.trim().parse::<u32>().ok().filter(|p| *p != 0);
+        }
+    }
+    None
+}
+
+/// pid 是否还活着且主程序名是 Weixin.exe / WeChat.exe
+fn pid_is_weixin(pid: u32) -> bool {
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return false;
+        };
+        let mut pe = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut ok = Process32FirstW(snap, &mut pe).is_ok();
+        let mut hit = false;
+        while ok {
+            if pe.th32ProcessID == pid {
+                let name = String::from_utf16_lossy(&pe.szExeFile);
+                let base = name.trim_end_matches('\0');
+                hit = base.eq_ignore_ascii_case("Weixin.exe") || base.eq_ignore_ascii_case("WeChat.exe");
+                break;
+            }
+            ok = Process32NextW(snap, &mut pe).is_ok();
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snap);
+        hit
+    }
+}
+
+/// 该快照账号是否已登录：account.txt 记录的 pid 还活着且是微信主程序 → Some(pid)。
+/// 2s 缓存（设置页每帧都会调，进程快照不便宜）。
+pub fn logged_in(id: &str) -> Option<u32> {
+    static CACHE: LazyLock<Mutex<HashMap<String, (u64, Option<u32>)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+    if let Ok(c) = CACHE.lock() {
+        if let Some((at, v)) = c.get(id) {
+            if now.saturating_sub(*at) < 2000 {
+                return *v;
+            }
+        }
+    }
+    let v = stored_pid(id).filter(|p| pid_is_weixin(*p));
+    if let Ok(mut c) = CACHE.lock() {
+        c.insert(id.to_string(), (now, v));
+    }
+    v
 }
 
 // ---------- 桌面快捷方式 ----------

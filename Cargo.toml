@@ -1,6 +1,6 @@
 [package]
 name = "orbit"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 description = "Windows 11 桌面增强悬浮栏：胶囊 + Dock + 通知横幅 + 开始菜单接管"
 license = "MIT"

@@ -70,8 +70,10 @@ static RUNTIME: Mutex<Option<RuntimeSnap>> = Mutex::new(None);
 struct RuntimeSnap {
     /// (icon_key, 显示名)
     tray: Vec<(String, String)>,
-    /// (实例标签, 是否已拿到 UIA)
-    wechat: Vec<(String, bool)>,
+    /// (微信 pid, 该 pid 的 UIA 是否可读)——账号监控表用
+    wechat_pid: Vec<(u32, bool)>,
+    /// (微信 pid, 绑定热键)——账号监控表用
+    wechat_hk: Vec<(u32, String)>,
 }
 
 fn runtime_path() -> std::path::PathBuf {
@@ -109,8 +111,12 @@ pub fn publish_runtime() {
     for (k, n) in &tray {
         body.push_str(&format!("T\t{k}\t{n}\n"));
     }
-    for (label, got) in crate::wechatmsg::instances() {
-        body.push_str(&format!("W\t{label}\t{}\n", if got { 1 } else { 0 }));
+    // 微信 pid 维度的 UIA 可读状态 + 热键：设置页「账号监控」表格用
+    for (pid, got) in crate::wechatmsg::grab_status() {
+        body.push_str(&format!("G\t{pid}\t{}\n", if got { 1 } else { 0 }));
+    }
+    for (pid, hk) in crate::wechatmsg::pid_hotkeys() {
+        body.push_str(&format!("H\t{pid}\t{hk}\n"));
     }
     let path = runtime_path();
     if let Ok(old) = std::fs::read_to_string(&path) {
@@ -132,8 +138,15 @@ fn load_runtime() {
             let mut it = line.split('\t');
             match (it.next(), it.next(), it.next()) {
                 (Some("T"), Some(k), Some(n)) => snap.tray.push((k.to_string(), n.to_string())),
-                (Some("W"), Some(label), Some(got)) => {
-                    snap.wechat.push((label.to_string(), got.trim() == "1"))
+                (Some("G"), Some(pid), Some(got)) => {
+                    if let Ok(p) = pid.trim().parse::<u32>() {
+                        snap.wechat_pid.push((p, got.trim() == "1"));
+                    }
+                }
+                (Some("H"), Some(pid), Some(hk)) => {
+                    if let Ok(p) = pid.trim().parse::<u32>() {
+                        snap.wechat_hk.push((p, hk.to_string()));
+                    }
                 }
                 _ => {}
             }
@@ -152,11 +165,28 @@ fn runtime_snap() -> Option<RuntimeSnap> {
     RUNTIME.lock().ok().and_then(|g| g.clone())
 }
 
-/// 微信 UIA 实例状态：子进程用主进程快照，主进程读内存
-fn wechat_instances() -> Vec<(String, bool)> {
+/// 该微信 pid 的 UIA 是否可读：子进程用主进程快照，主进程读内存
+fn wechat_pid_readable(pid: u32) -> bool {
     match runtime_snap() {
-        Some(s) => s.wechat,
-        None => crate::wechatmsg::instances(),
+        Some(s) => s.wechat_pid.iter().any(|(p, g)| *p == pid && *g),
+        None => crate::wechatmsg::pid_readable(pid),
+    }
+}
+
+/// 该微信 pid 绑定的热键：子进程用主进程快照，主进程读内存；空串 = 未配置
+fn wechat_pid_hotkey(pid: u32) -> String {
+    match runtime_snap() {
+        Some(s) => s
+            .wechat_hk
+            .iter()
+            .find(|(p, _)| *p == pid)
+            .map(|(_, hk)| hk.clone())
+            .unwrap_or_default(),
+        None => crate::wechatmsg::pid_hotkeys()
+            .into_iter()
+            .find(|(p, _)| *p == pid)
+            .map(|(_, hk)| hk)
+            .unwrap_or_default(),
     }
 }
 
@@ -177,6 +207,11 @@ fn find_main_window(class: windows::core::PCWSTR) -> Option<windows::Win32::Foun
 /// 早先只投胶囊，Dock 得等自己的 500ms 轮询才更新，改 Dock 透明度/图标大小时
 /// 会明显"慢半拍"。跨进程拿不到 appmsg 里登记的 HWND，只能按类名找。
 fn post_to_parent(msg: u32) {
+    post_to_parent_w(msg, 0);
+}
+
+/// 同 [`post_to_parent`]，带 wParam（如微信 pid）
+fn post_to_parent_w(msg: u32, wparam: usize) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
     for class in [
@@ -186,7 +221,7 @@ fn post_to_parent(msg: u32) {
     ] {
         if let Some(h) = find_main_window(class) {
             unsafe {
-                let _ = PostMessageW(h, msg, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(h, msg, WPARAM(wparam), LPARAM(0));
             }
         }
     }
@@ -586,6 +621,8 @@ struct Edits {
     clock: String,
     wechat_ignore: String,
     wechat_hotkeys: String,
+    /// 账号列表每行的热键输入缓冲：账号快照 id → 文本（空 = 没绑）
+    wechat_hk: std::collections::HashMap<String, String>,
     wechat_path: String,
     wechat_data_dir: String,
     snap_name: String,
@@ -740,6 +777,10 @@ impl SettingsApp {
         self.edits.clock = settings::clock_format();
         self.edits.wechat_ignore = settings::wechat_ignore_text();
         self.edits.wechat_hotkeys = settings::wechat_hotkeys_text();
+        self.edits.wechat_hk = crate::wechatsnap::list()
+            .into_iter()
+            .map(|s| (s.id.clone(), settings::wechat_hotkey_for(&s.id)))
+            .collect();
         self.edits.wechat_path = settings::wechat_path();
         self.edits.wechat_data_dir = settings::wechat_data_dir();
         self.edits.banner_secs = settings::banner_secs().to_string();
@@ -773,7 +814,7 @@ impl SettingsApp {
 
     /// 常规设置：字体 / 外观（主题 + 胶囊透明度·大小）/ 系统（开机启动、退出守护）
     /// / 通知接管与方式 / 横幅时长 / 提示音
-    fn detail_general(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+    fn detail_general(&mut self, ui: &mut egui::Ui, _ver_changed: bool) {
         // 字体放最上面：一换字体整页字全变，第一眼就能看出效果
         section(ui, "界面字体");
         if let Some(pick) = seg(
@@ -987,145 +1028,6 @@ impl SettingsApp {
 
         ui.add_space(10.0);
         ui.add_space(10.0);
-        section(ui, "通知接管（微信）");
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            let on = settings::wechat_cards();
-            if toggle_btn(ui, on, "微信卡片") {
-                settings::set_wechat_cards(!on);
-                crate::tlog!(
-                    "[settings] 微信消息卡片 → {}",
-                    if settings::wechat_cards() { "开启" } else { "关闭" }
-                );
-            }
-            ui.label(
-                egui::RichText::new(
-                    "开启后只读微信聊天列表（UIA，不改动微信本体），新消息弹会话名+摘要卡片，读不到的实例退回「有新消息」横幅；关闭时托盘图标闪烁也弹「有新消息」横幅（点击跳回微信）。两种方式的横幅时长与提示音设置通用",
-                )
-                .size(11.5)
-                .weak(),
-            );
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(row_label("不弹白名单"));
-            let r = ui.add_sized(
-                [CTRL_W, 24.0],
-                egui::TextEdit::singleline(&mut self.edits.wechat_ignore)
-                    .hint_text("可添加多个：标题之间用英文逗号 , 分隔"),
-            );
-            if r.lost_focus() {
-                // 英文逗号分隔
-                let list: Vec<String> = self
-                    .edits
-                    .wechat_ignore
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                settings::set_wechat_ignore(list);
-                self.edits.wechat_ignore = settings::wechat_ignore_text();
-                crate::tlog!("[settings] 微信卡片白名单 → {}", settings::wechat_ignore_text());
-            }
-            if ver_changed && !r.has_focus() {
-                self.edits.wechat_ignore = settings::wechat_ignore_text();
-            }
-        });
-        ui.label(
-            egui::RichText::new(
-                "可添加多个标题（英文逗号分隔，完全匹配才跳过）；被跳过的标题会写进 orbit.log",
-            )
-            .size(11.5)
-            .weak(),
-        );
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("手动拿 UIA").size(12.0))
-                        .min_size(egui::vec2(96.0, 24.0)),
-                )
-                .clicked()
-            {
-                // 设置页是独立进程，抓 UIA 的动作必须让主进程做
-                if IS_CHILD.load(Ordering::Relaxed) {
-                    post_to_parent(crate::appmsg::WM_GRAB_UIA);
-                } else {
-                    crate::banner::request_grab();
-                }
-                crate::tlog!("[settings] 手动拿 UIA 已点击");
-            }
-            ui.label(
-                egui::RichText::new("先唤出微信窗口（支持多开）再点；拿到后右下角提示一次")
-                    .size(11.5)
-                    .weak(),
-            );
-        });
-
-        // 微信热键（显示 ↔ 最小化）：英文逗号分隔，按微信启动先后对应
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(row_label("微信热键"));
-            let r = ui.add_sized(
-                [CTRL_W, 24.0],
-                egui::TextEdit::singleline(&mut self.edits.wechat_hotkeys)
-                    .hint_text("例：F1,F2 或 Ctrl+Alt+1,Ctrl+Alt+2"),
-            );
-            if r.lost_focus() {
-                let list: Vec<String> = self
-                    .edits
-                    .wechat_hotkeys
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                settings::set_wechat_hotkeys(list);
-                self.edits.wechat_hotkeys = settings::wechat_hotkeys_text();
-                crate::tlog!("[settings] 微信热键 → {}", settings::wechat_hotkeys_text());
-            }
-            if ver_changed && !r.has_focus() {
-                self.edits.wechat_hotkeys = settings::wechat_hotkeys_text();
-            }
-        });
-        ui.label(
-            egui::RichText::new(
-                "按微信启动先后对应：第 1 个热键 = 先启动的微信。动作只有显示↔最小化，绝不隐藏到托盘；注册成功/失败会弹横幅告知",
-            )
-            .size(11.5)
-            .weak(),
-        );
-
-        // 多开状态：每个微信实例是否已拿到 UIA 会话数据（按进程创建时间排序，
-        // 先开的在前，与 Dock 托盘里多开图标的顺序一致）
-        let insts = wechat_instances();
-        if !insts.is_empty() {
-            ui.add_space(6.0);
-            for (label, got) in &insts {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.label(egui::RichText::new(label.as_str()).size(12.0));
-                    ui.label(
-                        egui::RichText::new(if *got { "已拿到" } else { "未拿到" })
-                            .size(12.0)
-                            .color(if *got {
-                                ok_green()
-                            } else {
-                                argb(cfg::cur().text_dim)
-                            }),
-                    );
-                });
-            }
-            if insts.iter().any(|(_, g)| !*g) {
-                ui.label(
-                    egui::RichText::new("未拿到的实例：先显示一次它的主窗口，再点上面的按钮")
-                        .size(11.0)
-                        .weak(),
-                );
-            }
-        }
-
-        ui.add_space(10.0);
-        ui.add_space(10.0);
         section(ui, "通知方式");
         ui.label(
             egui::RichText::new("每类消息各自选择弹在哪里：Orbit 横幅（右下角卡片）/ Windows 系统通知 / 不通知")
@@ -1137,7 +1039,6 @@ impl SettingsApp {
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
                 for (name, ch) in [
-                    ("微信", settings::notify_wechat()),
                     ("邮件", settings::notify_mail()),
                     ("托盘闪烁", settings::notify_tray()),
                     ("剪切板", settings::notify_clipboard()),
@@ -1155,7 +1056,6 @@ impl SettingsApp {
                             _ => settings::NotifyChannel::Orbit,
                         };
                         match name {
-                            "微信" => settings::set_notify_wechat(c),
                             "邮件" => settings::set_notify_mail(c),
                             "托盘闪烁" => settings::set_notify_tray(c),
                             _ => settings::set_notify_clipboard(c),
@@ -1203,7 +1103,6 @@ impl SettingsApp {
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
                 for (name, key) in [
-                    ("微信", 0u8),
                     ("邮件", 1u8),
                     ("托盘闪烁", 2u8),
                     ("剪切板", 3u8),
@@ -1532,8 +1431,325 @@ impl SettingsApp {
         });
     }
 
-    /// 微信：程序路径 / 数据目录 / 登录凭证快照（保存、启动、快捷方式、删除）
+    /// 微信分组：消息监控 / 通知与横幅 / 程序路径与数据目录 / 登录凭证快照。
+    /// （2026-11-23 起所有微信相关设置集中到本页，常规设置里不再出现微信项）
     fn detail_wechat(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+        section(ui, "消息监控");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let on = settings::wechat_cards();
+            if toggle_btn(ui, on, "微信卡片") {
+                settings::set_wechat_cards(!on);
+                crate::tlog!(
+                    "[settings] 微信消息卡片 → {}",
+                    if settings::wechat_cards() { "开启" } else { "关闭" }
+                );
+            }
+            ui.label(
+                egui::RichText::new(
+                    "开启后只读微信聊天列表（UIA，不改动微信本体），新消息弹会话名+摘要卡片，读不到的实例退回「有新消息」横幅；关闭时托盘图标闪烁也弹「有新消息」横幅（点击跳回微信）。两种方式的横幅时长与提示音设置通用",
+                )
+                .size(11.5)
+                .weak(),
+            );
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let jump = settings::wechat_banner_jump();
+            if toggle_btn(ui, jump, "横幅直达") {
+                settings::set_wechat_banner_jump(!jump);
+                crate::tlog!(
+                    "[settings] 点横幅直达会话 → {}",
+                    if settings::wechat_banner_jump() { "开启" } else { "关闭" }
+                );
+            }
+            ui.label(
+                egui::RichText::new(
+                    "点微信消息横幅（会话名 + 摘要那种）时，单击即切到那个对话（会把它标为已读）；关闭则只把微信窗口唤到前台，不动当前对话。默认关闭——开启后会向微信投递一次后台单击（不移动你的鼠标），若那时列表刚好因新消息重排，可能切到相邻会话。托盘闪烁的「有新消息」横幅没有具体会话，始终只唤窗口",
+                )
+                .size(11.5)
+                .weak(),
+            );
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let hp = settings::wechat_hover_preview();
+            if toggle_btn(ui, hp, "悬停预览") {
+                settings::set_wechat_hover_preview(!hp);
+                crate::tlog!(
+                    "[settings] 微信悬停预览 → {}",
+                    if settings::wechat_hover_preview() { "开启" } else { "关闭" }
+                );
+            }
+            ui.label(
+                egui::RichText::new(
+                    "用 Orbit 自绘的浮窗替代微信自带的托盘悬停小窗：鼠标停在 Dock 的微信图标上时列出全部未读会话（会话名 + 摘要 + 未读数），点一条直达。微信收进托盘时读不到未读数，这种情况下仍用微信自己的小窗",
+                )
+                .size(11.5)
+                .weak(),
+            );
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(row_label("不弹白名单"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.wechat_ignore)
+                    .hint_text("可添加多个：标题之间用英文逗号 , 分隔"),
+            );
+            if r.lost_focus() {
+                // 英文逗号分隔
+                let list: Vec<String> = self
+                    .edits
+                    .wechat_ignore
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                settings::set_wechat_ignore(list);
+                self.edits.wechat_ignore = settings::wechat_ignore_text();
+                crate::tlog!("[settings] 微信卡片白名单 → {}", settings::wechat_ignore_text());
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.wechat_ignore = settings::wechat_ignore_text();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "可添加多个标题（英文逗号分隔，完全匹配才跳过）；被跳过的标题会写进 orbit.log",
+            )
+            .size(11.5)
+            .weak(),
+        );
+
+        // 微信热键（显示 ↔ 最小化）：英文逗号分隔，按微信启动先后对应
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(row_label("微信热键"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.wechat_hotkeys)
+                    .hint_text("例：F1,F2 或 Ctrl+Alt+1,Ctrl+Alt+2"),
+            );
+            if r.lost_focus() {
+                let list: Vec<String> = self
+                    .edits
+                    .wechat_hotkeys
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                settings::set_wechat_hotkeys(list);
+                self.edits.wechat_hotkeys = settings::wechat_hotkeys_text();
+                crate::tlog!("[settings] 微信热键 → {}", settings::wechat_hotkeys_text());
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.wechat_hotkeys = settings::wechat_hotkeys_text();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "按微信启动先后对应：第 1 个热键 = 先启动的微信（没有账号快照的实例用这条兜底；有快照的账号请到下表的行内热键框里填，跟账号走）。动作只有显示↔最小化，绝不隐藏到托盘；注册失败会弹横幅告知",
+            )
+            .size(11.5)
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("手动拿 UIA").size(12.0))
+                        .min_size(egui::vec2(96.0, 24.0)),
+                )
+                .clicked()
+            {
+                // 设置页是独立进程，抓 UIA 的动作必须让主进程做
+                if IS_CHILD.load(Ordering::Relaxed) {
+                    post_to_parent(crate::appmsg::WM_GRAB_UIA);
+                } else {
+                    crate::banner::request_grab();
+                }
+                crate::tlog!("[settings] 手动拿 UIA 已点击");
+            }
+            ui.label(
+                egui::RichText::new("先唤出微信窗口（支持多开）再点；拿到后右下角提示一次")
+                    .size(11.5)
+                    .weak(),
+            );
+        });
+
+        // 账号监控表：读各快照的 account.txt（昵称 / pid / 备份时间），备份时间
+        // 最早的排 1 号。pid 还活着且 UIA 可读 = 已监控。
+        // 「居中」= 唤醒该实例并把窗口移到屏幕正中；「已监控/未监控」按钮 =
+        // 让主进程拿一次 UIA 树（与「手动拿 UIA」同一动作）。
+        let snaps_mon = crate::wechatsnap::list();
+        if !snaps_mon.is_empty() {
+            ui.add_space(6.0);
+            egui::Grid::new("g_wechat_accounts")
+                .num_columns(6)
+                .spacing([12.0, 4.0])
+                // 序号列只放一个数字，不让它按 interact_size（默认 40px）撑开
+                .min_col_width(0.0)
+                .show(ui, |ui| {
+                    for (i, s) in snaps_mon.iter().enumerate() {
+                        let alive = crate::wechatsnap::logged_in(&s.id);
+                        let mon = alive.map(|p| wechat_pid_readable(p)).unwrap_or(false);
+                        let hk = alive.map(|p| wechat_pid_hotkey(p)).unwrap_or_default();
+                        ui.add_sized(
+                            egui::vec2(16.0, 18.0),
+                            egui::Label::new(egui::RichText::new(format!("{}", i + 1)).size(12.0)),
+                        );
+                        ui.label(egui::RichText::new(s.nickname.as_str()).size(12.0));
+                        ui.label(
+                            egui::RichText::new(
+                                crate::wechatsnap::stored_pid(&s.id)
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_else(|| "—".into()),
+                            )
+                            .size(12.0),
+                        );
+                        // 居中：唤醒该实例（托盘态点托盘 / 最小化还原）→ 移到屏幕正中
+                        if ui
+                            .add_enabled(
+                                alive.is_some(),
+                                egui::Button::new(egui::RichText::new("居中").size(12.0))
+                                    .min_size(egui::vec2(48.0, 22.0)),
+                            )
+                            .clicked()
+                        {
+                            if let Some(p) = alive {
+                                post_to_parent_w(crate::appmsg::WM_CENTER_WECHAT, p as usize);
+                                crate::tlog!("[settings] 请求居中微信 pid={p}");
+                            }
+                        }
+                        // 热键：直接在这一行填（留空 = 不绑这个账号）。
+                        // 绑的是账号快照 id，微信换启动顺序 / 换昵称都不会串
+                        let mut buf = self
+                            .edits
+                            .wechat_hk
+                            .get(&s.id)
+                            .cloned()
+                            .unwrap_or_else(|| settings::wechat_hotkey_for(&s.id));
+                        let hint = if hk.is_empty() {
+                            "填热键".to_string()
+                        } else {
+                            format!("顺序 {hk}")
+                        };
+                        let r = ui
+                            .add_sized(
+                                egui::vec2(96.0, 22.0),
+                                egui::TextEdit::singleline(&mut buf).hint_text(hint),
+                            )
+                            .on_hover_text(
+                                "该账号的「显示↔最小化」热键：写法 F1 / Ctrl+Alt+1，留空 = 不绑。\n绑到账号本身上（不看启动顺序），换昵称、换多开顺序都不受影响",
+                            );
+                        if r.changed() {
+                            self.edits.wechat_hk.insert(s.id.clone(), buf.clone());
+                        }
+                        if r.lost_focus() {
+                            settings::set_wechat_hotkey_for(&s.id, buf.trim());
+                            let saved = settings::wechat_hotkey_for(&s.id);
+                            self.edits.wechat_hk.insert(s.id.clone(), saved.clone());
+                            crate::tlog!(
+                                "[settings] 账号「{}」热键 → {:?}",
+                                s.nickname,
+                                if saved.is_empty() { "（空）" } else { &saved }
+                            );
+                        }
+                        // 监控状态按钮：点一下让主进程拿一次 UIA 树
+                        let st = if mon { "已监控" } else { "未监控" };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(st)
+                                        .size(12.0)
+                                        .color(if mon { ok_green() } else { argb(cfg::cur().text_dim) }),
+                                )
+                                .min_size(egui::vec2(72.0, 22.0)),
+                            )
+                            .clicked()
+                        {
+                            post_to_parent(crate::appmsg::WM_GRAB_UIA);
+                            crate::tlog!("[settings] 账号表请求拿 UIA（{}）", s.nickname);
+                        }
+                        ui.end_row();
+                    }
+                });
+            ui.label(
+                egui::RichText::new(
+                    "「居中」= 唤醒微信（托盘态自动点托盘唤出 / 最小化自动还原）并把窗口移到屏幕上下、左右正中；「已监控 / 未监控」点一下 = 拿一次 UIA 树；热键框留空 = 这个账号不绑热键",
+                )
+                .size(11.0)
+                .weak(),
+            );
+            if snaps_mon.iter().any(|s| {
+                crate::wechatsnap::logged_in(&s.id)
+                    .map(|p| !wechat_pid_readable(p))
+                    .unwrap_or(false)
+            }) {
+                ui.label(
+                    egui::RichText::new("未监控的账号：先点「居中」唤出它的微信主窗口，再点状态按钮拿一次 UIA")
+                        .size(11.0)
+                        .weak(),
+                );
+            }
+        }
+
+        ui.add_space(10.0);
+        ui.add_space(10.0);
+        section(ui, "通知与横幅");
+        ui.label(
+            egui::RichText::new("微信消息弹在哪里、横幅显示多久（提示音模式在「常规设置 → 提示音」）")
+                .size(11.5)
+                .weak(),
+        );
+        ui.horizontal(|ui| {
+            ui.label(row_label("通知方式"));
+            let ch = settings::notify_wechat();
+            let idx = match ch {
+                settings::NotifyChannel::Orbit => 0,
+                settings::NotifyChannel::Windows => 1,
+                settings::NotifyChannel::Off => 2,
+            };
+            if let Some(i) = seg(ui, &["Orbit 横幅", "Windows 通知", "不通知"], idx) {
+                let c = match i {
+                    1 => settings::NotifyChannel::Windows,
+                    2 => settings::NotifyChannel::Off,
+                    _ => settings::NotifyChannel::Orbit,
+                };
+                settings::set_notify_wechat(c);
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(row_label("横幅时长"));
+            let cur = settings::banner_secs_wechat();
+            let buf = &mut self.edits.banner_secs_wechat;
+            let r = ui.add_sized([CTRL_W, 24.0], egui::TextEdit::singleline(buf).hint_text("6"));
+            // 逐键提交：设置窗失活会直接收起，文本框来不及触发 lost_focus
+            let parsed = buf.trim().parse::<u32>().ok();
+            if r.changed() {
+                if let Some(v) = parsed {
+                    settings::set_banner_secs_wechat(v);
+                }
+            }
+            if r.lost_focus() {
+                let v = parsed.unwrap_or(6);
+                settings::set_banner_secs_wechat(v);
+                *buf = cur.to_string();
+            }
+            if ver_changed && !r.has_focus() {
+                *buf = cur.to_string();
+            }
+            ui.label(
+                egui::RichText::new("秒；0 = 不自动关闭，点一下才收起").size(11.5).weak(),
+            );
+        });
+
+        ui.add_space(10.0);
+        ui.add_space(10.0);
         section(ui, "微信程序");
         ui.horizontal(|ui| {
             ui.label(row_label("程序路径"));
@@ -1646,6 +1862,17 @@ impl SettingsApp {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.label(egui::RichText::new(s.nickname.as_str()).size(12.5));
                     ui.label(egui::RichText::new(format!("（账号 {}）", s.id)).size(11.0).weak());
+                    // 登录状态：account.txt 里记录的 pid 还活着且是 Weixin.exe → 已登录
+                    match crate::wechatsnap::logged_in(&s.id) {
+                        Some(pid) => ui.label(
+                            egui::RichText::new(format!("已登录（pid {pid}）"))
+                                .size(12.0)
+                                .color(ok_green()),
+                        ),
+                        None => ui.label(
+                            egui::RichText::new("未登录").size(12.0).weak(),
+                        ),
+                    };
                     if ui
                         .add(
                             egui::Button::new(egui::RichText::new("启动").size(12.0))
@@ -1686,7 +1913,7 @@ impl SettingsApp {
             }
             ui.label(
                 egui::RichText::new(
-                    "「启动」= 恢复该快照凭证（热替换，运行中的微信不受影响）→ 自动打开微信免扫码登录。多开：先开 A 号，再点 B 号快照的「启动」",
+                    "「启动」= 恢复该快照凭证（热替换，运行中的微信不受影响）→ 自动打开微信免扫码登录，并把本次拉起的微信 pid 记进 account.txt（据此显示登录状态，pid 退出即变回未登录）。多开：先开 A 号，再点 B 号快照的「启动」",
                 )
                 .size(11.5)
                 .weak(),

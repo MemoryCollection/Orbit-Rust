@@ -86,7 +86,7 @@ fn wechat_lines() -> Vec<WeLine> {
         .map(|(i, s)| {
             let name = if s.title.is_empty() { format!("微信{}", i + 1) } else { s.title.clone() };
             if !s.monitoring {
-                return WeLine { name, tail: "监视已关".into(), ok: false, faint: true };
+                return WeLine { name, tail: "未监控".into(), ok: false, faint: true };
             }
             let hk = if s.hotkey.is_empty() {
                 "热键未设".to_string()
@@ -95,7 +95,11 @@ fn wechat_lines() -> Vec<WeLine> {
             } else {
                 format!("热键{}✗", s.hotkey)
             };
-            let mon = if s.uia { "监控中" } else { "未抓到" };
+            // 监控状态三档：前台 = 暂停（灰）；读到 UIA 树 = 监控中（绿）；读不到 = 未监控（红）
+            if s.paused {
+                return WeLine { name, tail: format!("{hk} · 监控暂停"), ok: false, faint: true };
+            }
+            let mon = if s.uia { "监控中" } else { "未监控" };
             let ok = s.uia && (s.hotkey.is_empty() || s.hotkey_ok);
             WeLine { name, tail: format!("{hk} · {mon}"), ok, faint: false }
         })

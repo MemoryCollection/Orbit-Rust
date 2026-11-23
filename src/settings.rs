@@ -44,6 +44,11 @@
 //! - `wechat_cards`       微信消息卡片（UIA 读会话名+摘要）：`0` = 关（默认，托盘闪烁
 //!                          直接弹通用横幅）；`1` = 开，读取线程随开关启停
 //! - `wechat_ignore`      卡片白名单：标题命中就不弹（英文逗号分隔，默认「折叠的聊天」）
+//! - `wechat_banner_jump`  点击微信消息横幅是否直达对应会话：`1` = 开；`0` = 关（默认）
+//! - `wechat_hover_preview` 微信托盘悬停预览浮窗（自绘，替代微信自己的小窗）：
+//!                        `1` = 开；`0` = 关（默认，保留微信原生悬停小窗）
+//! - `wechat_hotkey_bind` 微信热键「按账号」绑定：`账号ID=热键`，英文逗号分隔。
+//!                        绑到账号跟账号走（换启动顺序不串），设置页账号列表每行直接填
 //! - `wechat_hotkeys`     微信实例的「显示↔最小化」热键（英文逗号分隔，按实例创建
 //!                          先后对应：第 1 个 = 先开的那个微信）。设置页可直接改。
 //!                          空 = 不注册任何热键（默认）。
@@ -156,6 +161,10 @@ static SHOW_DESKTOP: AtomicU32 = AtomicU32::new(UNLOADED);
 static WECHAT_SOUND: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 微信新消息是否在屏幕右下角弹会话名+摘要小卡片（只读 UIA）
 static WECHAT_CARDS: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 微信托盘悬停预览浮窗（默认关：默认保留微信自己的悬停小窗）
+static WECHAT_HOVER: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 点击微信消息横幅是否直达对应会话（默认开）
+static WECHAT_JUMP: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 右下角横幅每条停留秒数；0 = 不自动关闭（UNLOADED 时默认 6）
 static BANNER_SECS: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 微信卡片标题白名单：标题命中就不弹（默认含「折叠的聊天」）
@@ -163,6 +172,10 @@ static WECHAT_IGNORE: LazyLock<Mutex<Vec<String>>> =
     LazyLock::new(|| Mutex::new(vec!["折叠的聊天".to_string()]));
 /// 微信实例的「显示↔最小化」热键（按实例创建先后；空 = 不注册）
 static WECHAT_HOTKEYS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// 微信热键的「按账号」绑定：(账号快照 id, 热键)。跟账号走，换启动顺序不会串；
+/// 没有快照的实例仍走 `WECHAT_HOTKEYS` 的启动顺序。
+static WECHAT_HOTKEY_BIND: LazyLock<Mutex<Vec<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 /// 微信主程序路径（Weixin.exe；空 = 自动探测：运行中进程 → 注册表 → 常见位置）
 static WECHAT_PATH: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 /// 微信数据目录（xwechat_files；空 = 自动探测：安装目录同级 → 注册表）
@@ -1118,6 +1131,25 @@ pub fn wechat_cards() -> bool {
     }
 }
 
+/// 鼠标停在 Dock 的微信图标上时，是否弹出「未读会话」预览浮窗（点一条即可直达）。
+/// 默认**关**：保留微信自己的悬停小窗；开了才换成 orbit 自绘的多条预览。
+pub fn wechat_hover_preview() -> bool {
+    match WECHAT_HOVER.load(Ordering::Relaxed) {
+        UNLOADED => false,
+        c => c == 2,
+    }
+}
+
+/// 点微信消息横幅时，是否直接切到那个会话（默认**关**）。
+/// 关着只把微信窗口唤到前台，不碰当前对话。
+/// 注意直达即打开该会话，会把它标为已读。
+pub fn wechat_banner_jump() -> bool {
+    match WECHAT_JUMP.load(Ordering::Relaxed) {
+        UNLOADED => false,
+        c => c == 2,
+    }
+}
+
 /// 微信卡片白名单（标题精确匹配，英文逗号分隔展示/存储）
 pub fn wechat_ignore() -> Vec<String> {
     WECHAT_IGNORE.lock().map(|v| v.clone()).unwrap_or_default()
@@ -1168,11 +1200,6 @@ pub fn wechat_hotkeys() -> Vec<String> {
     WECHAT_HOTKEYS.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
-/// 按索引取热键文本（越界返回空串）
-pub fn wechat_hotkey_at(i: usize) -> String {
-    wechat_hotkeys().get(i).cloned().unwrap_or_default()
-}
-
 /// 设置页输入框用的文本
 pub fn wechat_hotkeys_text() -> String {
     wechat_hotkeys().join(",")
@@ -1202,6 +1229,57 @@ pub fn set_wechat_hotkeys(list: Vec<String>) {
         save();
         bump();
     }
+}
+
+/// 微信热键的「按账号」绑定表：(账号快照 id, 热键文本)
+pub fn wechat_hotkey_binds() -> Vec<(String, String)> {
+    WECHAT_HOTKEY_BIND
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default()
+}
+
+/// 某账号绑定的热键（空 = 没绑）。账号用快照 id（= `data/wechat_accounts/<id>/`），
+/// 换昵称、换登录顺序都不影响。
+pub fn wechat_hotkey_for(id: &str) -> String {
+    WECHAT_HOTKEY_BIND
+        .lock()
+        .ok()
+        .and_then(|v| v.iter().find(|(k, _)| k == id).map(|(_, s)| s.clone()))
+        .unwrap_or_default()
+}
+
+/// 给账号设热键；`spec` 传空 = 解绑
+pub fn set_wechat_hotkey_for(id: &str, spec: &str) {
+    let id = id.trim();
+    if id.is_empty() {
+        return;
+    }
+    let spec = spec.trim().to_string();
+    let changed = WECHAT_HOTKEY_BIND
+        .lock()
+        .map(|mut v| {
+            let before = v.clone();
+            v.retain(|(k, _)| k != id);
+            if !spec.is_empty() {
+                v.push((id.to_string(), spec));
+            }
+            *v != before
+        })
+        .unwrap_or(false);
+    if changed {
+        save();
+        bump();
+    }
+}
+
+/// 设置文件里的存法：`账号id=热键,账号id=热键`
+pub fn wechat_hotkey_binds_text() -> String {
+    wechat_hotkey_binds()
+        .into_iter()
+        .map(|(k, s)| format!("{k}={s}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// 微信主程序路径（空 = 自动探测）
@@ -1244,7 +1322,9 @@ pub fn wechat_close_min() -> bool {
     }
 }
 
-/// 设置「关闭 = 最小化」
+/// 设置「关闭 = 最小化」。目前只支持手改 `settings.txt`（设置页暂未给开关），
+/// 保留 setter 与其它 `set_*` 对称，供以后接 UI 用。
+#[allow(dead_code)]
 pub fn set_wechat_close_min(on: bool) {
     if wechat_close_min() == on {
         return;
@@ -1948,6 +2028,26 @@ pub fn set_wechat_cards(on: bool) {
     bump();
 }
 
+/// 开关微信托盘悬停预览浮窗（设置页）
+pub fn set_wechat_hover_preview(on: bool) {
+    if on == wechat_hover_preview() {
+        return;
+    }
+    WECHAT_HOVER.store(bool_code(on), Ordering::Relaxed);
+    save();
+    bump();
+}
+
+/// 开关「点横幅直达会话」（设置页）
+pub fn set_wechat_banner_jump(on: bool) {
+    if on == wechat_banner_jump() {
+        return;
+    }
+    WECHAT_JUMP.store(bool_code(on), Ordering::Relaxed);
+    save();
+    bump();
+}
+
 /// 按当前值更新设置文件：**只改我们管的键的值**，注释、空行、用户自己加的
 /// 其它键都原样保留（手改过的文件不会被洗掉）；缺的键补在末尾。
 /// 写完把 mtime 同步掉，免得下一轮轮询又当成"外部改动"重载一次。
@@ -1994,8 +2094,11 @@ fn save() {
         ("show_desktop_btn", on_off(show_desktop_btn()).to_string()),
         ("wechat_sound", on_off(wechat_sound()).to_string()),
         ("wechat_cards", on_off(wechat_cards()).to_string()),
+        ("wechat_hover_preview", on_off(wechat_hover_preview()).to_string()),
+        ("wechat_banner_jump", on_off(wechat_banner_jump()).to_string()),
         ("wechat_ignore", wechat_ignore().join(",")),
         ("wechat_hotkeys", wechat_hotkeys().join(",")),
+        ("wechat_hotkey_bind", wechat_hotkey_binds_text()),
         ("wechat_path", wechat_path()),
         ("wechat_data_dir", wechat_data_dir()),
         ("wechat_close_min", on_off(wechat_close_min()).to_string()),
@@ -2150,7 +2253,13 @@ struct Snap {
     show_tray: bool,
     show_desktop: bool,
     wechat_cards: bool,
+    wechat_hover_preview: bool,
+    wechat_banner_jump: bool,
     wechat_ignore: Vec<String>,
+    /// 热键两项也要进快照：否则只改热键（手改文件 / 设置页行内填）时快照没差异，
+    /// 主进程不会重装热键，得重启才生效
+    wechat_hotkeys: Vec<String>,
+    wechat_hotkey_bind: Vec<(String, String)>,
     use_misans: bool,
     hidden_tray: Vec<String>,
     start_pins: Option<Vec<(String, String)>>,
@@ -2196,7 +2305,11 @@ fn snapshot() -> Snap {
         show_tray: show_tray(),
         show_desktop: show_desktop_btn(),
         wechat_cards: wechat_cards(),
+        wechat_hover_preview: wechat_hover_preview(),
+        wechat_banner_jump: wechat_banner_jump(),
         wechat_ignore: wechat_ignore(),
+        wechat_hotkeys: wechat_hotkeys(),
+        wechat_hotkey_bind: wechat_hotkey_binds(),
         use_misans: use_misans(),
         hidden_tray: hidden_tray(),
         start_pins: start_pins_custom(),
@@ -2470,8 +2583,11 @@ fn append_missing() {
         ("tray_order", "# 托盘图标自定义排序（稳定键列表，分号分隔，设置页 ▲▼ 排序写回；清空 = 默认顺序）\ntray_order=\n"),
         ("wechat_sound", "# 微信托盘图标开始闪烁（新消息）时播放内置提示音（1 = 开，默认；0 = 关）\nwechat_sound=1\n"),
         ("wechat_cards", "# 微信消息卡片（UIA 读会话名+摘要，1 = 开；0 = 关，默认）\nwechat_cards=0\n"),
+        ("wechat_banner_jump", "# 点击微信消息横幅是否直达对应会话（1 = 开；0 = 关，默认）。开启后点横幅会切到该对话并把它标为已读；关闭则只唤出微信窗口\nwechat_banner_jump=0\n"),
+        ("wechat_hover_preview", "# 微信托盘悬停预览（用 Orbit 自绘浮窗替代微信自己的悬停小窗；1 = 开；0 = 关，默认）\nwechat_hover_preview=0\n"),
         ("wechat_ignore", "# 微信卡片白名单：标题命中就不弹卡片（英文逗号分隔；默认「折叠的聊天」）\nwechat_ignore=折叠的聊天\n"),
         ("wechat_hotkeys", "# 微信「显示↔最小化」热键（英文逗号分隔，按微信启动先后对应：第 1 个 = 先开的微信）\n# 例：F1,F2 或 Ctrl+Alt+1,Ctrl+Alt+2；设置页「通知接管（微信）」里可直接改。只做最小化，绝不隐藏\nwechat_hotkeys=\n"),
+        ("wechat_hotkey_bind", "# 微信热键「按账号」绑定：`账号ID=热键`，英文逗号分隔。账号ID 见设置页「账号监控」列表（data/wechat_accounts 下的目录名）\n# 绑到账号跟账号走，换启动顺序也不会串；没做快照的实例用上面的 wechat_hotkeys 按启动顺序兜底\n# 例：1234567890=F1,9876543210=Ctrl+Alt+2。设置页账号列表每行直接填，不用手改这里\nwechat_hotkey_bind=\n"),
         ("wechat_path", "# 微信主程序完整路径（到 Weixin.exe 为止）；空 = 自动探测（运行中进程 → 常见位置）\n# 例：D:\\Tencent\\Weixin\\weixin\\Weixin.exe\nwechat_path=\n"),
         ("wechat_data_dir", "# 微信数据目录（提供 xwechat_files 目录即可）；空 = 自动探测\n# 例：D:\\Tencent\\Weixin\\xwechat_files\nwechat_data_dir=\n"),
         ("wechat_close_min", "# 点微信「关闭」时改成最小化而不是收进托盘（1 = 开，默认；0 = 关）\nwechat_close_min=1\n"),
@@ -2542,12 +2658,15 @@ fn load() {
     let mut desktop = cfg::SHOW_DESKTOP_BTN;
     let mut wsound = true;
     let mut wcards = false;
+    let mut wpreview = false;
+    let mut wjump = false;
     let mut wcmin = true;
     let mut misans = true;
     // None = 文件里没这个键 → 保留默认（折叠的聊天）；Some(空 Vec) = 用户清空了白名单
     let mut wignore: Option<Vec<String>> = None;
     // None = 文件里没这个键 → 保留默认（空 = 不注册热键）
     let mut whotkeys: Option<Vec<String>> = None;
+    let mut wbind: Option<Vec<(String, String)>> = None;
     let mut wpath: Option<String> = None;
     let mut wdatadir: Option<String> = None;
     let mut bsecs: Option<u32> = None;
@@ -2756,6 +2875,16 @@ fn load() {
                     wcards = b;
                 }
             }
+            "wechat_hover_preview" => {
+                if let Some(b) = parse_bool(v) {
+                    wpreview = b;
+                }
+            }
+            "wechat_banner_jump" => {
+                if let Some(b) = parse_bool(v) {
+                    wjump = b;
+                }
+            }
             "wechat_ignore" => {
                 // 英文逗号分隔
                 wignore = Some(
@@ -2770,6 +2899,16 @@ fn load() {
                     v.split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
+                        .collect(),
+                );
+            }
+            "wechat_hotkey_bind" => {
+                // `账号id=热键` 逗号分隔；没有 `=` 的项直接忽略
+                wbind = Some(
+                    v.split(',')
+                        .filter_map(|it| it.split_once('='))
+                        .map(|(k, s)| (k.trim().to_string(), s.trim().to_string()))
+                        .filter(|(k, s)| !k.is_empty() && !s.is_empty())
                         .collect(),
                 );
             }
@@ -2939,6 +3078,8 @@ fn load() {
     SHOW_DESKTOP.store(bool_code(desktop), Ordering::Relaxed);
     WECHAT_SOUND.store(bool_code(wsound), Ordering::Relaxed);
     WECHAT_CARDS.store(bool_code(wcards), Ordering::Relaxed);
+    WECHAT_HOVER.store(bool_code(wpreview), Ordering::Relaxed);
+    WECHAT_JUMP.store(bool_code(wjump), Ordering::Relaxed);
     FONT.store(if misans { 1 } else { 2 }, Ordering::Relaxed);
     if let Some(list) = wignore {
         if let Ok(mut v) = WECHAT_IGNORE.lock() {
@@ -2947,6 +3088,11 @@ fn load() {
     }
     if let Some(list) = whotkeys {
         if let Ok(mut v) = WECHAT_HOTKEYS.lock() {
+            *v = list;
+        }
+    }
+    if let Some(list) = wbind {
+        if let Ok(mut v) = WECHAT_HOTKEY_BIND.lock() {
             *v = list;
         }
     }

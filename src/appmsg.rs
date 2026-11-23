@@ -24,6 +24,10 @@ pub const WM_GRAB_UIA: u32 = WM_APP + 0x73;
 /// 跨进程投递到横幅窗口（ORBIT_WECARD），主进程收到后写入设置内存并弹预览卡。
 pub const WM_BANNER_PREVIEW: u32 = WM_APP + 0x74;
 
+/// 设置页（独立子进程）请求主进程「居中某 pid 的微信窗口」：wParam = pid。
+/// 跨进程投递到胶囊窗口，主进程收到后唤醒该实例并把窗口移到屏幕正中。
+pub const WM_CENTER_WECHAT: u32 = WM_APP + 0x75;
+
 /// 胶囊主窗口 HWND（raw isize 存，避免跨线程持有 HWND）
 static PILL_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Dock 窗口 HWND

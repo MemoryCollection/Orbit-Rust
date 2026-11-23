@@ -163,6 +163,8 @@ pub fn run(want_hide_taskbar: bool) {
         settingsui::init(hinstance.into());
         // 通用右下角横幅（微信消息卡片只是其中一种；读取线程在定时器里跟随设置项启停）
         crate::banner::init(hinstance.into());
+        // 托盘悬停预览浮窗（Dock 悬停微信图标时列出未读会话，点击直达）
+        crate::wxhover::init(hinstance.into());
         // 接管 Windows 通知中心（开关在设置页；关闭时线程只待命）
         crate::notifycenter::start();
         // 开始菜单（Win 键弹出；快捷方式在设置页配置）

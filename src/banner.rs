@@ -465,7 +465,9 @@ pub fn flash_tick() {
 }
 
 fn sync_reader() {
-    let want = settings::wechat_cards();
+    // 读取线程有两项消费方：新消息卡片，以及 Dock 的悬停预览浮窗。
+    // 任一开启就要跑——否则默认配置（卡片关、预览开）下快照永远空，浮窗弹不出来。
+    let want = settings::wechat_cards() || settings::wechat_hover_preview();
     let Ok(mut g) = READER.lock() else { return };
     if want && g.is_none() {
         *g = Reader::start();
@@ -625,7 +627,26 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                 if let Some(card) = c.cards.remove(idx) {
                     c.unregister(card.flash_key());
                     if card.notice.pid != 0 {
-                        crate::wechatmsg::focus(card.notice.pid);
+                        // 微信消息卡片（source = wechat，main 就是会话名）：
+                        // 开关开着就直达那个对话，否则只把微信窗口唤出来。
+                        // 托盘闪烁的兜底横幅（source = tray，main 是账号名不是会话名）
+                        // 没有可跳的对话，一直走「只唤出窗口」。
+                        if settings::wechat_banner_jump()
+                            && card.notice.source == "wechat"
+                            && !card.notice.main.is_empty()
+                        {
+                            crate::tlog!(
+                                "[banner] 点击卡片直达会话 pid={} chat={:?}",
+                                card.notice.pid,
+                                card.notice.main
+                            );
+                            crate::wechatmsg::open_session(
+                                card.notice.pid,
+                                card.notice.main.clone(),
+                            );
+                        } else {
+                            crate::wechatmsg::focus(card.notice.pid);
+                        }
                     }
                 }
                 c.hovered = false;

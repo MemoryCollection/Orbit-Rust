@@ -289,8 +289,9 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 LRESULT(0)
             }
             WM_HOTKEY if w.0 as usize >= crate::hotkey::HOTKEY_BASE => {
-                // 微信实例热键：显示 ↔ 最小化（绝不 hide，见 hotkey.rs 头注释）
-                crate::wechatmsg::toggle(w.0 as usize - crate::hotkey::HOTKEY_BASE);
+                // 微信实例热键：显示 ↔ 最小化（绝不 hide，见 hotkey.rs 头注释）。
+                // 具体唤哪个实例由 hotkey 的注册计划决定：账号绑定 or 启动顺序。
+                crate::hotkey::dispatch(w.0 as i32);
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
@@ -358,6 +359,11 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             // 设置页子进程请求「手动拿一次微信 UIA」（跨进程）
             m if m == crate::appmsg::WM_GRAB_UIA => {
                 crate::banner::request_grab();
+                LRESULT(0)
+            }
+            // 设置页子进程请求「居中某 pid 的微信窗口」（跨进程，wParam = pid）
+            m if m == crate::appmsg::WM_CENTER_WECHAT => {
+                crate::wechatmsg::center(w.0 as u32);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, w, l),

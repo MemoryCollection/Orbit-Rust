@@ -46,6 +46,7 @@ mod traydetect;
 mod banner;
 mod usb;
 mod wechatmsg;
+mod wxhover;
 mod wechatsnap;
 mod weather;
 mod weathercard;
