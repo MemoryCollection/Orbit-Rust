@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use windows::core::{BSTR, VARIANT};
-use windows::Win32::Foundation::{BOOL, CloseHandle, FILETIME, HANDLE, LPARAM};
+use windows::Win32::Foundation::{BOOL, CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
@@ -36,8 +36,9 @@ use windows::Win32::UI::Accessibility::{
     UIA_ClassNamePropertyId, UIA_NamePropertyId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow,
-    IsWindowVisible,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, PostMessageW,
+    ShowWindow, SW_MINIMIZE, WM_SYSCOMMAND,
 };
 
 use crate::banner::BannerNotice;
@@ -148,6 +149,64 @@ pub fn instance_tag(pid: u32) -> Option<String> {
     (procs.len() > 1).then(|| format!("微信{}", idx + 1))
 }
 
+/// 单个微信实例的运行状态（天气卡片「微信监视」区用）
+#[derive(Clone)]
+pub struct InstStatus {
+    /// 主窗口标题（= 账号名），空串时调用方退化用「微信N」
+    pub title: String,
+    /// 绑定的热键（如 `F1`）；未配置为空串
+    pub hotkey: String,
+    /// 热键是否注册成功（未配置热键时无意义）
+    pub hotkey_ok: bool,
+    /// UIA 树是否拿到（读到过会话行或仍有存活缓存）→ 能读未读数才能弹横幅
+    pub uia: bool,
+    /// 是否处于实时监视（消息卡片开关开着）
+    pub monitoring: bool,
+}
+
+/// 各实例状态快照，按启动先后排列（与热键槽位一致）。
+/// 每 3s 才被天气卡片调一次，不做缓存。
+pub fn instance_status() -> Vec<InstStatus> {
+    let monitoring = settings::wechat_cards();
+    let mut procs: Vec<(u32, u64)> = wechat_processes()
+        .into_iter()
+        .map(|pid| (pid, proc_start(pid)))
+        .collect();
+    procs.sort_by_key(|(_, t)| *t);
+    let hotkeys = settings::wechat_hotkeys();
+    let hk = crate::hotkey::status();
+    let grab = grab_status();
+    let titled = instance_windows_titled();
+    procs
+        .iter()
+        .enumerate()
+        .map(|(i, (pid, _))| {
+            let title = titled
+                .iter()
+                .find(|(p, _, _)| p == pid)
+                .map(|(_, _, t)| t.clone())
+                .unwrap_or_default();
+            let (spec, _) = hotkeys
+                .get(i)
+                .map(|e| crate::hotkey::split_binding(e))
+                .unwrap_or(("", None));
+            let hotkey = if spec.is_empty() || parse_hotkey_unrecognized(spec) {
+                String::new()
+            } else {
+                spec.to_string()
+            };
+            let hotkey_ok = hk.iter().any(|(slot, _, ok)| *slot == i && *ok);
+            let uia = grab.iter().any(|(p, g)| p == pid && *g);
+            InstStatus { title, hotkey, hotkey_ok, uia, monitoring }
+        })
+        .collect()
+}
+
+/// 热键写法是否解析不了（写错了就不显示，免得误导）
+fn parse_hotkey_unrecognized(spec: &str) -> bool {
+    crate::hotkey::parse_for_check(spec).is_none()
+}
+
 #[derive(Clone, Default)]
 struct Row {
     chat: String,
@@ -158,13 +217,18 @@ struct Row {
     pid: u32,
 }
 
-/// "17:06" / "10/27" / "昨天" / "星期三"：摘要里这些不是消息内容
+/// "17:06" / "10/27" / "昨天" / "星期三"：摘要里这些不是消息内容。
+/// 注意纯数字不算时间（真实时间行必含 `:` 或 `/`，如 17:06、2026/11/20）——
+/// 否则「3」「123」这种纯数字消息内容会被误当时间丢掉，摘要变空。
 fn is_time(s: &str) -> bool {
     if s.is_empty() || s.chars().count() > 12 {
         return false;
     }
     if s == "昨天" || s.starts_with("星期") {
         return true;
+    }
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return false;
     }
     s.chars()
         .all(|c| c.is_ascii_digit() || c == ':' || c == '/' || c == '-')
@@ -240,6 +304,185 @@ fn wechat_windows(pid: u32) -> Vec<windows::Win32::Foundation::HWND> {
         );
     }
     data.out
+}
+
+// ---------- 热键动作：显示 ↔ 最小化（绝不 hide） ----------
+
+/// 微信主窗口标题（Qt 顶层窗口里还有「设置」等辅助窗，不能混进实例顺序）
+fn is_main_window(h: HWND) -> bool {
+    let mut buf = [0u16; 128];
+    let n = unsafe { GetWindowTextW(h, &mut buf) };
+    if n <= 0 {
+        return false;
+    }
+    String::from_utf16_lossy(&buf[..n as usize]).contains("微信")
+}
+
+/// 按「实例创建先后」排列的微信主窗口：(pid, hwnd, 窗口标题)。
+/// 标题就是账号名（UIA 树根的名字），热键按名称绑定（`F1=吴东`）靠它匹配。
+/// 顺序和 `instances()`（设置页「微信1/微信2」）完全一致，热键下标才对得上。
+fn instance_windows_titled() -> Vec<(u32, HWND, String)> {
+    let mut procs: Vec<(u32, u64)> = wechat_processes()
+        .into_iter()
+        .map(|pid| (pid, proc_start(pid)))
+        .collect();
+    procs.sort_by_key(|(_, t)| *t);
+    let mut out = Vec::new();
+    for (pid, _) in procs {
+        let wins = wechat_windows(pid);
+        let pick = wins
+            .iter()
+            .copied()
+            .find(|h| is_main_window(*h))
+            .or_else(|| wins.first().copied());
+        if let Some(h) = pick {
+            let mut buf = [0u16; 128];
+            let n = unsafe { GetWindowTextW(h, &mut buf) };
+            let title = if n > 0 {
+                String::from_utf16_lossy(&buf[..n as usize])
+            } else {
+                String::new()
+            };
+            out.push((pid, h, title));
+        }
+    }
+    out
+}
+
+/// 热键动作：可见 → 最小化；已最小化 → 还原并置前；已隐藏 → 点托盘唤出
+/// （隐藏后只能靠微信自己的 show()，外部 ShowWindow 重建不了 UIA 树）。
+/// 槽位按实例启动先后对应：热键列表第 1 个 = 先启动的微信。
+pub fn toggle(index: usize) {
+    let list = instance_windows_titled();
+    let Some((pid, h)) = list.get(index).map(|(p, h, _)| (*p, *h)) else {
+        crate::tlog!("[wechatmsg] 热键：没有第 {} 个微信实例", index + 1);
+        return;
+    };
+    unsafe {
+        if !IsWindowVisible(h).as_bool() {
+            crate::tlog!("[wechatmsg] 热键：微信 pid={} 已隐藏，点托盘唤出", pid);
+            crate::dock::click_tray_for_pid(pid);
+        } else if IsIconic(h).as_bool() {
+            crate::tlog!("[wechatmsg] 热键：微信 pid={} 还原并置前", pid);
+            crate::window::activate_window(h);
+        } else {
+            // 只最小化：窗口仍可见，Qt 的部件树完整保留，会话/未读继续可读
+            let _ = ShowWindow(h, SW_MINIMIZE);
+            crate::tlog!("[wechatmsg] 热键：微信 pid={} 最小化", pid);
+        }
+    }
+}
+
+// ---------- 关闭按钮拦截：点「关闭」改成最小化 ----------
+
+/// 微信标题栏「关闭」按钮的位置，按**相对窗口右上角**的偏移缓存：
+/// 窗口移动/缩放都不用重算，DPI 变了下一轮读取会刷新。
+#[derive(Clone, Copy)]
+struct CloseBtn {
+    hwnd: isize,
+    w: i32,
+    h: i32,
+    /// 窗口右边到按钮左边的距离
+    dx: i32,
+    /// 窗口顶到按钮顶的距离
+    dy: i32,
+}
+
+static CLOSE_BTNS: LazyLock<Mutex<Vec<CloseBtn>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 读取循环里顺手刷新该窗口「关闭」按钮的相对位置（只在正常显示时取，最小化时矩形无意义）
+fn refresh_close_btn(auto: &IUIAutomation, root: &IUIAutomationElement, hwnd: HWND) {
+    if !settings::wechat_close_min() {
+        return;
+    }
+    if unsafe { IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() } {
+        return;
+    }
+    let by_cls = unsafe {
+        auto.CreatePropertyCondition(UIA_ClassNamePropertyId, &VARIANT::from("mmui::XButton"))
+    };
+    let by_name = unsafe { auto.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from("关闭")) };
+    let (Ok(by_cls), Ok(by_name)) = (by_cls, by_name) else {
+        return;
+    };
+    let Ok(cond) = (unsafe { auto.CreateAndCondition(&by_cls, &by_name) }) else {
+        return;
+    };
+    let Ok(arr) = (unsafe { root.FindAll(TreeScope_Descendants, &cond) }) else {
+        return;
+    };
+    if unsafe { arr.Length() }.unwrap_or(0) == 0 {
+        return;
+    }
+    let Ok(el) = (unsafe { arr.GetElement(0) }) else {
+        return;
+    };
+    let Ok(b) = (unsafe { el.CurrentBoundingRectangle() }) else {
+        return;
+    };
+    let mut r = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut r) }.is_err() {
+        return;
+    }
+    let w = b.right - b.left;
+    let h = b.bottom - b.top;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let dx = r.right - b.left;
+    let dy = b.top - r.top;
+    if let Ok(mut v) = CLOSE_BTNS.lock() {
+        let key = hwnd.0 as isize;
+        match v.iter_mut().find(|c| c.hwnd == key) {
+            Some(c) => {
+                c.w = w;
+                c.h = h;
+                c.dx = dx;
+                c.dy = dy;
+            }
+            None => v.push(CloseBtn { hwnd: key, w, h, dx, dy }),
+        }
+        if v.len() > 16 {
+            let keep = v.len() - 16;
+            v.drain(..keep);
+        }
+    }
+}
+
+/// 鼠标钩子调用：落点是否命中**前台**微信窗口的「关闭」按钮。
+/// 命中就替用户最小化并返回 true（钩子据此吞掉这次点击）。
+/// 只做两次廉价的窗口调用，不做 UIA，钩子里不会卡。
+pub fn hit_close_and_minimize(x: i32, y: i32) -> bool {
+    if !settings::wechat_close_min() {
+        return false;
+    }
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_invalid() {
+        return false;
+    }
+    let key = fg.0 as isize;
+    let btn = CLOSE_BTNS
+        .lock()
+        .ok()
+        .and_then(|v| v.iter().find(|c| c.hwnd == key).copied());
+    let Some(btn) = btn else {
+        return false;
+    };
+    let mut r = RECT::default();
+    if unsafe { GetWindowRect(fg, &mut r) }.is_err() {
+        return false;
+    }
+    let left = r.right - btn.dx;
+    let top = r.top + btn.dy;
+    if x < left || x >= left + btn.w || y < top || y >= top + btn.h {
+        return false;
+    }
+    const SC_MINIMIZE: usize = 0xF020;
+    unsafe {
+        let _ = PostMessageW(fg, WM_SYSCOMMAND, windows::Win32::Foundation::WPARAM(SC_MINIMIZE), LPARAM(0));
+    }
+    crate::tlog!("[wechatmsg] 点「关闭」改为最小化 hwnd={:?}", fg);
+    true
 }
 
 /// 横幅点击跳转：把指定 PID 的微信窗口恢复并置前。多开时按 PID 找到
@@ -385,11 +628,16 @@ fn update_unread(
                 r.chat, r.summary, r.unread, key
             );
             let mut notice = BannerNotice::wechat(&r.chat, &r.summary, r.unread, r.pid);
-            // 常驻卡片（横幅秒数=0）挂到托盘闪烁上：图标不闪了（消息已读）
-            // 随 flash_tick 收起。多开按 pid 各挂各的图标；拿不到闪烁信息
-            // （托盘隐藏 / 刚启动还没见过闪烁）保持原行为，不挂
-            if let Some(k) = crate::banner::flashing_key_for_pid(r.pid) {
-                notice.flash_key = Some(k);
+            // 只有常驻卡片（横幅秒数=0）才挂到托盘闪烁上：图标不闪了（消息已读）
+            // 随 flash_tick 收起。计时横幅**不能**挂——托盘图标一停闪它就被提前
+            // 收起，表现为「横幅闪一下就没了」（2026-11-23 实测）。
+            let eff_secs = notice
+                .secs
+                .unwrap_or_else(|| settings::banner_secs_for(notice.source));
+            if eff_secs == 0 {
+                if let Some(k) = crate::banner::flashing_key_for_pid(r.pid) {
+                    notice.flash_key = Some(k);
+                }
             }
             crate::banner::show(notice);
         }
@@ -561,6 +809,8 @@ unsafe fn run(wake: HANDLE, stop: Arc<AtomicBool>) {
                     Err(_) => continue,
                 };
                 roots_ok += 1;
+                // 顺手记下「关闭」按钮位置：点它时改成最小化（见 hit_close_and_minimize）
+                refresh_close_btn(&auto, &root, h);
                 let all = match root.FindAllBuildCache(
                     TreeScope_Descendants,
                     Some(&cells),
@@ -784,4 +1034,14 @@ mod tests {
         assert_eq!(r.unread, 0);
     }
 
+    /// 纯数字的消息内容不是时间：不能把摘要丢掉（2026-11-23 实测「3」变空摘要）
+    #[test]
+    fn digit_only_summary_is_kept() {
+        let r = parse("东\n[1条] \n3\n17:38");
+        assert_eq!(r.unread, 1);
+        assert_eq!(r.summary, "3");
+        let r2 = parse("东\n[2条] \n123\n17:38");
+        assert_eq!(r2.unread, 2);
+        assert_eq!(r2.summary, "123");
+    }
 }

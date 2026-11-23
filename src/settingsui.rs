@@ -521,16 +521,18 @@ enum Group {
     Pill,
     Dock,
     Start,
+    Wechat,
 }
 
 impl Group {
-    const ALL: [Group; 4] = [Group::General, Group::Pill, Group::Dock, Group::Start];
+    const ALL: [Group; 5] = [Group::General, Group::Pill, Group::Dock, Group::Start, Group::Wechat];
     fn label(self) -> &'static str {
         match self {
             Group::General => "常规设置",
             Group::Pill => "顶部胶囊",
             Group::Dock => "Dock",
             Group::Start => "开始菜单",
+            Group::Wechat => "微信",
         }
     }
 }
@@ -575,12 +577,18 @@ struct SettingsApp {
     mail_edit: Option<usize>,
     /// 「浏览程序…」添加开始菜单快捷方式时是否以管理员权限
     pin_admin: bool,
+    /// 微信快照操作的反馈信息（保存/恢复/快捷方式/删除的结果）
+    snap_status: String,
 }
 
 #[derive(Default)]
 struct Edits {
     clock: String,
     wechat_ignore: String,
+    wechat_hotkeys: String,
+    wechat_path: String,
+    wechat_data_dir: String,
+    snap_name: String,
     banner_secs: String,
     banner_secs_wechat: String,
     banner_secs_mail: String,
@@ -731,6 +739,9 @@ impl SettingsApp {
     fn load_edits(&mut self) {
         self.edits.clock = settings::clock_format();
         self.edits.wechat_ignore = settings::wechat_ignore_text();
+        self.edits.wechat_hotkeys = settings::wechat_hotkeys_text();
+        self.edits.wechat_path = settings::wechat_path();
+        self.edits.wechat_data_dir = settings::wechat_data_dir();
         self.edits.banner_secs = settings::banner_secs().to_string();
         // 四个来源的输入框也要一起初始化：以前只填了 banner_secs，另外四个空着 →
         // 打开页面看到的是 hint 里的「6」，要等点进输入框失焦一次才读本地值
@@ -756,6 +767,7 @@ impl SettingsApp {
             Group::Pill => self.detail_pill(ui, ver_changed),
             Group::Dock => self.detail_dock(ui),
             Group::Start => self.detail_start(ui),
+            Group::Wechat => self.detail_wechat(ui, ver_changed),
         }
     }
 
@@ -1049,6 +1061,39 @@ impl SettingsApp {
                     .weak(),
             );
         });
+
+        // 微信热键（显示 ↔ 最小化）：英文逗号分隔，按微信启动先后对应
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(row_label("微信热键"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.wechat_hotkeys)
+                    .hint_text("例：F1,F2 或 Ctrl+Alt+1,Ctrl+Alt+2"),
+            );
+            if r.lost_focus() {
+                let list: Vec<String> = self
+                    .edits
+                    .wechat_hotkeys
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                settings::set_wechat_hotkeys(list);
+                self.edits.wechat_hotkeys = settings::wechat_hotkeys_text();
+                crate::tlog!("[settings] 微信热键 → {}", settings::wechat_hotkeys_text());
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.wechat_hotkeys = settings::wechat_hotkeys_text();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "按微信启动先后对应：第 1 个热键 = 先启动的微信。动作只有显示↔最小化，绝不隐藏到托盘；注册成功/失败会弹横幅告知",
+            )
+            .size(11.5)
+            .weak(),
+        );
 
         // 多开状态：每个微信实例是否已拿到 UIA 会话数据（按进程创建时间排序，
         // 先开的在前，与 Dock 托盘里多开图标的顺序一致）
@@ -1485,6 +1530,179 @@ impl SettingsApp {
                 ]);
             }
         });
+    }
+
+    /// 微信：程序路径 / 数据目录 / 登录凭证快照（保存、启动、快捷方式、删除）
+    fn detail_wechat(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+        section(ui, "微信程序");
+        ui.horizontal(|ui| {
+            ui.label(row_label("程序路径"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.wechat_path)
+                    .hint_text("完整路径，需带 Weixin.exe；留空 = 自动探测"),
+            );
+            if r.lost_focus() {
+                settings::set_wechat_path(&self.edits.wechat_path);
+                crate::tlog!("[settings] 微信程序路径 → {:?}", settings::wechat_path());
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.wechat_path = settings::wechat_path();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(row_label("数据目录"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.wechat_data_dir)
+                    .hint_text("提供 xwechat_files 目录即可；留空 = 自动探测"),
+            );
+            if r.lost_focus() {
+                settings::set_wechat_data_dir(&self.edits.wechat_data_dir);
+                crate::tlog!("[settings] 微信数据目录 → {:?}", settings::wechat_data_dir());
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.wechat_data_dir = settings::wechat_data_dir();
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!(
+                "检查：程序路径 {}；数据目录 {}（填好后凭证快照即可用）",
+                match crate::wechatsnap::wechat_exe() {
+                    Some(p) => format!("✓ {}", p.display()),
+                    None => "✗ 未配置或文件不存在".into(),
+                },
+                match crate::wechatsnap::data_root() {
+                    Some(p) => format!("✓ {}", p.display()),
+                    None => "✗ 未配置或目录不对（需含 all_users/config/global_config）".into(),
+                },
+            ))
+            .size(11.5)
+            .weak(),
+        );
+
+        ui.add_space(10.0);
+        ui.add_space(10.0);
+        section(ui, "登录凭证快照");
+        // 当前登录账号（head_imgs/0 下永远只有一个文件，文件名 = 账号数字 ID）
+        let cur = crate::wechatsnap::current_account();
+        ui.horizontal(|ui| {
+            ui.label(row_label("当前登录"));
+            match cur {
+                Some((id, _)) => ui.label(
+                    egui::RichText::new(format!("账号 {id}"))
+                        .size(12.0)
+                        .color(ok_green()),
+                ),
+                None => ui.label(
+                    egui::RichText::new("检测不到（微信未登录或数据目录不对）")
+                        .size(12.0)
+                        .weak(),
+                ),
+            };
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.label(row_label("凭证昵称"));
+            ui.add_sized(
+                [240.0, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.snap_name)
+                    .hint_text("给这个账号的凭证起个名字，例：办执照"),
+            );
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("保存当前凭证").size(12.0))
+                        .min_size(egui::vec2(104.0, 24.0)),
+                )
+                .clicked()
+            {
+                let name = self.edits.snap_name.trim().to_string();
+                if name.is_empty() {
+                    self.snap_status = "先填凭证昵称再保存".into();
+                } else {
+                    self.snap_status = match crate::wechatsnap::save(&name) {
+                        Ok(s) => format!("已保存「{}」（账号 {}）", s.nickname, s.id),
+                        Err(e) => format!("保存失败：{e}"),
+                    };
+                    self.edits.snap_name.clear();
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "保存的是当前登录状态的凭证（global/client_config 四件套 + 头像）。微信登录成功后随时可保存，不必退出",
+            )
+            .size(11.5)
+            .weak(),
+        );
+
+        // 快照列表：昵称（账号 ID）+ 启动 / 创建快捷方式 / 删除
+        let snaps = crate::wechatsnap::list();
+        if !snaps.is_empty() {
+            ui.add_space(6.0);
+            for s in &snaps {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(egui::RichText::new(s.nickname.as_str()).size(12.5));
+                    ui.label(egui::RichText::new(format!("（账号 {}）", s.id)).size(11.0).weak());
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("启动").size(12.0))
+                                .min_size(egui::vec2(64.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        self.snap_status = match crate::wechatsnap::launch(&s.id) {
+                            Ok(()) => format!("已恢复「{}」凭证并启动微信", s.nickname),
+                            Err(e) => format!("启动失败：{e}"),
+                        };
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("创建快捷方式").size(12.0))
+                                .min_size(egui::vec2(104.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        self.snap_status = match crate::wechatsnap::make_shortcut(&s.id) {
+                            Ok(p) => format!("已创建桌面快捷方式：{}", p.display()),
+                            Err(e) => format!("创建快捷方式失败：{e}"),
+                        };
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("删除").size(12.0))
+                                .min_size(egui::vec2(56.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        self.snap_status = match crate::wechatsnap::delete(&s.id) {
+                            Ok(()) => format!("已删除「{}」", s.nickname),
+                            Err(e) => format!("删除失败：{e}"),
+                        };
+                    }
+                });
+            }
+            ui.label(
+                egui::RichText::new(
+                    "「启动」= 恢复该快照凭证（热替换，运行中的微信不受影响）→ 自动打开微信免扫码登录。多开：先开 A 号，再点 B 号快照的「启动」",
+                )
+                .size(11.5)
+                .weak(),
+            );
+        }
+        if !self.snap_status.is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(&self.snap_status).size(12.0).color(ok_green()));
+        }
+        ui.label(
+            egui::RichText::new(
+                "原理：微信把「当前登录账号」存在数据目录 all_users/config/ 的 global/client_config 里；快照备份该组文件，恢复时用改名法绕过运行中微信的文件锁（只挪开不关闭句柄，对微信无感）。桌面快捷方式启动 = 恢复凭证 + 拉起微信，可多号共存",
+            )
+            .size(11.0)
+            .weak(),
+        );
     }
 
     fn detail_pill(&mut self, ui: &mut egui::Ui, ver_changed: bool) {

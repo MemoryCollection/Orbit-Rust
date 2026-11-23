@@ -17,6 +17,7 @@ mod trayhost;
 mod flyout;
 mod clipboard;
 mod hide;
+mod hotkey;
 mod json;
 mod lyric;
 mod mail;
@@ -45,6 +46,7 @@ mod traydetect;
 mod banner;
 mod usb;
 mod wechatmsg;
+mod wechatsnap;
 mod weather;
 mod weathercard;
 mod widgetbar;
@@ -73,6 +75,24 @@ fn main() {
     // 必须在单实例互斥之前分支，否则会被当成"重复启动"直接退出。
     if args.iter().any(|a| a == "--settings-ui") {
         settingsui::run_child();
+        return;
+    }
+    // 微信账号快照启动（桌面快捷方式入口）：恢复快照凭证 → 启动微信 → 退出。
+    // 放在单实例互斥之前：orbit 主程序在不在跑都不影响（每次都独立执行一轮替换+启动）。
+    // settings::init() 必须先调：wechat_path / wechat_data_dir 等自定义键都在 settings.txt 里，
+    // 不加载的话自动探测/自定义路径全部失效（实测 bug：快捷方式启动报"找不到微信配置目录"）。
+    if let Some(pos) = args.iter().position(|a| a == "--wechat-launch") {
+        settings::init();
+        match args.get(pos + 1) {
+            Some(id) => match wechatsnap::launch(id) {
+                Ok(()) => tlog!("[wechat-launch] 快照 {id} 启动完成"),
+                Err(e) => {
+                    tlog!("[wechat-launch] 快照 {id} 启动失败：{e}");
+                    wechatsnap::error_popup(&format!("微信账号启动失败\n\n{e}"));
+                }
+            },
+            None => tlog!("[wechat-launch] 缺少快照 ID 参数"),
+        }
         return;
     }
     // 单实例互斥：已有 orbit 在跑就直接退出（守护子进程 / --restore-taskbar 不受影响）

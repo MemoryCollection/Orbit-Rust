@@ -59,6 +59,8 @@ static KEY_HOOK: AtomicIsize = AtomicIsize::new(0);
 static WIN_DOWN: AtomicU32 = AtomicU32::new(0);
 /// Win 按住期间是否碰过别的键（键盘/鼠标）——碰过就算组合键，松 Win 时放行
 static WIN_COMBO: AtomicBool = AtomicBool::new(false);
+/// 「关闭→最小化」吞掉了按下事件，抬起事件也要一并吞掉
+static SWALLOW_UP: AtomicBool = AtomicBool::new(false);
 
 const VK_LWIN: u32 = 0x5B;
 const VK_RWIN: u32 = 0x5C;
@@ -215,6 +217,22 @@ unsafe extern "system" fn mouse_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
             && matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN)
         {
             WIN_COMBO.store(true, Ordering::Relaxed);
+        }
+        // 微信「关闭」按钮 → 最小化（不让它隐藏到托盘，否则 UIA 树整棵被摘掉）
+        if msg == WM_LBUTTONDOWN {
+            let ms = l.0 as *const MSLLHOOKSTRUCT;
+            if !ms.is_null() && (*ms).flags & 0x1 == 0 {
+                let pt = (*ms).pt;
+                if crate::wechatmsg::hit_close_and_minimize(pt.x, pt.y) {
+                    SWALLOW_UP.store(true, Ordering::Relaxed);
+                    return LRESULT(1);
+                }
+            }
+        }
+        // WM_LBUTTONUP = 0x0202（本文件的 windows 导入里没带这个名字）
+        if msg == 0x0202 && SWALLOW_UP.swap(false, Ordering::Relaxed) {
+            // 按下已被吞掉，抬起也吞掉，免得微信收到一个孤立的抬键
+            return LRESULT(1);
         }
         if OPEN.load(Ordering::Relaxed)
             && matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN)

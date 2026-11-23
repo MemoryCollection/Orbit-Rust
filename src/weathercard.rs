@@ -57,6 +57,50 @@ const BG_CHECK_MS: u32 = 2000;
 const TIMER_VIS: usize = 2;
 /// 自检间隔：按下 Win+D 后最多 500ms 卡片回到桌面层
 const VIS_CHECK_MS: u32 = 500;
+/// 微信状态刷新定时器：热键注册 / UIA 拿取 / 实时监视，最多 3s 跟上变化
+const TIMER_STATUS: usize = 3;
+const STATUS_CHECK_MS: u32 = 3000;
+
+/// 「微信监视」区的一行：实例名（账号名）+ 状态尾巴（热键/UIA/监控）
+#[derive(Clone, PartialEq)]
+struct WeLine {
+    name: String,
+    tail: String,
+    /// 全绿（热键注册成功 + UIA 拿到）→ 绿字；有缺失 → 红字；faint → 灰字
+    ok: bool,
+    faint: bool,
+}
+
+fn wechat_lines() -> Vec<WeLine> {
+    let st = crate::wechatmsg::instance_status();
+    if st.is_empty() {
+        return vec![WeLine {
+            name: "微信".into(),
+            tail: "未运行".into(),
+            ok: false,
+            faint: true,
+        }];
+    }
+    st.iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let name = if s.title.is_empty() { format!("微信{}", i + 1) } else { s.title.clone() };
+            if !s.monitoring {
+                return WeLine { name, tail: "监视已关".into(), ok: false, faint: true };
+            }
+            let hk = if s.hotkey.is_empty() {
+                "热键未设".to_string()
+            } else if s.hotkey_ok {
+                format!("热键{}✓", s.hotkey)
+            } else {
+                format!("热键{}✗", s.hotkey)
+            };
+            let mon = if s.uia { "监控中" } else { "未抓到" };
+            let ok = s.uia && (s.hotkey.is_empty() || s.hotkey_ok);
+            WeLine { name, tail: format!("{hk} · {mon}"), ok, faint: false }
+        })
+        .collect()
+}
 
 #[derive(Clone)]
 struct View {
@@ -88,6 +132,8 @@ struct Card {
     probed: bool,
     /// 已挂进桌面壁纸层（WorkerW / Progman 的子窗口）
     embedded: bool,
+    /// 「微信监视」区当前显示的行（变化才重绘）
+    wechat: Vec<WeLine>,
 }
 
 pub fn init(instance: HINSTANCE) {
@@ -106,6 +152,7 @@ pub fn init(instance: HINSTANCE) {
             dark_bg: false,
             probed: false,
             embedded: false,
+            wechat: Vec::new(),
         }));
         match CreateWindowExW(
             // 注意：没有 WS_EX_TOPMOST —— 卡片只属于桌面层
@@ -125,6 +172,7 @@ pub fn init(instance: HINSTANCE) {
                 TASKBAR_CREATED.store(msg as isize, Ordering::Relaxed);
                 let _ = SetTimer(h, TIMER_BG, BG_CHECK_MS, None);
                 let _ = SetTimer(h, TIMER_VIS, VIS_CHECK_MS, None);
+                let _ = SetTimer(h, TIMER_STATUS, STATUS_CHECK_MS, None);
                 refresh();
             }
             Err(_) => drop(Box::from_raw(p)),
@@ -229,6 +277,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 card.recheck_bg(hwnd);
                 LRESULT(0)
             }
+            WM_TIMER if w.0 == TIMER_STATUS => {
+                card.recheck_wechat(hwnd);
+                LRESULT(0)
+            }
             WM_TIMER if w.0 == TIMER_VIS => {
                 card.recheck_vis(hwnd);
                 LRESULT(0)
@@ -299,6 +351,17 @@ impl Card {
         }
     }
 
+    /// 每 3s 刷新「微信监视」区：热键注册 / UIA 拿取 / 实时监视状态。
+    /// 内容变了才重排重绘（行数变化会撑高/收矮窗口）。
+    fn recheck_wechat(&mut self, h: HWND) {
+        let lines = wechat_lines();
+        if lines == self.wechat {
+            return;
+        }
+        self.wechat = lines;
+        self.apply(h);
+    }
+
     /// 沿卡片四周取屏幕像素估壁纸明暗（正文从 pad 起，边缘一圈只有壁纸）。
     /// 取不到足够有效点时保留上一次结果（被别的窗口挡住时不该乱改颜色）。
     fn probe_bg(&mut self) {
@@ -355,7 +418,7 @@ impl Card {
         let w = (CARD_W * s).round() as i32;
         // 高度按当前内容量出来：详情折行 / 字号放大时窗口自动撑高（不再裁字）
         let hh = match VIEW.lock().ok().and_then(|g| g.clone()) {
-            Some(v) => (card_height(&mut self.view, &v, k) * s).ceil() as i32,
+            Some(v) => (card_height(&mut self.view, &v, k, &self.wechat) * s).ceil() as i32,
             None => (CARD_H * s).round() as i32,
         };
         self.size = (w, hh);
@@ -424,7 +487,8 @@ impl Card {
             return;
         }
         let s = scale(h);
-        let rgba = paint(&mut self.view, w, hh, s, &view, self.dark_bg);
+        let wechat = self.wechat.clone();
+        let rgba = paint(&mut self.view, w, hh, s, &view, self.dark_bg, &wechat);
         let bgra = render::premultiplied_rgba_to_bgra(&rgba);
         render::present(h, &bgra, w, hh);
     }
@@ -589,7 +653,7 @@ fn detail_lines(soft: &SoftBackend, v: &View, max_w: f32, size: f32) -> Vec<Stri
 
 /// 卡片内容总高度（逻辑点，宽度按 CARD_W 量）。与 paint 的纵向布局一一对应，
 /// place() 用它把窗口撑到正好装下内容——详情折行、字号放大都不再裁字。
-fn card_height(soft: &mut SoftBackend, v: &View, k: f32) -> f32 {
+fn card_height(soft: &mut SoftBackend, v: &View, k: f32, wechat: &[WeLine]) -> f32 {
     let pad = 16.0 * k;
     let mut y = 8.0 * k;
     // ① 标题行
@@ -614,6 +678,18 @@ fn card_height(soft: &mut SoftBackend, v: &View, k: f32) -> f32 {
         y += dh;
     }
     if !lines.is_empty() {
+        y += 7.0 * k;
+    }
+    // ⑤ 微信监视区（每个实例一行 + 行间 4k，行后 7k）
+    if !wechat.is_empty() {
+        let wfont = egui::FontId::proportional(10.5 * k);
+        let wh = soft.text_height("微", wfont);
+        for n in 0..wechat.len() {
+            if n > 0 {
+                y += 4.0 * k;
+            }
+            y += wh;
+        }
         y += 7.0 * k;
     }
     // ④ 来源行
@@ -645,7 +721,15 @@ fn lift(c: u32, k: f32) -> u32 {
 }
 
 /// 透明底板：只画内容，不铺 panel_bg（分层窗口逐像素 alpha 决定透明）。
-fn paint(soft: &mut SoftBackend, w: i32, h: i32, scale: f32, v: &View, dark_bg: bool) -> Vec<u8> {
+fn paint(
+    soft: &mut SoftBackend,
+    w: i32,
+    h: i32,
+    scale: f32,
+    v: &View,
+    dark_bg: bool,
+    wechat: &[WeLine],
+) -> Vec<u8> {
     soft.set_scale(scale);
     let fw = w as f32 / scale;
     let fh = h as f32 / scale;
@@ -717,6 +801,32 @@ fn paint(soft: &mut SoftBackend, w: i32, h: i32, scale: f32, v: &View, dark_bg: 
                 }
                 txt(&p, pad, y, line, dfont.clone(), dim, shadow, scale);
                 y += dh;
+            }
+            y += 7.0 * k;
+        }
+
+        // ⑤ 微信监视区：每个实例一行 —— 名称（次）+ 状态尾巴（绿=正常 / 红=有缺失）
+        if !wechat.is_empty() {
+            let w_size = 10.5 * k;
+            let wfont = egui::FontId::proportional(w_size);
+            let wh = soft.text_height("微", wfont.clone());
+            // 状态色跟壁纸明暗走：深壁纸用提亮的绿/红，浅壁纸用压暗的绿/红
+            let (ok_c, bad_c) = if dark_bg {
+                (0xFF_9C_E8_AE, 0xFF_FF_B4_AB)
+            } else {
+                (0xFF_1B_7A_33, 0xFF_B3_26_1E)
+            };
+            for (n, line) in wechat.iter().enumerate() {
+                if n > 0 {
+                    y += 4.0 * k;
+                }
+                let tail_w = soft.text_width(&line.tail, wfont.clone());
+                let max_name = (fw - pad * 2.0 - tail_w - 8.0 * k).max(40.0);
+                let name = ellipsize(soft, &line.name, max_name, w_size);
+                let c = if line.faint { faint } else if line.ok { ok_c } else { bad_c };
+                txt(&p, pad, y, &name, wfont.clone(), c, shadow, scale);
+                txt(&p, fw - pad - tail_w, y, &line.tail, wfont.clone(), c, shadow, scale);
+                y += wh;
             }
             y += 7.0 * k;
         }

@@ -182,6 +182,8 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     let v = settings::version();
                     if file_changed || v != app.seen_settings {
                         app.seen_settings = v;
+                        // 热键可能改了：整组重装（先注销再注册）
+                        crate::hotkey::apply(app.hwnd);
                         dirty = true;
                         if app.panel.is_some() {
                             app.reload_panel();
@@ -284,6 +286,11 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             WM_HOTKEY if w.0 == 2 => {
                 // Ctrl+Alt+,：设置页面（再按一次收起）
                 crate::settingsui::toggle();
+                LRESULT(0)
+            }
+            WM_HOTKEY if w.0 as usize >= crate::hotkey::HOTKEY_BASE => {
+                // 微信实例热键：显示 ↔ 最小化（绝不 hide，见 hotkey.rs 头注释）
+                crate::wechatmsg::toggle(w.0 as usize - crate::hotkey::HOTKEY_BASE);
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
@@ -413,6 +420,8 @@ impl App {
             // RegisterHotKey 拦不住系统开始菜单——它靠松键触发）
             let _ = RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT, 0xBC /* VK_OEM_COMMA */);
         }
+        // 微信实例热键（设置里的 wechat_hotkeys；空 = 不注册）
+        crate::hotkey::apply(hwnd);
     }
 
     /// 计算布局 → egui 软件光栅化（pillui）→ UpdateLayeredWindow → 置顶定位。
