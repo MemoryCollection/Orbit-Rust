@@ -23,7 +23,7 @@ use crate::render::{self, PanelRow, WeatherView};
 /// 面板动作被点击时发给胶囊窗口的消息（wParam = 动作号）
 pub const WM_ROW_CLICK: u32 = 0x8000 + 1;
 
-/// 面板内容：通用列表（剪贴板 / 邮件）或天气宽卡片
+/// 面板内容：通用列表（剪贴板 / 邮件）或天气宽卡片或 USB 设备
 pub enum Content {
     List {
         title: String,
@@ -35,6 +35,7 @@ pub enum Content {
         empty: String,
     },
     Weather(Box<WeatherView>),
+    Usb(Box<crate::render::UsbView>),
 }
 
 impl Content {
@@ -44,6 +45,7 @@ impl Content {
                 render::panel_size(scale, title, subtitle, rows, empty, tabs)
             }
             Content::Weather(v) => render::weather_panel_size(scale, v),
+            Content::Usb(v) => render::usb_panel_size(scale, v),
         }
     }
 }
@@ -207,6 +209,10 @@ impl Panel {
             Content::Weather(v) =>
                 crate::panelview::paint_weather(
                     &mut self.view, w, h, self.scale, v, self.hovered == Some(0),
+                ),
+            Content::Usb(v) =>
+                crate::panelview::paint_usb(
+                    &mut self.view, w, h, self.scale, v, self.hovered,
                 ),
         };
         self.hits = out.hits;

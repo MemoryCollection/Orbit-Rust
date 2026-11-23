@@ -6,8 +6,8 @@
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, SoftBackend};
-use crate::render::{PanelRow, WeatherView, PIN_BASE, TAB_BASE};
+use crate::egui_soft::{argb, widget_icon, KIND_USB, SoftBackend};
+use crate::render::{PanelRow, UsbView, WeatherView, PIN_BASE, TAB_BASE, USB_EJECT_BASE};
 
 pub struct PanelPainted {
     /// 预乘 RGBA（w*h*4）
@@ -344,3 +344,119 @@ pub fn paint_weather(
     let rgba = soft.rasterize(out.shapes, out.pixels_per_point, w, h);
     PanelPainted { rgba, hits: to_px(&hits, scale) }
 }
+
+// ---- USB 面板 ----
+
+/// 布局协议：0..999 = 行（点行 = 资源管理器打开该盘），USB_EJECT_BASE + 行号 = 「弹出」按钮。
+/// 命中区顺序：行先压入、弹出按钮后压入（`action_at` 后压入的优先，按钮压在整行上面）。
+pub fn paint_usb(
+    soft: &mut SoftBackend,
+    w: i32, h: i32, scale: f32,
+    v: &UsbView,
+    hovered: Option<u32>,
+) -> PanelPainted {
+    if w <= 0 || h <= 0 {
+        return PanelPainted { rgba: Vec::new(), hits: Vec::new() };
+    }
+    let scale = scale.max(0.5);
+    soft.set_scale(scale);
+    let fw = w as f32 / scale;
+    let fh = h as f32 / scale;
+
+    let pad = cfg::PANEL_PAD;
+    let head_h = cfg::PANEL_HEAD_H;
+    let row_h = cfg::PANEL_ROW_H;
+    let btn_h = 22.0;
+    let s = &*soft;
+    let mut hits: Vec<([f32; 4], u32)> = Vec::new();
+
+    // 按钮尺寸（两处绘制一致，宽度从文本量出来）
+    let open_w = tw(s, "打开", USB_BTN_SIZE) + 16.0;
+    let ej_w = tw(s, "弹出", USB_BTN_SIZE) + 16.0;
+
+    let ctx = s.ctx().clone();
+    let input = s.input(fw, fh);
+    let mut out = ctx.run_ui(
+        input,
+        |ui| {
+            let p = ui.painter().clone();
+            p.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh)),
+                egui::CornerRadius::same(cfg::cur().panel_radius as u8),
+                argb(cfg::bg_alpha(cfg::cur().panel_bg)),
+            );
+
+            // 标题 + 副标题（与列表面板同一套节奏）
+            let title_y = head_h / 2.0 - th(s, &v.title, cfg::PANEL_TITLE_SIZE) + 2.0;
+            txt(&p, pad, title_y, &v.title, cfg::PANEL_TITLE_SIZE, cfg::cur().text);
+            if !v.subtitle.is_empty() {
+                let sh = th(s, &v.subtitle, cfg::PANEL_SUB_SIZE);
+                txt(&p, pad, head_h - sh - 4.0, &v.subtitle, cfg::PANEL_SUB_SIZE, cfg::cur().text_dim);
+            }
+
+            for (i, row) in v.rows.iter().enumerate() {
+                let y = head_h + i as f32 * row_h;
+                let id = i as u32;
+                hits.push(([pad * 0.5, y, fw - pad, row_h], id));
+                if hovered == Some(id) {
+                    p.rect_filled(
+                        egui::Rect::from_min_size(egui::pos2(pad * 0.5, y + 1.0),
+                            egui::vec2(fw - pad, row_h - 2.0)),
+                        egui::CornerRadius::same(8), argb(cfg::cur().hover));
+                }
+
+                // 矢量 U 盘图标
+                let icx = pad + cfg::WIDGET_ICON_SIZE * 0.5 + 1.0;
+                widget_icon(&p, egui::pos2(icx, y + row_h / 2.0),
+                    cfg::WIDGET_ICON_SIZE, KIND_USB, argb(cfg::cur().icon_dim));
+                let x = pad + cfg::WIDGET_ICON_SIZE + cfg::PANEL_ICON_GAP;
+
+                // 右侧按钮区（弹出贴右缘，打开在其左）
+                let ej_x = fw - pad - ej_w;
+                let open_x = ej_x - 6.0 - open_w;
+                let by = y + (row_h - btn_h) / 2.0;
+                let room = (open_x - x - 8.0).max(24.0);
+
+                let tt = ellipsize(s, &row.title, room, cfg::PANEL_ROW_TITLE);
+                txt(&p, x, y + 8.0, &tt, cfg::PANEL_ROW_TITLE, cfg::cur().text_body);
+                let ss = ellipsize(s, &row.sub, room, cfg::PANEL_ROW_SUB);
+                txt(&p, x, y + 26.0, &ss, cfg::PANEL_ROW_SUB, cfg::cur().text_dim);
+
+                // 「打开」按钮：描边 + 常规色
+                let open_rect = egui::Rect::from_min_size(egui::pos2(open_x, by), egui::vec2(open_w, btn_h));
+                let open_hot = hovered == Some(id) || hovered == Some(USB_EJECT_BASE + id);
+                if open_hot {
+                    p.rect_filled(open_rect, egui::CornerRadius::same(7), argb(cfg::cur().hover));
+                }
+                p.rect_stroke(open_rect, egui::CornerRadius::same(7),
+                    egui::Stroke::new(1.0, argb(cfg::cur().icon_dim)), egui::StrokeKind::Inside);
+                let ow = tw(s, "打开", USB_BTN_SIZE);
+                let oh = th(s, "打开", USB_BTN_SIZE);
+                txt(&p, open_x + (open_w - ow) / 2.0, by + (btn_h - oh) / 2.0,
+                    "打开", USB_BTN_SIZE, cfg::cur().text_dim);
+
+                // 「弹出」按钮：强调色（安全移除是主操作）
+                let ej_rect = egui::Rect::from_min_size(egui::pos2(ej_x, by), egui::vec2(ej_w, btn_h));
+                let ej_hot = hovered == Some(USB_EJECT_BASE + id);
+                if ej_hot {
+                    p.rect_filled(ej_rect, egui::CornerRadius::same(7), argb(cfg::cur().hover));
+                }
+                p.rect_stroke(ej_rect, egui::CornerRadius::same(7),
+                    egui::Stroke::new(1.0, argb(cfg::cur().accent)), egui::StrokeKind::Inside);
+                let ew = tw(s, "弹出", USB_BTN_SIZE);
+                let eh = th(s, "弹出", USB_BTN_SIZE);
+                txt(&p, ej_x + (ej_w - ew) / 2.0, by + (btn_h - eh) / 2.0,
+                    "弹出", USB_BTN_SIZE, cfg::cur().accent);
+
+                // 弹出按钮的命中区压在整行上面（后压入优先）
+                hits.push(([ej_x, by, ej_w, btn_h], USB_EJECT_BASE + id));
+            }
+        },
+    );
+    soft.update_textures(&mut out.textures_delta);
+    let rgba = soft.rasterize(out.shapes, out.pixels_per_point, w, h);
+    PanelPainted { rgba, hits: to_px(&hits, scale) }
+}
+
+/// 按钮字号（usb_panel_size 与 paint_usb 共用的数值）
+const USB_BTN_SIZE: f32 = 12.5;

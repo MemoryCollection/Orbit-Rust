@@ -539,6 +539,7 @@ pub fn glow_edges(p: &egui::Painter, rect: egui::Rect, cr: egui::CornerRadius, c
 /// 线条粗细统一、光学居中、颜色跟随主题，放大缩小都清晰。
 pub const KIND_MAIL: u8 = 1;
 pub const KIND_CLIP: u8 = 2;
+pub const KIND_USB: u8 = 3;
 
 /// 在 `center` 处画一个边长为 `cell` 的模块图标（`kind` 见 `KIND_*`）
 pub fn widget_icon(p: &egui::Painter, center: egui::Pos2, cell: f32, kind: u8, color: egui::Color32) {
@@ -580,6 +581,31 @@ pub fn widget_icon(p: &egui::Painter, center: egui::Pos2, cell: f32, kind: u8, c
                     [egui::pos2(r.left() + pad, y), egui::pos2(r.right() - w * 0.16, y)],
                     stroke,
                 );
+            }
+        }
+        KIND_USB => {
+            // U 盘：上方金属接头（带两条触点线）+ 下方圆角壳体，竖放居中
+            let bw = cell * 0.46; // 机身宽
+            let bh = cell * 0.60; // 壳体高
+            let ch = cell * 0.26; // 接头高
+            let top = center.y - (bh + ch) / 2.0;
+            let body = egui::Rect::from_min_size(
+                egui::pos2(center.x - bw / 2.0, top + ch),
+                egui::vec2(bw, bh),
+            );
+            p.rect_stroke(body, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            let conn_w = bw * 0.86;
+            let conn = egui::Rect::from_min_size(
+                egui::pos2(center.x - conn_w / 2.0, top),
+                egui::vec2(conn_w, ch),
+            );
+            p.rect_stroke(conn, egui::CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+            // 触点：两条竖短线
+            let y0 = conn.top() + ch * 0.28;
+            let y1 = conn.top() + ch * 0.72;
+            for k in [-0.20, 0.20] {
+                let x = center.x + bw * k;
+                p.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], stroke);
             }
         }
         _ => {}

@@ -72,6 +72,10 @@ pub struct App {
     lyrics: Lyrics,
     clipboard: Clipboard,
     mail: Mail,
+    /// 当前插着的可移动磁盘（500ms 轮询，见 `usb::refresh`）
+    usb: Vec<crate::usb::UsbVol>,
+    /// 最近一次弹出的结果提示（显示在 USB 面板副标题里，盘列表变化时清掉）
+    usb_status: String,
     /// 当前展开的面板（None = 无）
     panel: Option<WidgetKind>,
     /// 面板当前标签页（0 = 未读，1 = 全部；只有邮件用）
@@ -97,6 +101,7 @@ enum WidgetKind {
     Weather,
     Clipboard,
     Mail,
+    Usb,
 }
 
 impl WidgetKind {
@@ -106,6 +111,7 @@ impl WidgetKind {
             WidgetKind::Weather => 1,
             WidgetKind::Clipboard => 2,
             WidgetKind::Mail => 3,
+            WidgetKind::Usb => 4,
         }
     }
 
@@ -114,6 +120,7 @@ impl WidgetKind {
             1 => Some(WidgetKind::Weather),
             2 => Some(WidgetKind::Clipboard),
             3 => Some(WidgetKind::Mail),
+            4 => Some(WidgetKind::Usb),
             _ => None,
         }
     }
@@ -152,7 +159,12 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     let music_changed = app.music.tick();
                     let clip_changed = app.clipboard.tick();
                     let mail_changed = app.mail.tick();
-                    if weather_changed || music_changed || clip_changed || mail_changed {
+                    let usb_changed = crate::usb::refresh(&mut app.usb);
+                    if usb_changed && !app.usb_status.starts_with("已安全弹出") {
+                        // 盘列表变了，上一条失败提示就没意义了（成功提示保留给用户看）
+                        app.usb_status.clear();
+                    }
+                    if weather_changed || music_changed || clip_changed || mail_changed || usb_changed {
                         dirty = true;
                     }
                     // 天气快照更新：推给右上角透明卡片（天气已从胶囊移出）
@@ -187,7 +199,10 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             | (Some(WidgetKind::Clipboard), _, true, _)
                             | (Some(WidgetKind::Mail), _, _, true)
                     );
-                    if stale {
+                    if app.panel == Some(WidgetKind::Usb) && app.usb.is_empty() {
+                        // 最后一个 U 盘没了：面板直接收起
+                        app.close_panel();
+                    } else if stale || (app.panel == Some(WidgetKind::Usb) && usb_changed) {
                         app.reload_panel();
                     }
                     app.tick_panel();
@@ -363,6 +378,8 @@ impl App {
             lyrics: Lyrics::default(),
             clipboard: Clipboard::spawn(),
             mail: Mail::default(),
+            usb: Vec::new(),
+            usb_status: String::new(),
             panel: None,
             panel_tab: 0,
             panel_outside: 0,
@@ -496,6 +513,8 @@ impl App {
             WidgetKind::Weather => (settings::module_mode("weather"), "weather"),
             WidgetKind::Mail => (settings::module_mode("mail"), "mail"),
             WidgetKind::Clipboard => (settings::module_mode("clipboard"), "clipboard"),
+            // USB 模块没进设置页：走 module_mode 的默认分支（留在胶囊里）
+            WidgetKind::Usb => (settings::module_mode("usb"), "usb"),
         }
     }
 
@@ -535,6 +554,22 @@ impl App {
                 },
             ));
         }
+        // USB 模块按需出现：插着可移动磁盘（U 盘 / 读卡器）才占位
+        if cfg::SHOW_USB && !self.usb.is_empty() {
+            let text = match self.usb.len() {
+                1 => self.usb[0].letter.clone(),
+                n => format!("{n} 个"),
+            };
+            all.push((
+                WidgetKind::Usb,
+                WidgetItem {
+                    icon: "usb".to_string(),
+                    icon_argb: cfg::cur().icon_dim,
+                    text,
+                    icon_kind: crate::egui_soft::KIND_USB,
+                },
+            ));
+        }
 
         let order = settings::module_order();
         let rank = |kind: WidgetKind| -> usize {
@@ -542,6 +577,7 @@ impl App {
                 WidgetKind::Weather => "weather",
                 WidgetKind::Mail => "mail",
                 WidgetKind::Clipboard => "clipboard",
+                WidgetKind::Usb => "usb",
             };
             order.iter().position(|n| n == name).unwrap_or(usize::MAX)
         };
@@ -629,6 +665,11 @@ impl App {
                     self.render();
                     return;
                 }
+                self.toggle_panel(kind);
+            }
+            WidgetKind::Usb => {
+                // 重开面板时清掉上一条弹出结果，副标题回到常规提示
+                self.usb_status.clear();
                 self.toggle_panel(kind);
             }
             WidgetKind::Weather | WidgetKind::Clipboard => self.toggle_panel(kind),
@@ -882,6 +923,39 @@ impl App {
                     self.close_panel();
                 }
             }
+            Some(WidgetKind::Usb) => {
+                if id >= render::USB_EJECT_BASE {
+                    // 「弹出」按钮：安全移除，结果写进面板副标题
+                    let idx = (id - render::USB_EJECT_BASE) as usize;
+                    if let Some(v) = self.usb.get(idx) {
+                        let letter = v.letter.clone();
+                        crate::tlog!("[usb] 请求弹出 {letter}");
+                        match crate::usb::eject(&letter) {
+                            Ok(()) => {
+                                self.usb_status = format!("已安全弹出 {letter}，可以拔下");
+                                crate::tlog!("[usb] {letter} 弹出成功");
+                            }
+                            Err(e) => {
+                                self.usb_status = format!("{letter} 弹出失败：{e}");
+                                crate::tlog!("[usb] {letter} 弹出被否决：{e}");
+                            }
+                        }
+                        // 弹出后立刻重扫（盘符消失要等系统撤下，先按现状刷）
+                        let _ = crate::usb::refresh(&mut self.usb);
+                    }
+                    self.render();
+                    if self.usb.is_empty() {
+                        self.close_panel();
+                    } else {
+                        self.reload_panel();
+                    }
+                } else if let Some(v) = self.usb.get(id as usize) {
+                    // 点行 = 资源管理器打开该盘，顺手收起面板
+                    let letter = v.letter.clone();
+                    crate::usb::open(&letter);
+                    self.close_panel();
+                }
+            }
             _ => {}
         }
     }
@@ -1034,6 +1108,28 @@ impl App {
                     rows,
                     empty: if tab == 0 { "没有未读邮件".into() } else { "没有邮件".into() },
                 }
+            }
+            WidgetKind::Usb => {
+                let mut usb_rows: Vec<render::UsbRow> = Vec::new();
+                for v in &self.usb {
+                    let title = if v.label.is_empty() {
+                        format!("{} 可移动磁盘", v.letter)
+                    } else {
+                        format!("{} {}", v.letter, v.label)
+                    };
+                    usb_rows.push(render::UsbRow { title, sub: v.cap.clone() });
+                }
+                // 副标题：优先显示刚发生的弹出结果，否则常规提示
+                let subtitle = if self.usb_status.is_empty() {
+                    format!("{} 个设备 · 点行打开 · 「弹出」安全移除", self.usb.len())
+                } else {
+                    self.usb_status.clone()
+                };
+                Content::Usb(Box::new(render::UsbView {
+                    title: "USB 设备".into(),
+                    subtitle,
+                    rows: usb_rows,
+                }))
             }
         }
     }

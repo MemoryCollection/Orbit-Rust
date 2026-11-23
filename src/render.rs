@@ -421,6 +421,61 @@ pub fn weather_panel_size(scale: f32, v: &WeatherView) -> (i32, i32) {
     )
 }
 
+// ---------- USB 面板 ----------
+
+/// USB 面板里的一行（一个可移动卷）
+pub struct UsbRow {
+    /// "E: 卷标名"，没卷标就是 "E: 可移动磁盘"
+    pub title: String,
+    /// 容量行
+    pub sub: String,
+}
+
+pub struct UsbView {
+    pub title: String,
+    pub subtitle: String,
+    pub rows: Vec<UsbRow>,
+}
+
+/// 「弹出」按钮的动作号基数（与固定按钮同槽：后压入的命中区优先）
+pub const USB_EJECT_BASE: u32 = PIN_BASE;
+/// 行内按钮字号
+const USB_BTN_SIZE: f32 = 12.5;
+/// 行内按钮（打开/弹出）的总宽：两个文字按钮 + 6 间距
+fn usb_buttons_w(scale: f32) -> f32 {
+    (measure_text(&to_u16("打开"), USB_BTN_SIZE, FontKind::Cjk, scale).0 + 16.0 * scale)
+        + 6.0 * scale
+        + (measure_text(&to_u16("弹出"), USB_BTN_SIZE, FontKind::Cjk, scale).0 + 16.0 * scale)
+}
+
+/// 单行的内容宽（图标 + 文本 + 按钮区）
+fn usb_row_inner_width(row: &UsbRow, scale: f32) -> f32 {
+    let icon = cfg::WIDGET_ICON_SIZE * scale + cfg::PANEL_ICON_GAP * scale;
+    let t = measure_text(&to_u16(&row.title), cfg::PANEL_ROW_TITLE, FontKind::Cjk, scale).0;
+    let s = measure_text(&to_u16(&row.sub), cfg::PANEL_ROW_SUB, FontKind::Cjk, scale).0;
+    icon + t.max(s) + usb_buttons_w(scale)
+}
+
+/// USB 面板尺寸（与 panelview::paint_usb 的布局严格一致）
+pub fn usb_panel_size(scale: f32, v: &UsbView) -> (i32, i32) {
+    let pad = cfg::PANEL_PAD * scale;
+    let head = measure_text(&to_u16(&v.title), cfg::PANEL_TITLE_SIZE, FontKind::Cjk, scale).0
+        .max(measure_text(&to_u16(&v.subtitle), cfg::PANEL_SUB_SIZE, FontKind::Cjk, scale).0)
+        + 16.0 * scale;
+    let mut inner = head;
+    for r in &v.rows {
+        inner = inner.max(usb_row_inner_width(r, scale));
+    }
+    let body_h = if v.rows.is_empty() {
+        cfg::PANEL_ROW_H
+    } else {
+        v.rows.len() as f32 * cfg::PANEL_ROW_H
+    };
+    let w = (inner + pad * 2.0).clamp(cfg::PANEL_MIN_W * scale, cfg::PANEL_MAX_W * scale);
+    let h = cfg::PANEL_HEAD_H * scale + body_h * scale + pad;
+    (w.ceil() as i32, h.ceil() as i32)
+}
+
 // ---------- 图标捕获 ----------
 
 /// 窗口图标兜底链：WM_GETICON(SMALL/BIG) → 类图标 SM/BIG

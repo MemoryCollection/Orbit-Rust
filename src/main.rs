@@ -43,6 +43,7 @@ mod trace;
 mod tray;
 mod traydetect;
 mod banner;
+mod usb;
 mod wechatmsg;
 mod weather;
 mod weathercard;

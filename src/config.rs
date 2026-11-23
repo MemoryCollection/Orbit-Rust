@@ -58,6 +58,8 @@ pub const SHOW_TRAY: bool = true;
 pub const SHOW_MUSIC: bool = true;
 /// 剪贴板 widget 开关
 pub const SHOW_CLIPBOARD: bool = true;
+/// USB widget 开关：插着可移动磁盘（U 盘 / 读卡器）时才出现在胶囊上
+pub const SHOW_USB: bool = true;
 /// 分离出来的模块条与胶囊之间的间距（多条之间也用这个间距）
 pub const WIDGET_BAR_GAP: i32 = 6;
 /// 每侧最多分几条（= `slot` 取值上限，也决定 widgetbar 预建的窗口数）
