@@ -1000,13 +1000,14 @@ impl SettingsApp {
             let r = ui.add_sized(
                 [CTRL_W, 24.0],
                 egui::TextEdit::singleline(&mut self.edits.wechat_ignore)
-                    .hint_text("可添加多个：标题之间用分号 ; 分隔"),
+                    .hint_text("可添加多个：标题之间用英文逗号 , 分隔"),
             );
             if r.lost_focus() {
+                // 英文逗号分隔
                 let list: Vec<String> = self
                     .edits
                     .wechat_ignore
-                    .split(';')
+                    .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
@@ -1020,7 +1021,7 @@ impl SettingsApp {
         });
         ui.label(
             egui::RichText::new(
-                "可添加多个标题（分号分隔，完全匹配才跳过）；被跳过的标题会写进 orbit.log",
+                "可添加多个标题（英文逗号分隔，完全匹配才跳过）；被跳过的标题会写进 orbit.log",
             )
             .size(11.5)
             .weak(),

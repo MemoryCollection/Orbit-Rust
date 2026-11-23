@@ -43,7 +43,7 @@
 //! - `wechat_sound`       微信托盘图标闪烁（新消息）时播放内置提示音（0 = 关，默认开）
 //! - `wechat_cards`       微信消息卡片（UIA 读会话名+摘要）：`0` = 关（默认，托盘闪烁
 //!                          直接弹通用横幅）；`1` = 开，读取线程随开关启停
-//! - `wechat_ignore`      卡片白名单：标题命中就不弹（分号分隔，默认「折叠的聊天」）
+//! - `wechat_ignore`      卡片白名单：标题命中就不弹（英文逗号分隔，默认「折叠的聊天」）
 //! - `font`               界面字体：`misans`（默认，随包分发 MiSans Semibold）/ `system`（微软雅黑等系统字体）
 //! - `show_desktop_btn`   Dock"返回桌面"细长条（0 = 不显示；设置页在「托盘图标」
 //!                          列表的"返回桌面"格里开关）
@@ -1101,14 +1101,14 @@ pub fn wechat_cards() -> bool {
     }
 }
 
-/// 微信卡片白名单（标题精确匹配，分号分隔展示/存储）
+/// 微信卡片白名单（标题精确匹配，英文逗号分隔展示/存储）
 pub fn wechat_ignore() -> Vec<String> {
     WECHAT_IGNORE.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
 /// 设置页输入框用的文本
 pub fn wechat_ignore_text() -> String {
-    wechat_ignore().join(";")
+    wechat_ignore().join(",")
 }
 
 /// 这个会话标题是否在白名单里（不弹卡片）
@@ -1886,7 +1886,7 @@ fn save() {
         ("show_desktop_btn", on_off(show_desktop_btn()).to_string()),
         ("wechat_sound", on_off(wechat_sound()).to_string()),
         ("wechat_cards", on_off(wechat_cards()).to_string()),
-        ("wechat_ignore", wechat_ignore().join(";")),
+        ("wechat_ignore", wechat_ignore().join(",")),
         ("banner_secs", banner_secs().to_string()),
         ("font", if use_misans() { "misans" } else { "system" }.to_string()),
         ("hide_tray", hidden_tray().join(";")),
@@ -2358,7 +2358,7 @@ fn append_missing() {
         ("tray_order", "# 托盘图标自定义排序（稳定键列表，分号分隔，设置页 ▲▼ 排序写回；清空 = 默认顺序）\ntray_order=\n"),
         ("wechat_sound", "# 微信托盘图标开始闪烁（新消息）时播放内置提示音（1 = 开，默认；0 = 关）\nwechat_sound=1\n"),
         ("wechat_cards", "# 微信消息卡片（UIA 读会话名+摘要，1 = 开；0 = 关，默认）\nwechat_cards=0\n"),
-        ("wechat_ignore", "# 微信卡片白名单：标题命中就不弹卡片（分号分隔；默认「折叠的聊天」）\nwechat_ignore=折叠的聊天\n"),
+        ("wechat_ignore", "# 微信卡片白名单：标题命中就不弹卡片（英文逗号分隔；默认「折叠的聊天」）\nwechat_ignore=折叠的聊天\n"),
         ("banner_secs", "# 右下角横幅每条停留秒数（0 = 不自动关闭，默认 6）\nbanner_secs=6\n"),
         ("lyric_lead", "# 歌词提前量（秒，默认 1；0 = 不提前；负值 = 延后；设置页按 0.1 秒调）\nlyric_lead=1\n"),
         ("font", "# 界面字体：misans = MiSans（随包分发，默认）；system = 系统字体\nfont=misans\n"),
@@ -2636,8 +2636,9 @@ fn load() {
                 }
             }
             "wechat_ignore" => {
+                // 英文逗号分隔
                 wignore = Some(
-                    v.split(';')
+                    v.split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect(),
