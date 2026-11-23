@@ -175,6 +175,10 @@ static SYS_PANEL: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 有些程序注册的托盘 hIcon 只有 16px，放大到 Dock 尺寸必然糊，用户可以指定一个
 /// 图标清晰的 exe 顶替它。
 static ICON_OVER: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// 托盘图标自定义排序（`tray::TrayItem::key` 列表，设置页 ▲▼ 排序写回）。
+/// 空 = 用户没自定义，托盘按默认规则（首次出现顺序）排；非空时表里的键按
+/// 自定义顺序排，没进表的（新图标）按默认规则跟在后面。
+static TRAY_ORDER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 // ---------- 通知 / 横幅 / 提示音（按来源独立配置）----------
 /// 通知通道：0 = 关，1 = Orbit 横幅，2 = Windows 系统通知。见 `NotifyChannel`
@@ -1239,6 +1243,39 @@ pub fn clear_hidden_tray() {
     }
 }
 
+// ---------- 托盘图标排序 ----------
+
+/// 用户自定义的托盘图标顺序（`tray::TrayItem::key` 列表）。空 = 没自定义
+pub fn tray_order() -> Vec<String> {
+    TRAY_ORDER.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+/// 写回自定义顺序（设置页 ▲▼ 排序；传空 = 恢复默认排序）。
+/// 键去重去空，顺序即 Dock 上托盘图标的显示顺序。
+pub fn set_tray_order(order: Vec<String>) {
+    let mut list: Vec<String> = Vec::new();
+    for k in order {
+        let k = k.trim().to_string();
+        if !k.is_empty() && !list.iter().any(|o| *o == k) {
+            list.push(k);
+        }
+    }
+    let changed = TRAY_ORDER
+        .lock()
+        .map(|mut v| {
+            let same = *v == list;
+            if !same {
+                *v = list;
+            }
+            !same
+        })
+        .unwrap_or(false);
+    if changed {
+        save();
+        bump();
+    }
+}
+
 // ---------- 图标指定 ----------
 
 /// 图标指定表：`(键, 取图标的 exe/.lnk)`
@@ -1853,6 +1890,7 @@ fn save() {
         ("banner_secs", banner_secs().to_string()),
         ("font", if use_misans() { "misans" } else { "system" }.to_string()),
         ("hide_tray", hidden_tray().join(";")),
+        ("tray_order", tray_order().join(";")),
     ];
     // 固定列表按需写：用户还没改过（None）就不落键，免得把系统任务栏钉选"写空"
     if let Some(pins) = dock_pins() {
@@ -2209,6 +2247,8 @@ wechat_ignore=折叠的聊天
 font=misans
 # Dock 上要单独隐藏的托盘图标（分号分隔，键由设置页生成；清空 = 全部显示）
 hide_tray=
+# 托盘图标自定义排序（稳定键列表，分号分隔，设置页 ▲▼ 排序写回；清空 = 默认顺序）
+tray_order=
 # 开始菜单（Win 键弹出）快捷方式：`名称|程序路径`，分号分隔；删掉本行恢复默认「命令提示符(管理员)」
 # 路径前缀 @admin: 表示以管理员权限启动（ShellExecute runas）
 start_pins=命令提示符(管理员)|@admin:C:\\Windows\\System32\\cmd.exe
@@ -2315,6 +2355,7 @@ fn append_missing() {
             "# 底部 Dock：显示托盘图标 / 右端“返回桌面”细长条（1 = 显示，0 = 隐藏）\nshow_tray=1\nshow_desktop_btn=1\n",
         ),
         ("hide_tray", "# Dock 上要单独隐藏的托盘图标（分号分隔，键由设置页生成；清空 = 全部显示）\nhide_tray=\n"),
+        ("tray_order", "# 托盘图标自定义排序（稳定键列表，分号分隔，设置页 ▲▼ 排序写回；清空 = 默认顺序）\ntray_order=\n"),
         ("wechat_sound", "# 微信托盘图标开始闪烁（新消息）时播放内置提示音（1 = 开，默认；0 = 关）\nwechat_sound=1\n"),
         ("wechat_cards", "# 微信消息卡片（UIA 读会话名+摘要，1 = 开；0 = 关，默认）\nwechat_cards=0\n"),
         ("wechat_ignore", "# 微信卡片白名单：标题命中就不弹卡片（分号分隔；默认「折叠的聊天」）\nwechat_ignore=折叠的聊天\n"),
@@ -2390,6 +2431,7 @@ fn load() {
     let mut wignore: Option<Vec<String>> = None;
     let mut bsecs: Option<u32> = None;
     let mut hide_tray: Vec<String> = Vec::new();
+    let mut torder: Vec<String> = Vec::new();
     let mut dpins: Option<Vec<String>> = None;
     let mut iover: Vec<(String, String)> = Vec::new();
     let mut spins: Option<Vec<(String, String)>> = None;
@@ -2529,6 +2571,7 @@ fn load() {
             "imap_user" => iuser = Some(v.to_string()),
             "imap_pass" => ipass = Some(v.to_string()),
             "hide_tray" => hide_tray = parse_hide(v),
+            "tray_order" => torder = parse_hide(v),
             "dock_pins" => dpins = Some(parse_list(v)),
             "icon_over" => iover = parse_pairs(v),
             "start_pins" => spins = Some(parse_pairs(v)),
@@ -2766,6 +2809,9 @@ fn load() {
     }
     if let Ok(mut v) = HIDE_TRAY.lock() {
         *v = hide_tray;
+    }
+    if let Ok(mut v) = TRAY_ORDER.lock() {
+        *v = torder;
     }
     if let Some(p) = dpins {
         if let Ok(mut v) = DOCK_PINS.lock() {

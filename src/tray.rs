@@ -433,6 +433,23 @@ impl TrayMirror {
         self.items
             .sort_by_key(|it| order.iter().position(|k| *k == it.key()).unwrap_or(usize::MAX));
         self.order = order;
+        // 用户自定义排序（设置页 ▲▼ 写回 `tray_order`）优先：表里的键按自定义
+        // 顺序排，没进表的（新图标）保持上面的默认顺序跟在后面。没自定义时
+        // 上面那次默认排序就是最终结果，行为不变。
+        let custom = crate::settings::tray_order();
+        if !custom.is_empty() {
+            self.items
+                .sort_by_key(|it| custom.iter().position(|k| *k == it.key()).unwrap_or(usize::MAX));
+        }
+    }
+
+    /// 设置页改了自定义排序后立即重排（不等托盘表下一次变化）；返回顺序是否变了。
+    /// 托管模式下调用方要按返回值决定要不要重建 host_targets（与 items 一一对应）。
+    pub fn resort(&mut self) -> bool {
+        let before: Vec<String> = self.items.iter().map(|it| it.key()).collect();
+        self.stabilize();
+        let after: Vec<String> = self.items.iter().map(|it| it.key()).collect();
+        before != after
     }
 
     /// 快速采样：抓一次任务栏，看每个托盘图标此刻是"亮"还是"灭"。

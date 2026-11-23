@@ -74,8 +74,8 @@ pub fn grab_status() -> Vec<(u32, bool)> {
 }
 
 /// 该 pid 的 UIA 数据当前是否可用（这轮读到过行，或有存活的 held 缓存）。
-/// Dock 托盘闪烁兜底用：卡片开着但这个实例拿不到数据时，闪烁退回提示音，
-/// 否则该实例的新消息会完全无声（卡片永远不来）。
+/// Dock 托盘闪烁兜底用：卡片开着但这个实例拿不到数据时，弹「有新消息」兜底横幅
+/// （横幅自己按 sound_mode 响提示音），否则该实例的新消息会完全没有提示。
 pub fn pid_readable(pid: u32) -> bool {
     GRABBED
         .lock()
@@ -384,7 +384,14 @@ fn update_unread(
                 "[wechatmsg] 新消息 | 标题={} | 内容={} | 未读={} | pid_key={}",
                 r.chat, r.summary, r.unread, key
             );
-            crate::banner::show(BannerNotice::wechat(&r.chat, &r.summary, r.unread, r.pid));
+            let mut notice = BannerNotice::wechat(&r.chat, &r.summary, r.unread, r.pid);
+            // 常驻卡片（横幅秒数=0）挂到托盘闪烁上：图标不闪了（消息已读）
+            // 随 flash_tick 收起。多开按 pid 各挂各的图标；拿不到闪烁信息
+            // （托盘隐藏 / 刚启动还没见过闪烁）保持原行为，不挂
+            if let Some(k) = crate::banner::flashing_key_for_pid(r.pid) {
+                notice.flash_key = Some(k);
+            }
+            crate::banner::show(notice);
         }
         if baseline {
             unread.insert(key.clone(), r.unread);

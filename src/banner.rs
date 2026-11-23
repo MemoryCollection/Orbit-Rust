@@ -102,7 +102,8 @@ impl BannerNotice {
         self
     }
 
-    /// 微信新消息卡片。响不响由 `wechat_sound` 设置决定（和托盘闪烁音二选一）。
+    /// 微信新消息卡片（接管后的正式卡片与托盘闪烁兜底卡共用）。
+    /// 响不响由 `wechat_sound` 设置决定（silent 位），响几遍按 `sound_mode`。
     /// UIA 抓到的信息尽量都上横幅：
     /// - `main`：会话名
     /// - `sub`：摘要（非空才填；空则兜底 "新消息"）
@@ -155,15 +156,26 @@ static FLASH_SEEN: LazyLock<Mutex<HashMap<String, Instant>>> =
 /// 兜底卡片已发过的那次闪烁（key → 时刻），同一闪不重复弹卡
 static FLASH_CARD_SEEN: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 闪烁轮次去重（key → 本轮最近一次闪烁时刻）。同一轮连续闪烁（微信亮→灭
+/// 周期约 500ms，相邻两闪间隔 <1s）只弹一张横幅、响一声——横幅按
+/// 「横幅显示时长」到期收起后图标还在闪也不重弹不重响（否则闪烁不停
+/// 声音就不停）；停闪 ≥ FLASH_BURST_GAP_MS 后再闪才算新一轮。
+static FLASH_BURST_AT: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 判定"新一轮闪烁"的最小间隔：距上次闪烁 ≥ 1 秒才再弹再响
+const FLASH_BURST_GAP_MS: u128 = 1_000;
 /// 闪烁触发的横幅：正在展示的（flash key → 这张横幅）。同一实例闪烁期间
 /// 只有这一张；图标停止闪烁（或消失）时整条收起（见 `flash_tick`）。
 static LIVE_FLASH_CARDS: LazyLock<Mutex<HashMap<String, ()>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// 各微信图标最近一次「还在闪」的上报时刻（Dock 每轮 publish_flash 调 `flash_seen`）
+/// 各微信图标最后一次「亮→灭」的时刻（Dock 每轮 publish_flash 调 `flash_seen`
+/// 上报，存的是**灭帧时刻**而非上报时刻——Dock 在图标停闪后还会按自己的
+/// 宽限窗口再报一会儿（同一个旧时刻），按上报时刻计会多等好几秒）
 static FLASH_ALIVE: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// 超过这个时长没有新的闪烁上报 → 视为「不闪了」，对应横幅收起
-const FLASH_STOP_MS: u128 = 4_000;
+/// 距最后一次「亮→灭」超过这个时长 → 视为「不闪了」，对应横幅收起。
+/// 微信亮→灭周期约 500ms，1.5s ≈ 3 个周期没动静才算停，停闪后横幅即收。
+const FLASH_STOP_MS: u128 = 1_500;
 
 struct Card {
     notice: BannerNotice,
@@ -333,14 +345,34 @@ pub fn on_flash(key: &str, at: Instant) {
 /// 兜底卡片：托盘闪了一下但拿不到这个实例的 UIA 数据（微信 4.x 多开只有
 /// 第一个实例能被读到会话列表），或者 UIA 卡片整体关着（默认模式）——
 /// 发一条「有新消息」横幅顶上，点击按 PID 跳到对应微信窗口。
-/// 同一次闪烁（key + 时刻）只发一张；闪烁期间横幅常驻，
-/// 图标不闪了由 `flash_tick` 收起。
+/// 闪烁轮次去重：同一轮连续闪烁（相邻两闪 <1s）只弹一张横幅、响一声，
+/// 横幅按时长到期收起后图标还在闪也不重弹；停闪 ≥1s 再闪才算新一轮。
+/// 图标不闪了由 `flash_tick` 收起。时长与提示音都和接管后的微信卡片
+/// 走同一套设置（横幅显示时长 / sound_mode）。
 pub fn on_flash_card(key: &str, at: Instant, pid: u32, name: &str) {
     let Ok(mut seen) = FLASH_CARD_SEEN.lock() else { return };
     if seen.get(key) == Some(&at) {
         return; // 同一帧重复调用
     }
     seen.insert(key.to_string(), at);
+    // 闪烁轮次去重：同一轮连续闪烁（相邻两闪 <1s）只弹一张横幅、响一声。
+    // 横幅按「横幅显示时长」到期收起后图标还在闪 → 不重弹不重响；
+    // 停闪 ≥ 1 秒后再闪才算新一轮，才再弹再响（与接管后"一条消息一声"一致）
+    let now = Instant::now();
+    let same_burst = match FLASH_BURST_AT.lock() {
+        Ok(mut m) => {
+            let new_burst = match m.get(key) {
+                Some(prev) => now.duration_since(*prev).as_millis() >= FLASH_BURST_GAP_MS,
+                None => true,
+            };
+            m.insert(key.to_string(), now);
+            !new_burst
+        }
+        Err(_) => false,
+    };
+    if same_burst {
+        return;
+    }
     // 该实例的横幅还在展示中（闪烁未停）：不重复弹
     if let Ok(live) = LIVE_FLASH_CARDS.lock() {
         if live.contains_key(key) {
@@ -351,23 +383,56 @@ pub fn on_flash_card(key: &str, at: Instant, pid: u32, name: &str) {
     let mut notice = BannerNotice::wechat(account, "有新消息", 0, pid);
     notice.flash_key = Some(key.to_string());
     notice.source = "tray"; // 托盘图标监管触发的兜底横幅，走托盘通知通道
-    notice.secs = Some(0); // 常驻，随闪烁停止收起（flash_tick）
-    // UIA 关着（默认模式）：Dock 侧按闪烁逐次播放提示音，横幅静音避免响两遍；
-    // UIA 开着（兜底场景，实例不可读）：没有其它声音来源，横幅自己按 wechat_sound 响
-    notice.silent = !settings::wechat_cards() || !settings::wechat_sound();
+    // 时长与接管后的微信卡片一致：不覆写，交给该来源的「横幅显示时长」设置
+    // （托盘闪烁行；0 = 常驻）。没覆写时 accept() 按 banner_secs_for("tray") 取值。
+    // 提示音与接管后一致：横幅自己按 wechat_sound 静音位 + sound_mode 播
+    // （accept() 里 !silent → play_banner），不再由 Dock 侧按闪烁轮次单独响。
+    notice.silent = !settings::wechat_sound();
     show(notice);
 }
 
-/// Dock 每轮发布闪烁快照时上报「这个微信图标还在闪」。
-/// 横幅窗口的 500ms 定时器里 `flash_tick` 检查：多久没上报就收横幅。
-pub fn flash_seen(key: &str) {
+/// Dock 每轮发布闪烁快照时上报「这个微信图标还在闪」（`at` 是本次亮→灭的
+/// 灭帧时刻）。横幅窗口的 500ms 定时器里 `flash_tick` 检查：距最后一次
+/// 灭帧超过 `FLASH_STOP_MS` 就收横幅。
+pub fn flash_seen(key: &str, at: Instant) {
     if let Ok(mut m) = FLASH_ALIVE.lock() {
-        m.insert(key.to_string(), Instant::now());
+        // 存灭帧时刻而不是上报时刻：停闪后 Dock 还会按宽限窗口再报一会儿
+        // （同一个旧 at），按上报时刻计会让横幅多挂好几秒才收
+        m.insert(key.to_string(), at);
     }
 }
 
+/// pid → (托盘图标 key, 最近一次「还在闪」的上报时刻)。Dock 每轮 publish_flash
+/// 对正在闪烁的微信图标上报，多开各 pid 各自一条。UIA 微信卡片据此把横幅
+/// 生命周期挂到托盘闪烁上：图标不闪了（消息已读）横幅随 flash_tick 收起——
+/// 横幅秒数设 0（常驻）时不再永远挂着。
+static FLASH_BY_PID: LazyLock<Mutex<HashMap<u32, (String, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Dock 上报：pid 的微信托盘图标还在闪（`key` 是图标稳定键，多开各一条；
+/// `at` 是本次灭帧时刻，过期判定与 `flash_seen` 同一套）
+pub fn flash_seen_pid(pid: u32, key: &str, at: Instant) {
+    if pid == 0 || key.is_empty() {
+        return;
+    }
+    if let Ok(mut m) = FLASH_BY_PID.lock() {
+        // 顺手清理：实例退出后 pid 不再上报，60s 后清掉防堆积
+        m.retain(|_, (_, t)| t.elapsed().as_millis() < 60_000);
+        m.insert(pid, (key.to_string(), at));
+    }
+}
+
+/// 该 pid 的托盘图标当前是否在闪（距最后一次「亮→灭」≤ `FLASH_STOP_MS`）：
+/// 在闪返回图标 key，供微信卡片挂 flash_key（不闪了随 flash_tick 收起）。
+/// 拿不到（托盘隐藏 / 刚启动还没见过闪烁）返回 None，卡片保持原行为。
+pub fn flashing_key_for_pid(pid: u32) -> Option<String> {
+    let m = FLASH_BY_PID.lock().ok()?;
+    let (k, t) = m.get(&pid)?;
+    (t.elapsed().as_millis() <= FLASH_STOP_MS).then(|| k.clone())
+}
+
 /// 收起已经不闪的微信横幅（在横幅窗口自己的定时器里跑，线程安全）。
-/// 「不闪」= 超过 `FLASH_STOP_MS` 没有新的 flash_seen 上报
+/// 「不闪」= 距最后一次「亮→灭」（灭帧时刻）超过 `FLASH_STOP_MS`
 /// （用户点开消息、图标消失、Dock 隐藏都会走到这里）。
 pub fn flash_tick() {
     let expired: Vec<String> = match FLASH_ALIVE.lock() {

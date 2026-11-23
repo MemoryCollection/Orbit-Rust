@@ -7,7 +7,7 @@
 //! - 邮箱：多账号管理，内置常用服务器预设（QQ/163/Gmail/Outlook），
 //!   「测试连通」通过后打 ✓ 标记并持久化
 //! - 模块芯片：拖动排序、点击循环 胶囊 → 左条 → 右条 → 隐藏
-//! - 托盘图标：两列开关，第 0 格固定是「返回桌面」，下面有「恢复」按钮
+//! - 托盘图标：统一列表（一行完成 显示/隐藏 + 图标指定 + ▲▼ 排序），「返回桌面」固定第一行
 //! - 开始菜单：Win 键接管、每行列数、快捷方式增删排序（拖动行首圆点或 ↑↓，「快速添加」一键加任务管理器）
 //!
 //! 线程模型：设置页跑在**独立子进程**（`orbit.exe --settings-ui`）里——
@@ -45,9 +45,6 @@ const NAV_W: f32 = 150.0;
 const CTRL_W: f32 = 320.0;
 /// 窗口圆角
 const WIN_RADIUS: f32 = 10.0;
-
-/// 托盘列表里"返回桌面"开关的伪键
-const DESKTOP_KEY: &str = "__desktop__";
 
 // ---------- 主进程 ↔ 设置页子进程 ----------
 //
@@ -990,9 +987,11 @@ impl SettingsApp {
                 );
             }
             ui.label(
-                egui::RichText::new("新消息在屏幕右下角弹会话名+摘要小卡片（只读微信界面）")
-                    .size(11.5)
-                    .weak(),
+                egui::RichText::new(
+                    "开启后只读微信聊天列表（UIA，不改动微信本体），新消息弹会话名+摘要卡片，读不到的实例退回「有新消息」横幅；关闭时托盘图标闪烁也弹「有新消息」横幅（点击跳回微信）。两种方式的横幅时长与提示音设置通用",
+                )
+                .size(11.5)
+                .weak(),
             );
         });
         ui.add_space(4.0);
@@ -1991,112 +1990,356 @@ impl SettingsApp {
             );
         });
         ui.add_space(6.0);
-
-        section(ui, "托盘图标");
-        ui.label(
-            egui::RichText::new("点一下切换显示 / 隐藏；被隐藏的托盘图标会转发给系统托盘")
-                .size(11.5)
-                .weak(),
-        );
-        let mut entries: Vec<(String, String)> = vec![(DESKTOP_KEY.to_string(), "返回桌面".into())];
-        entries.extend(tray_entries());
-        let cell_w = (ui.available_width() - 10.0).min(300.0) / 2.0;
-        for chunk in entries.chunks(2) {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                for (key, name) in chunk {
-                    let on = if key == DESKTOP_KEY {
-                        settings::show_desktop_btn()
-                    } else {
-                        !settings::tray_hidden(key)
-                    };
-                    let fill = if on { on_fill() } else { off_fill() };
-                    let txt = egui::RichText::new(name.as_str())
-                        .size(12.0)
-                        .color(if on { on_text() } else { off_text() });
-                    if ui
-                        .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(cell_w, 24.0)))
-                        .clicked()
-                    {
-                        if key == DESKTOP_KEY {
-                            settings::set_show_desktop_btn(!settings::show_desktop_btn());
-                            crate::tlog!(
-                                "[settings] 返回桌面细长条 → {}",
-                                if settings::show_desktop_btn() { "显示" } else { "隐藏" }
-                            );
-                        } else {
-                            let now_hidden = !settings::tray_hidden(key);
-                            settings::set_tray_hidden(key, now_hidden);
-                            crate::tlog!(
-                                "[settings] 托盘图标 {key} → {}",
-                                if now_hidden { "隐藏" } else { "显示" }
-                            );
-                        }
-                    }
-                }
-            });
-        }
-        if !settings::hidden_tray().is_empty() {
-            ui.add_space(6.0);
-            if ui.add(egui::Button::new("恢复全部显示").small()).clicked() {
-                settings::clear_hidden_tray();
-                crate::tlog!("[settings] 托盘隐藏列表清空");
-            }
-        }
-
+        self.tray_list(ui);
         ui.add_space(10.0);
         self.pins(ui);
     }
 
-    /// 固定图标：已固定的一行一个（右侧「移除」），下面列正在运行但还没固定的应用，
-    /// 再给一个「浏览程序…」从磁盘挑 exe / 快捷方式。所有改动都整体写回列表。
+    /// 托盘图标统一列表：一张表里同时完成 显示/隐藏、图标指定、拖动排序，
+    /// 不再分「托盘图标开关」「图标指定」两张表。
+    /// 顺序：自定义排序（`tray_order`）优先，没进表的图标按快照顺序跟在后面；
+    /// 没有自定义排序时就是 Dock 的默认顺序。
+    fn tray_list(&mut self, ui: &mut egui::Ui) {
+        // 右区宽度 = 图标指定(84) + 显示/隐藏(56) + 间距(6) + 8(余量)
+        const RIGHT_W: f32 = 84.0 + 56.0 + 6.0 + 8.0;
+        section(ui, "托盘图标");
+        ui.label(
+            egui::RichText::new(
+                "按住行首圆点拖动调整在 Dock 上的排列顺序；按钮切换 显示/隐藏\
+                 （隐藏的会转发给系统托盘）；「指定图标…」给发糊的小图标换高清来源\
+                 （exe / dll / ico / png）。「返回桌面」固定在第一行，不参与排序",
+            )
+            .size(11.5)
+            .weak(),
+        );
+
+        // 返回桌面细长条：表格第一行，位置固定不可拖动（无把手）。
+        // 列口径与下面各行一致：无把手占位对齐名称列，空占位对齐「图标指定」列
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::hover());
+            let name_w = (ui.available_width() - RIGHT_W).max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(name_w, 22.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_max_width(name_w);
+                    ui.add(egui::Label::new(egui::RichText::new("返回桌面").size(12.5)));
+                },
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                // 空占位（84 宽）：与下面各行的「图标指定」按钮列对齐
+                ui.allocate_exact_size(egui::vec2(84.0, 22.0), egui::Sense::hover());
+                let on = settings::show_desktop_btn();
+                let fill = if on { on_fill() } else { off_fill() };
+                let txt = egui::RichText::new(if on { "显示" } else { "隐藏" })
+                    .size(12.0)
+                    .color(if on { on_text() } else { off_text() });
+                if ui
+                    .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(56.0, 22.0)))
+                    .clicked()
+                {
+                    settings::set_show_desktop_btn(!on);
+                    crate::tlog!(
+                        "[settings] 返回桌面细长条 → {}",
+                        if settings::show_desktop_btn() { "显示" } else { "隐藏" }
+                    );
+                }
+            });
+        });
+
+        // 自定义排序优先：表里的键按其下标排，没进表的按快照顺序跟在后面（稳定排序）
+        let mut entries = tray_entries();
+        let order = settings::tray_order();
+        entries.sort_by_key(|(k, _)| order.iter().position(|o| o == k).unwrap_or(usize::MAX));
+        let overs = settings::icon_overrides();
+
+        // 表格式三列布局：[拖动把手] [名称靠左] … [显示/隐藏] [图标指定]（后两列靠右）。
+        // 右侧两个按钮全部固定宽度，保证各行的列严格对齐（同开始菜单快捷方式的行）。
+        let dragging = egui::DragAndDrop::payload::<TrayDrag>(ui.ctx()).map(|p| p.0);
+        let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        for (idx, (key, name)) in entries.iter().enumerate() {
+            let hidden = settings::tray_hidden(key);
+            let over = overs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, p)| p.clone());
+            let row = ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                // 拖动把手：2×3 圆点 grip（手绘，不依赖字体字形）。按住拖到目标行即可换位
+                let (hr, hresp) = ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::drag());
+                let dot_color = if dragging == Some(idx) {
+                    argb(cfg::cur().accent)
+                } else {
+                    argb(cfg::cur().text_dim)
+                };
+                let c = hr.center();
+                for dx in [-3.0f32, 3.0] {
+                    for dy in [-4.5f32, 0.0, 4.5] {
+                        ui.painter().circle_filled(c + egui::vec2(dx, dy), 1.2, dot_color);
+                    }
+                }
+                let hresp = hresp.on_hover_text("按住拖动调整顺序");
+                if hresp.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), TrayDrag(idx));
+                }
+                if hresp.drag_stopped() {
+                    egui::DragAndDrop::clear_payload(ui.ctx());
+                }
+                hresp.on_hover_cursor(egui::CursorIcon::Grab);
+
+                // 名称列靠左：固定宽度 + truncate（长名字在本列截断，绝不把行撑宽）。
+                // add_sized 内部固定用居中布局，所以自己用左对齐布局分配矩形
+                let mut label = name.clone();
+                if let Some(p) = &over {
+                    label.push_str(&format!("  → {}", pin_label(p)));
+                }
+                let name_w = (ui.available_width() - RIGHT_W).max(80.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(name_w, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_max_width(name_w);
+                        ui.add(egui::Label::new(egui::RichText::new(label).size(12.5)).truncate());
+                    },
+                );
+
+                // 右区：right_to_left 布局从右缘往左摆按钮，先加的在最右。
+                // 左→右的列顺序 = 显示/隐藏、图标指定，所以先加「图标指定」再加开关
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    // 图标指定：已指定的显示「还原」，没指定的显示「指定图标…」
+                    // （固定 84 宽，足够放下「指定图标…」不撑开）
+                    let icon_btn = |ui: &mut egui::Ui, t: &str| {
+                        ui.add(
+                            egui::Button::new(egui::RichText::new(t).size(11.5))
+                                .min_size(egui::vec2(84.0, 22.0)),
+                        )
+                        .clicked()
+                    };
+                    if over.is_some() {
+                        if icon_btn(ui, "还原") {
+                            settings::set_icon_override(key, None);
+                            crate::tlog!("[settings] 托盘图标 {key} 图标指定已还原");
+                        }
+                    } else if icon_btn(ui, "指定图标…") {
+                        if let Some(path) = pick_program(true) {
+                            settings::set_icon_override(key, Some(&path));
+                            crate::tlog!("[settings] 托盘图标 {key} 指定图标源 → {path}");
+                        }
+                    }
+                    // 显示 / 隐藏（固定 56 宽）
+                    let fill = if hidden { off_fill() } else { on_fill() };
+                    let txt = egui::RichText::new(if hidden { "隐藏" } else { "显示" })
+                        .size(12.0)
+                        .color(if hidden { off_text() } else { on_text() });
+                    if ui
+                        .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(56.0, 22.0)))
+                        .clicked()
+                    {
+                        settings::set_tray_hidden(key, !hidden);
+                        crate::tlog!(
+                            "[settings] 托盘图标 {key} → {}",
+                            if !hidden { "隐藏" } else { "显示" }
+                        );
+                    }
+                });
+            });
+            row_rects.push((idx, row.response.rect));
+        }
+
+        // 拖着走的行悬到另一行上：实时交换顺序（松手即定格），写回自定义排序表
+        if let Some(src) = dragging {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                if let Some(&(j, _)) = row_rects.iter().find(|(_, r)| r.contains(pos)) {
+                    if j != src {
+                        let mut keys: Vec<String> =
+                            entries.iter().map(|(k, _)| k.clone()).collect();
+                        if src < keys.len() && j < keys.len() {
+                            let item = keys.remove(src);
+                            keys.insert(j, item);
+                            settings::set_tray_order(keys);
+                            egui::DragAndDrop::set_payload(ui.ctx(), j);
+                        }
+                    }
+                }
+            }
+        }
+
+        let has_hidden = !settings::hidden_tray().is_empty();
+        let has_order = !settings::tray_order().is_empty();
+        if has_hidden || has_order {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if has_hidden && ui.add(egui::Button::new("恢复全部显示").small()).clicked() {
+                    settings::clear_hidden_tray();
+                    crate::tlog!("[settings] 托盘隐藏列表清空");
+                }
+                if has_order && ui.add(egui::Button::new("恢复默认排序").small()).clicked() {
+                    settings::set_tray_order(Vec::new());
+                    crate::tlog!("[settings] 托盘自定义排序已清空（回到默认顺序）");
+                }
+            });
+        }
+    }
+
+    /// 固定图标：一张表 = 已固定（行首把手可拖动排序）+ 正在运行但未固定（无把手、
+    /// 不可拖动）。右侧统一用开关按钮切换 固定/未固定（与托盘列表的 显示/隐藏 同款）。
+    /// 下面保留「浏览程序…」添加没在运行的程序。所有改动整体写回列表。
     fn pins(&mut self, ui: &mut egui::Ui) {
         section(ui, "固定图标");
+        ui.label(
+            egui::RichText::new(
+                "已固定的可按住行首圆点拖动排序；点右侧按钮取消固定。\
+                 未固定的行是正在运行的应用，点「固定」加到 Dock",
+            )
+            .size(11.5)
+            .weak(),
+        );
         let (pins, running) = pins_view();
+
+        // 拖动排序：payload 用 PinDrag 类型，与托盘列表的 TrayDrag 区分（两表同屏）
+        let dragging = egui::DragAndDrop::payload::<PinDrag>(ui.ctx()).map(|p| p.0);
+        let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
         if pins.is_empty() {
             ui.label(
-                egui::RichText::new("还没有固定图标：只显示正在运行的应用")
+                egui::RichText::new("还没有固定图标：下面的运行中应用点「固定」即可添加")
                     .size(11.5)
                     .weak(),
             );
         }
-        for path in &pins {
-            let label = pin_label(path);
+
+        // 已固定的行（按固定顺序，行首把手可拖动）
+        for (idx, path) in pins.iter().enumerate() {
+            let name = pin_label(path);
+            let row = ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                // 拖动把手：2×3 圆点 grip（手绘，不依赖字体字形）
+                let (hr, hresp) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::drag());
+                let dot_color = if dragging == Some(idx) {
+                    argb(cfg::cur().accent)
+                } else {
+                    argb(cfg::cur().text_dim)
+                };
+                let c = hr.center();
+                for dx in [-3.0f32, 3.0] {
+                    for dy in [-4.5f32, 0.0, 4.5] {
+                        ui.painter().circle_filled(c + egui::vec2(dx, dy), 1.2, dot_color);
+                    }
+                }
+                let hresp = hresp.on_hover_text("按住拖动调整顺序");
+                if hresp.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), PinDrag(idx));
+                }
+                if hresp.drag_stopped() {
+                    egui::DragAndDrop::clear_payload(ui.ctx());
+                }
+                hresp.on_hover_cursor(egui::CursorIcon::Grab);
+                // 名称列靠左（固定宽度 + truncate，与托盘列表同一套做法）
+                let name_w = (ui.available_width() - PIN_RIGHT).max(80.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(name_w, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_max_width(name_w);
+                        ui.add(egui::Label::new(egui::RichText::new(&name).size(12.5)).truncate());
+                    },
+                );
+                // 右侧开关（与托盘列表 显示/隐藏 同款按钮）
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let fill = on_fill();
+                    let txt = egui::RichText::new("已固定")
+                        .size(12.0)
+                        .color(on_text());
+                    if ui
+                        .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(PIN_BTN, 22.0)))
+                        .clicked()
+                    {
+                        let list: Vec<String> = pins
+                            .iter()
+                            .filter(|p| !p.eq_ignore_ascii_case(path))
+                            .cloned()
+                            .collect();
+                        settings::set_dock_pins(list);
+                        pins_cache_clear();
+                        crate::tlog!("[settings] 固定图标 取消固定 {name}");
+                    }
+                });
+            });
+            row_rects.push((idx, row.response.rect));
+        }
+
+        // 正在运行但未固定的行：无把手、不可拖动，名称用次级色区分
+        let unpinned: Vec<(String, String)> = running
+            .into_iter()
+            .filter(|(_, exe)| !pins.iter().any(|p| p.eq_ignore_ascii_case(exe)))
+            .collect();
+        if unpinned.is_empty() && !pins.is_empty() {
+            ui.label(
+                egui::RichText::new("（运行中的应用都已固定）").size(11.5).weak(),
+            );
+        }
+        for (name, exe) in &unpinned {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(egui::RichText::new(label).size(12.5));
+                // 无把手：空占位，让名称列与上面已固定的行对齐
+                ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::hover());
+                let name_w = (ui.available_width() - PIN_RIGHT).max(80.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(name_w, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_max_width(name_w);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(name)
+                                    .size(12.5)
+                                    .color(argb(cfg::cur().text_dim)),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new("移除").small()).clicked() {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let fill = off_fill();
+                    let txt = egui::RichText::new("固定")
+                        .size(12.0)
+                        .color(off_text());
+                    if ui
+                        .add(egui::Button::new(txt).fill(fill).min_size(egui::vec2(PIN_BTN, 22.0)))
+                        .clicked()
+                    {
                         let mut list = pins.clone();
-                        list.retain(|p| !p.eq_ignore_ascii_case(path));
+                        list.push(exe.clone());
                         settings::set_dock_pins(list);
+                        pins_cache_clear();
+                        crate::tlog!("[settings] 固定图标 已固定 {name}");
                     }
                 });
             });
         }
 
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new("添加：正在运行的应用").size(11.5).weak());
-        let running: Vec<(String, String)> = running
-            .into_iter()
-            .filter(|(_, exe)| !pins.iter().any(|p| p.eq_ignore_ascii_case(exe)))
-            .collect();
-        if running.is_empty() {
-            ui.label(egui::RichText::new("（没有可添加的运行中应用）").size(11.5).weak());
-        }
-        for (name, exe) in &running {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(egui::RichText::new(name).size(12.5));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new("固定").small()).clicked() {
+        // 拖着走的行悬到另一行（仅已固定行）上：实时交换顺序（松手即定格）
+        if let Some(src) = dragging {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                if let Some(&(j, _)) = row_rects.iter().find(|(_, r)| r.contains(pos)) {
+                    if j != src {
                         let mut list = pins.clone();
-                        list.push(exe.clone());
-                        settings::set_dock_pins(list);
+                        if src < list.len() && j < list.len() {
+                            let item = list.remove(src);
+                            list.insert(j, item);
+                            settings::set_dock_pins(list);
+                            pins_cache_clear();
+                            egui::DragAndDrop::set_payload(ui.ctx(), PinDrag(j));
+                        }
                     }
-                });
-            });
+                }
+            }
         }
 
         ui.add_space(6.0);
@@ -2107,75 +2350,15 @@ impl SettingsApp {
                     if !list.iter().any(|p| p.eq_ignore_ascii_case(&path)) {
                         list.push(path);
                         settings::set_dock_pins(list);
+                        pins_cache_clear();
                     }
                 }
             }
             if !pins.is_empty() && ui.add(egui::Button::new("清空固定").small()).clicked() {
                 settings::set_dock_pins(Vec::new());
+                pins_cache_clear();
             }
         });
-
-        ui.add_space(10.0);
-        self.icon_override(ui);
-    }
-
-    /// 图标指定：某些程序注册的托盘 hIcon 只有 16px，放大到 Dock 必然糊。
-    /// 这里可以给某个图标单挑一个 exe，Orbit 会读它的 256px 图标顶上。
-    fn icon_override(&mut self, ui: &mut egui::Ui) {
-        section(ui, "图标指定");
-        ui.label(
-            egui::RichText::new(
-                "托盘图标糊的话，可以给它换一张：选程序的 exe / dll，或 .ico / png 等图标图片",
-            )
-            .size(11.5)
-            .weak(),
-        );
-
-        let overs = settings::icon_overrides();
-        for (key, path) in &overs {
-            let target = override_target_name(key);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(egui::RichText::new(target).size(12.5));
-                ui.label(
-                    egui::RichText::new(format!("→ {}", pin_label(path)))
-                        .size(11.5)
-                        .color(argb(cfg::cur().accent)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new("还原").small()).clicked() {
-                        settings::set_icon_override(key, None);
-                    }
-                });
-            });
-        }
-
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new("可选托盘图标").size(11.5).weak());
-        // 候选只有托盘图标：任务栏（钉选项 / 运行项）读的是 exe 自带的大图标，本来就不糊
-        let cands: Vec<(String, String)> = tray_entries().into_iter().collect();
-        let mut shown = 0;
-        for (key, name) in cands {
-            if overs.iter().any(|(k, _)| k.eq_ignore_ascii_case(&key)) {
-                continue;
-            }
-            if shown >= 16 {
-                ui.label(egui::RichText::new("…（更多图标请先关掉一些再刷新）").size(11.5).weak());
-                break;
-            }
-            shown += 1;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(egui::RichText::new(name).size(12.5));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new("指定图标…").small()).clicked() {
-                        if let Some(path) = pick_program(true) {
-                            settings::set_icon_override(&key, Some(&path));
-                        }
-                    }
-                });
-            });
-        }
     }
 
 
@@ -2415,12 +2598,20 @@ fn seg(ui: &mut egui::Ui, options: &[&str], active: usize) -> Option<usize> {
 /// 「固定图标」区块的输入数据：(已固定列表, 正在运行的应用)。
 ///
 /// immediate mode 每帧都会重跑界面函数，`EnumWindows` + 读 TaskBar 目录太贵，
-/// 这里按 2 秒缓存一份；固定列表本身改动会立刻体现在下一帧（缓存被 `set_dock_pins` 之外的
-/// 路径不会清，所以保留 2 秒的自然过期）。
+/// 这里按 2 秒缓存一份；表内改动（固定/取消固定/拖动排序）走 `pins_cache_clear()`
+/// 立刻清缓存，下一帧就能看到变化，不用等 2 秒自然过期。
+static PINS_CACHE: Mutex<Option<(std::time::Instant, Vec<String>, Vec<(String, String)>)>> =
+    Mutex::new(None);
+
+/// 表内改动后立刻清固定列表缓存（下一帧重扫，改动马上可见）
+fn pins_cache_clear() {
+    if let Ok(mut c) = PINS_CACHE.lock() {
+        *c = None;
+    }
+}
+
 fn pins_view() -> (Vec<String>, Vec<(String, String)>) {
-    static CACHE: Mutex<Option<(std::time::Instant, Vec<String>, Vec<(String, String)>)>> =
-        Mutex::new(None);
-    if let Ok(c) = CACHE.lock() {
+    if let Ok(c) = PINS_CACHE.lock() {
         if let Some((at, pins, running)) = c.as_ref() {
             if at.elapsed().as_millis() < 2000 {
                 return (pins.clone(), running.clone());
@@ -2429,23 +2620,21 @@ fn pins_view() -> (Vec<String>, Vec<(String, String)>) {
     }
     let pins = crate::dock::effective_pins();
     let running = crate::dock::running_app_list();
-    if let Ok(mut c) = CACHE.lock() {
+    if let Ok(mut c) = PINS_CACHE.lock() {
         *c = Some((std::time::Instant::now(), pins.clone(), running.clone()));
     }
     (pins, running)
 }
 
-/// 图标指定的键 → 给人看的名字：`app:<exe>` 取文件名，托盘键在托盘表里查 tooltip
-fn override_target_name(key: &str) -> String {
-    if let Some(exe) = key.strip_prefix("app:") {
-        return pin_label(exe);
-    }
-    tray_entries()
-        .into_iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, n)| n)
-        .unwrap_or_else(|| pin_label(key))
-}
+/// 拖动排序的 payload 类型：托盘列表与固定图标列表在 Dock 页同屏可见，
+/// 必须各用一个独立类型，否则共用 `usize` 时 A 表拖动会误触发 B 表换位
+struct TrayDrag(usize);
+struct PinDrag(usize);
+
+/// 「固定图标」行右侧开关按钮的宽度（放下三个字「已固定/未固定」）
+const PIN_BTN: f32 = 68.0;
+/// 固定图标行的右区预算（按钮 + 间距 + 余量），名称列据此留位
+const PIN_RIGHT: f32 = PIN_BTN + 10.0;
 
 /// 固定列表里显示的名字：去掉目录和扩展名
 fn pin_label(path: &str) -> String {

@@ -1,5 +1,5 @@
-//! 内嵌提示音：微信托盘图标开始闪烁（新消息提醒）或右下角横幅弹出时，Orbit 侧用
-//! MCI 播放一段嵌进二进制的提示音——**不修改微信本体**，微信自己的声音/弹窗照旧。
+//! 内嵌提示音：右下角横幅弹出时，Orbit 侧用 MCI 播放一段嵌进二进制的提示音
+//! ——**不修改微信本体**，微信自己的声音/弹窗照旧。
 //!
 //! 实现：`include_bytes!` 把 mp3 编译进 exe；首次播放时释放到
 //! `<exe>/data/wechat_notify.mp3`，然后走 MCI（`mciSendStringW`，DirectShow
@@ -8,12 +8,11 @@
 //! 关键点：**单条播放线程 + 队列**。同时来好几条横幅时，不再是"后一声打断前一声"
 //! （听感上等于漏响），而是排队逐条完整播完——每弹一条横幅就实打实响一次。
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{LazyLock, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HWND;
@@ -21,19 +20,11 @@ use windows::Win32::Media::Multimedia::mciSendStringW;
 
 /// 嵌入的提示音（约 36 KB）
 static SOUND_MP3: &[u8] = include_bytes!("../assets/wechat_notify.mp3");
-/// 托盘闪烁这条路径的极短兜底间隔（毫秒）：调用侧已用每次闪烁的 flash_at 精确去重，
-/// 这里只防同一帧重入（比如 render 和 70ms 定时器在同一灭帧各调一次）。
-/// 微信一闪约 250ms，两次闪烁间隔 ~500ms，200ms 兜底不会吞掉下一次闪烁。
-const MIN_GAP_MS: u64 = 200;
 /// 排队上限：突然来一大批消息时最多排这么多声，避免提示音拖到很久以后还在响
 const MAX_PENDING: u64 = 8;
 /// MCI alias（进程内唯一）
 const ALIAS: &str = "orbit_notify";
 
-/// 每个图标 key 各自的上次播放时刻：微信双开时两个图标各算各的一轮提醒，
-/// 全局节流会把第二个实例的提醒吞掉（用户实测）
-static LAST_PLAY: LazyLock<Mutex<HashMap<String, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// 正在排队的播放请求数（用来限制队列长度）
 static PENDING: AtomicU64 = AtomicU64::new(0);
 /// 播放队列：只有一个消费线程，保证每一声都完整播完。
@@ -56,28 +47,6 @@ pub fn is_wechat(name: &str, exe: &str) -> bool {
 
 fn sound_path() -> PathBuf {
     crate::store::path("wechat_notify.mp3")
-}
-
-/// 托盘闪烁提示音。调用侧每次闪烁（亮→灭）触发一次，连续消息每闪都响；
-/// 这里按图标 key 做 200ms 重入兜底，双开的两个实例互不干扰。
-pub fn play_wechat(key: &str) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    {
-        let Ok(mut last) = LAST_PLAY.lock() else { return };
-        // 顺手清掉过期项，免得 map 无限长（图标 key 有限，其实涨不起来）
-        last.retain(|_, t| now.saturating_sub(*t) < MIN_GAP_MS * 2);
-        if let Some(prev) = last.get(key) {
-            if now.saturating_sub(*prev) < MIN_GAP_MS {
-                return;
-            }
-        }
-        last.insert(key.to_string(), now);
-    }
-    crate::tlog!("[notify] 托盘提示音 key={key}");
-    enqueue("托盘闪烁");
 }
 
 /// 右下角横幅弹出时播放的提示音：**每弹一条就排一声**，不再做时间合并。

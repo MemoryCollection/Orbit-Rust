@@ -87,15 +87,6 @@ pub struct FlashIcon {
 
 static FLASH_SET: Mutex<Vec<FlashIcon>> = Mutex::new(Vec::new());
 static FLASH_VER: AtomicU64 = AtomicU64::new(0);
-/// 每个图标 key 上次**见到**的闪烁时刻（`it.flash_at`）。
-/// 提示音按"闪烁轮次"判定：同一轮连续闪烁里相邻两闪只差约 500ms
-/// （小于 `FLASH_SOUND_GAP_MS`），不重复响；停止闪烁 1 秒后再闪，
-/// 间隔 ≥ 1 秒，视为新一轮，再响一声。之前按"响声时刻"节流，
-/// 消息一直不读会每秒响一声（太吵），改成整轮只响开头一声。
-static SOUND_FLASH_AT: LazyLock<Mutex<HashMap<String, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-/// 判定"新一轮闪烁"的最小间隔（毫秒）：距上次闪烁 ≥ 1 秒才再响
-const FLASH_SOUND_GAP_MS: u128 = 1000;
 /// pid → 托盘回调目标（build_host_targets 时同步）。横幅点击跳转兜底用：
 /// 微信主窗口收在托盘（不可见）时，SetForegroundWindow 无效，
 /// 唯一可靠的唤醒方式是模拟左键它的托盘图标。
@@ -640,6 +631,11 @@ impl Dock {
         // 固定图标列表 / 开关都可能变，内容整轮重扫（签名没变时等价于空转）
         self.scan();
         self.poll_tray();
+        // 自定义排序（设置页 ▲▼ 写回 tray_order）可能变了：立即重排托盘显示顺序。
+        // 托管模式下 host_targets 与 items 下标一一对应，顺序变了必须跟着重建
+        if self.tray.resort() && self.tray.hosted() {
+            self.build_host_targets();
+        }
         self.refresh_active();
         self.render();
     }
@@ -1137,13 +1133,7 @@ impl Dock {
     /// 集合或亮/灭帧没变就不动版本号，胶囊那边靠版本号判断要不要重绘。
     fn publish_flash(&mut self) {
         let now = Instant::now();
-        // 微信提示音按"闪烁轮次"响：`it.flash_at` 在每次亮→灭时刷新，
-        // 拿它当"这一闪"的身份。同一轮连续闪烁（相邻两闪 ~500ms）整轮
-        // 只响开头一声；停闪超过 1 秒再闪才算新一轮、再响一声。
-        // 按图标 key 各自记，双开微信两个图标互不干扰。
-        let mut wx_new_keys: Vec<String> = Vec::new();
         let mut snap: Vec<FlashIcon> = Vec::new();
-        let mut sounded = SOUND_FLASH_AT.lock().unwrap_or_else(|e| e.into_inner());
         if settings::show_tray() {
             for &i in &self.tray_shown {
                 let Some(it) = self.tray.items.get(i) else { continue };
@@ -1156,38 +1146,23 @@ impl Dock {
                     // 微信闪一下 = 新消息：让 UIA 读取线程立刻重读一轮，卡片跟提示音同步。
                     // on_flash 内部按 key + 闪烁时刻去重，同一帧重复调用只唤醒一次。
                     crate::banner::on_flash(&key, t);
-                    // 上报「还在闪」：横幅窗口据此决定闪烁横幅什么时候收起
-                    crate::banner::flash_seen(&key);
+                    // 上报「还在闪」：横幅窗口据此决定闪烁横幅什么时候收起。
+                    // 传灭帧时刻 t（不是上报时刻）：停闪后本函数还会按
+                    // FLASH_WINDOW_MS 宽限再跑一会儿，横幅按 t 计时才能
+                    // 停闪后立刻到期收起，不多等宽限的几秒
+                    crate::banner::flash_seen(&key, t);
                     let pid = it.host.as_ref().map(|h| h.pid).unwrap_or(0);
-                    if settings::wechat_cards() {
-                        // UIA 卡片开着：只有读不到会话列表的实例（微信 4.x 多开
-                        // 只有第一个实例的树有内容，实测 4.2.0）需要兜底横幅
-                        if pid != 0 && !crate::wechatmsg::pid_readable(pid) {
-                            crate::banner::on_flash_card(&key, t, pid, &it.name);
-                        }
-                    } else {
-                        // UIA 卡片关着（默认模式）：闪烁直接弹「有新消息」横幅，
-                        // 点击跳到对应微信窗口；图标不闪了横幅随之收起
+                    // 按 pid 再报一份：UIA 微信卡片挂 flash_key 用（多开各 pid 各自
+                    // 一条），横幅秒数=0 常驻时图标不闪了（消息已读）随之收起
+                    crate::banner::flash_seen_pid(pid, &key, t);
+                    // UIA 卡片开着：只有读不到会话列表的实例（微信 4.x 多开
+                    // 只有第一个实例的树有内容，实测 4.2.0）需要兜底横幅；
+                    // 卡片关着：闪烁直接弹「有新消息」横幅，点击跳到对应微信窗口。
+                    // 提示音由横幅自己按 sound_mode 播（与接管后一致），Dock 不再单独响。
+                    if !settings::wechat_cards()
+                        || (pid != 0 && !crate::wechatmsg::pid_readable(pid))
+                    {
                         crate::banner::on_flash_card(&key, t, pid, &it.name);
-                    }
-                    // 提示音：只在「开始闪的第一声」响。以 `it.flash_at`（这次亮→灭
-                    // 的时刻）为闪烁身份：同一轮连续闪烁里相邻两闪间隔约 500ms
-                    // （< FLASH_SOUND_GAP_MS），整轮只响开头一声；停止闪烁 1 秒
-                    // 后再次闪烁 → 间隔 ≥ 1 秒，算新一轮，再响一声。
-                    // 按图标 key 各记各的，双开微信互不干扰。
-                    if settings::wechat_sound() && !settings::wechat_cards() {
-                        let new_burst = match sounded.get(&key) {
-                            Some(prev) => t
-                                .checked_duration_since(*prev)
-                                .map(|d| d.as_millis())
-                                .unwrap_or(0)
-                                >= FLASH_SOUND_GAP_MS,
-                            None => true,
-                        };
-                        sounded.insert(key.clone(), t);
-                        if new_burst {
-                            wx_new_keys.push(key.clone());
-                        }
                     }
                 }
                 snap.push(FlashIcon {
@@ -1198,9 +1173,6 @@ impl Dock {
                     target: self.host_targets.get(i).cloned().flatten().map(|t| t.raw()),
                 });
             }
-        }
-        for key in wx_new_keys {
-            notify::play_wechat(&key);
         }
         let sig: Vec<(String, bool)> = snap.iter().map(|f| (f.key.clone(), f.dim)).collect();
         let mut changed = true;
