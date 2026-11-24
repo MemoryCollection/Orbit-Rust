@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
@@ -62,31 +61,12 @@ const T_SETTINGS: usize = 6;
 /// 后台扫完"图标回调消息"后叫醒窗口线程（lParam 不用，下标在 wParam）
 const WM_TRAY_SCAN: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x71;
 
-// ---------- 胶囊右侧的"托盘闪烁"快照 ----------
+// ---------- 托盘闪烁采样 ----------
 //
 // 应用用托盘图标一闪一闪提示新消息（微信就是这样）。Dock 的 70ms 采样定时器
-// 已经跟着真实闪烁走，这里把"正在闪烁的图标"发布成一份快照（图标像素 + 亮/灭帧
-// + 回调目标 + 版本号），顶部胶囊按版本号跟随——胶囊右侧就会显示同一个图标、
-// 以同样的节奏闪，点它等于点托盘图标。
+// 已经跟着真实闪烁走，采样结果只喂给微信提示音/消息横幅（`banner::on_flash*`
+// / `flash_seen*`）；胶囊不再显示闪烁图标（2026-11-20 起）。
 
-/// 快照里的一条闪烁图标
-#[derive(Clone)]
-pub struct FlashIcon {
-    /// 托盘图标的稳定键（`tray::TrayItem::key`）
-    pub key: String,
-    /// 显示名（tooltip 首行）
-    pub name: String,
-    /// 图标像素（straight RGBA，px*px*4）
-    pub rgba: Vec<u8>,
-    /// 这一帧是否"灭"（灭 = 图标消失帧，胶囊留空位不画）
-    pub dim: bool,
-    /// 回调目标（悬停/点击转发用；UIA 兜底模式可能还没有）。
-    /// 存 `Raw` 而不是 `Target`：HWND 里是裸指针，静态快照要求 Send/Sync。
-    pub target: Option<traymsg::Raw>,
-}
-
-static FLASH_SET: Mutex<Vec<FlashIcon>> = Mutex::new(Vec::new());
-static FLASH_VER: AtomicU64 = AtomicU64::new(0);
 /// pid → 托盘回调目标（build_host_targets 时同步）。横幅点击跳转兜底用：
 /// 微信主窗口收在托盘（不可见）时，SetForegroundWindow 无效，
 /// 唯一可靠的唤醒方式是模拟左键它的托盘图标。
@@ -108,16 +88,6 @@ pub fn click_tray_for_pid(pid: u32) {
     let c = traymsg::icon_center_of(t).unwrap_or((0, 0));
     crate::tlog!("[dock] 横幅兜底：模拟左键 pid={pid} 的托盘图标（回调消息投递）");
     traymsg::click(&t, c, false);
-}
-
-/// 快照版本号：正在闪烁的图标集合（或亮/灭帧）变化时 +1
-pub fn flash_version() -> u64 {
-    FLASH_VER.load(Ordering::Relaxed)
-}
-
-/// 当前正在闪烁的图标（胶囊每帧取一次；量很小，直接克隆）
-pub fn flash_icons() -> Vec<FlashIcon> {
-    FLASH_SET.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
 /// 点击目标
@@ -1180,15 +1150,14 @@ impl Dock {
             self.sync_host_layout(x, y);
         }
 
-        // 托盘成员/目标变了，闪烁快照跟着刷新（70ms 定时器里也会再发一次）
+        // 托盘成员/目标变了，闪烁采样跟着刷新（70ms 定时器里也会再发一次）
         self.publish_flash();
     }
 
-    /// 把"正在闪烁的托盘图标"发布成胶囊消费的快照（见 `FlashIcon`）。
-    /// 集合或亮/灭帧没变就不动版本号，胶囊那边靠版本号判断要不要重绘。
+    /// 把"正在闪烁的托盘图标"上报给横幅层（微信提示音/消息卡片）。
+    /// 胶囊不再显示闪烁图标，这里只做 banner 上报，不再维护快照集合。
     fn publish_flash(&mut self) {
         let now = Instant::now();
-        let mut snap: Vec<FlashIcon> = Vec::new();
         if settings::show_tray() {
             for &i in &self.tray_shown {
                 let Some(it) = self.tray.items.get(i) else { continue };
@@ -1220,25 +1189,7 @@ impl Dock {
                         crate::banner::on_flash_card(&key, t, pid, &it.name);
                     }
                 }
-                snap.push(FlashIcon {
-                    key,
-                    name: it.name.clone(),
-                    rgba: it.rgba.clone(),
-                    dim: it.dim,
-                    target: self.host_targets.get(i).cloned().flatten().map(|t| t.raw()),
-                });
             }
-        }
-        let sig: Vec<(String, bool)> = snap.iter().map(|f| (f.key.clone(), f.dim)).collect();
-        let mut changed = true;
-        if let Ok(cur) = FLASH_SET.lock() {
-            changed = cur.iter().map(|f| (f.key.clone(), f.dim)).collect::<Vec<_>>() != sig;
-        }
-        if changed {
-            if let Ok(mut cur) = FLASH_SET.lock() {
-                *cur = snap;
-            }
-            FLASH_VER.fetch_add(1, Ordering::Relaxed);
         }
     }
 

@@ -711,19 +711,6 @@ pub fn island_board(
     }
 }
 
-/// 分隔线（竖 1px，垂直居中）。顶部胶囊已去掉分割线，保留给其它视图备用。
-#[allow(dead_code)]
-pub fn divider(p: &egui::Painter, x: f32, fh: f32) {
-    p.rect_filled(
-        egui::Rect::from_min_size(
-            egui::pos2(x, (fh - cfg::DIVIDER_H) / 2.0),
-            egui::vec2(1.0, cfg::DIVIDER_H),
-        ),
-        0,
-        argb(cfg::cur().divider),
-    );
-}
-
 // ---------- 字体字节全局缓存 ----------
 
 /// 同一字体文件按「路径 + 大小 + 修改时间」缓存一份 `Arc<FontData>`。

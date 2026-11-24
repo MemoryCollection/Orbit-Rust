@@ -16,7 +16,7 @@ use eframe::egui;
 
 use crate::config as cfg;
 use crate::egui_soft::{argb, clock_font, glass_board, island_board, widget_icon, SoftBackend};
-use crate::render::{ear_size, FlashView, PillShape, WidgetItem};
+use crate::render::{ear_size, PillShape, WidgetItem};
 
 // ---------- 对外接口 ----------
 
@@ -48,9 +48,6 @@ impl InputAcc {
 pub enum PillEvent {
     /// 按下了第 i 个 widget（按下即触发，对齐旧版）
     WidgetClick(usize),
-    /// 悬停进入 / 离开第 i 个闪烁图标
-    FlashEnter(usize),
-    FlashLeave,
 }
 
 /// 每帧传给 paint 的快照（数据仍由主线程 App 持有）
@@ -60,8 +57,6 @@ pub struct View<'a> {
     pub clock: &'a str,
     /// 留在胶囊里的 widget（已按 module_order 排好）
     pub items: &'a [WidgetItem],
-    /// 托盘闪烁图标（排在最右）
-    pub flash: &'a [FlashView<'a>],
     pub shape: PillShape,
     /// 界面透明度 0..1（真正乘像素在上屏前 `render::premultiplied_rgba_to_bgra`，
     /// 这里只参与变化检测：滑条一动就得重画）
@@ -75,7 +70,7 @@ pub struct Painted {
     pub h: i32,
     /// 预乘 RGBA（w*h*4）
     pub rgba: Vec<u8>,
-    /// 命中矩形（物理像素）：前 widget_kinds.len() 个是 widget，其余是闪烁图标
+    /// 命中矩形（物理像素），与 widget 一一对应
     pub widget_rects: Vec<[f32; 4]>,
     pub events: Vec<PillEvent>,
 }
@@ -85,7 +80,6 @@ pub struct Painted {
 pub struct PillUi {
     soft: SoftBackend,
     input: InputAcc,
-    prev_flash_hover: Option<usize>,
     last_hash: u64,
     t0: Instant,
 }
@@ -101,7 +95,6 @@ impl PillUi {
         Self {
             soft: SoftBackend::new(),
             input: InputAcc::default(),
-            prev_flash_hover: None,
             last_hash: 0,
             t0: Instant::now(),
         }
@@ -181,7 +174,7 @@ impl PillUi {
 
         let mut rects_pts: Vec<[f32; 4]> = Vec::new();
         let mut events: Vec<PillEvent> = Vec::new();
-        let (mut hov_w, hov_f) = (None, None);
+        let mut hov_w = None;
         // Context 内部是 Arc，clone 出来共享同一上下文（闭包里只读它）
         let ctx = self.soft.ctx().clone();
 
@@ -289,18 +282,6 @@ impl PillUi {
                 });
         });
 
-        // 悬停进出事件（进入发 hover、离开发 leave，wndproc 转发真实托盘）
-        match (hov_f, self.prev_flash_hover) {
-            (Some(i), None) => events.push(PillEvent::FlashEnter(i)),
-            (None, Some(_)) => events.push(PillEvent::FlashLeave),
-            (Some(i), Some(_)) if Some(i) != self.prev_flash_hover => {
-                events.push(PillEvent::FlashLeave);
-                events.push(PillEvent::FlashEnter(i));
-            }
-            _ => {}
-        }
-        self.prev_flash_hover = hov_f;
-
         // ---- 纹理增量 ----
         self.soft.update_textures(&mut out.textures_delta);
 
@@ -318,10 +299,6 @@ impl PillUi {
             mix(&mut hash, it.text.as_bytes());
             mix(&mut hash, &tw.to_bits().to_le_bytes());
         }
-        for f in v.flash {
-            mix(&mut hash, f.rgba);
-            mix(&mut hash, &[f.dim as u8]);
-        }
         mix(&mut hash, &v.alpha.to_bits().to_le_bytes());
         // 圆角半径是全局设置：改了必须重画（否则内容哈希不变会误判成"没变"）
         mix(&mut hash, &crate::settings::corner_radius().to_bits().to_le_bytes());
@@ -329,7 +306,6 @@ impl PillUi {
         mix(&mut hash, &scale.to_bits().to_le_bytes());
         mix(&mut hash, &[matches!(v.shape, PillShape::Float) as u8, matches!(v.shape, PillShape::Island) as u8]);
         mix(&mut hash, &hov_w.map_or(0xffu8, |i| i as u8).to_le_bytes());
-        mix(&mut hash, &hov_f.map_or(0xffu8, |i| i as u8).to_le_bytes());
         mix(&mut hash, &w.to_le_bytes());
         mix(&mut hash, &h.to_le_bytes());
         let changed = hash != self.last_hash || !events.is_empty();

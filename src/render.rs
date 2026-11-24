@@ -126,13 +126,6 @@ pub fn measure_text(text: &[u16], size: f32, kind: FontKind, scale: f32) -> (f32
 
 // ---------- 胶囊绘制 ----------
 
-/// 胶囊右侧的一个托盘闪烁图标（新消息提醒）：图标位图 + 这一帧是否在"灭"。
-/// 灭帧画全透明（格子仍占位），亮帧画真实图标——与 Dock 托盘区的闪烁同一节奏。
-pub struct FlashView<'a> {
-    pub rgba: &'a [u8],
-    pub dim: bool,
-}
-
 /// 胶囊内的一个小 widget：一个符号图标 + 一段短文本
 #[derive(Clone)]
 pub struct WidgetItem {

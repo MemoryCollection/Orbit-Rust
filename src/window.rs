@@ -22,7 +22,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::clipboard::{self, Clipboard};
 use crate::clock;use crate::config as cfg;
-use crate::dock::{self, FlashIcon};
 use crate::hide;
 use crate::lyric::Lyrics;
 use crate::mail::{Badge, Mail};
@@ -32,7 +31,6 @@ use crate::musicbar;
 use crate::panel::{self, Content, WM_ROW_CLICK};
 use crate::render::{self, PanelRow, PillShape, WidgetItem, PIN_BASE, TAB_BASE};
 use crate::settings::{self, LyricPos, ModuleMode, PillAnchor};
-use crate::traymsg;
 use crate::weather::{self, Weather};
 use crate::widgetbar::{self, Side as BarSide, WM_WIDGET_CLICK};
 
@@ -44,8 +42,6 @@ const T_HIDE: usize = 2;
 const T_LYRIC: usize = 4;
 /// 封面旋转用的帧定时器（40ms，只在播放时开着）
 const T_COVER: usize = 5;
-/// 托盘闪烁跟随（Dock 在 70ms 采样真实托盘；这里只比版本号，变了就重绘）
-const T_FLASH: usize = 6;
 
 pub struct App {
     hwnd: HWND,
@@ -57,13 +53,6 @@ pub struct App {
     mouse_tracked: bool,
     widget_rects: Vec<[f32; 4]>,
     widget_kinds: Vec<WidgetKind>,
-    /// 胶囊右侧正在闪烁的托盘图标（Dock 发布的快照，见 `dock::FlashIcon`）
-    flash: Vec<FlashIcon>,
-    /// 上次见到的闪烁快照版本号（变了才重绘）
-    flash_ver: u64,
-    /// 悬停中的闪烁图标下标（相对 flash 的下标）
-    /// 已转发"悬停进入"的闪烁图标下标（离开时要补发 leave）
-    flash_hover_sent: Option<usize>,
     pill: (i32, i32),
     /// 胶囊当前的屏幕左上角
     pos: (i32, i32),
@@ -215,11 +204,6 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     hide::ensure_hidden();
                 } else if w.0 == T_LYRIC || w.0 == T_COVER {
                     app.tick_bar();
-                } else if w.0 == T_FLASH {
-                    // Dock 的 70ms 采样在跟着真实托盘闪；这里只比快照版本号
-                    if dock::flash_version() != app.flash_ver {
-                        app.render();
-                    }
                 }
                 LRESULT(0)
             }
@@ -386,9 +370,6 @@ impl App {
             mouse_tracked: false,
             widget_rects: vec![],
             widget_kinds: vec![],
-            flash: Vec::new(),
-            flash_ver: 0,
-            flash_hover_sent: None,
             pill: (0, 0),
             pos: (0, 0),
             weather: Weather::default(),
@@ -444,14 +425,6 @@ impl App {
         let clock_text = clock::text();
         let Widgets { pill: pill_items, pill_kinds, bars } = self.build_widgets();
 
-        // 托盘闪烁快照：谁在闪就显示谁（灭帧留空位），跟随 Dock 的真实节奏
-        let flash = dock::flash_icons();
-        self.flash_ver = dock::flash_version();
-        let flash_views: Vec<render::FlashView<'_>> = flash
-            .iter()
-            .map(|f| render::FlashView { rgba: &f.rgba, dim: f.dim })
-            .collect();
-
         let shape = match settings::pill_anchor() {
             PillAnchor::Float => PillShape::Float,
             PillAnchor::Island => PillShape::Island,
@@ -460,7 +433,6 @@ impl App {
             scale,
             clock: &clock_text,
             items: &pill_items,
-            flash: &flash_views,
             shape,
             alpha: settings::ui_alpha(),
         });
@@ -469,7 +441,6 @@ impl App {
             self.pill = (out.w, out.h);
             self.widget_rects = out.widget_rects;
             self.widget_kinds = pill_kinds;
-            self.flash = flash;
             // egui 输出是预乘 RGBA；「界面透明度」在换 BGRA 时整帧一起乘
             let bgra = render::premultiplied_rgba_to_bgra(&out.rgba);
             render::present(self.hwnd, &bgra, out.w, out.h);
@@ -494,7 +465,7 @@ impl App {
         // 模块条内容、胶囊本体没变（changed=false），不放外面的话侧边条
         // 要等时钟跳一下才更新，宽度也就一直卡在旧值。
         self.sync_bars(&bars);
-        // 交互事件（widget/闪烁图标的点击与悬停进出）按旧语义分发
+        // 交互事件（widget 点击）按旧语义分发
         for e in events {
             match e {
                 crate::pillui::PillEvent::WidgetClick(i) => {
@@ -502,8 +473,6 @@ impl App {
                         self.on_widget(kind);
                     }
                 }
-                crate::pillui::PillEvent::FlashEnter(i) => self.flash_hover_enter(i),
-                crate::pillui::PillEvent::FlashLeave => self.flash_hover_leave(),
             }
         }
     }
@@ -632,46 +601,6 @@ impl App {
             }
         }
         out
-    }
-
-    /// 闪烁图标**悬停进入**：与 Dock 托盘转发同一套回调消息（hover 事件），
-    /// 并启动 flyout 守位线程把应用自己弹的预览卡片摆到**胶囊下方**——
-    /// 胶囊贴着屏幕顶，卡片放上方会直接出屏。
-    fn flash_hover_enter(&mut self, i: usize) {
-        if !settings::tray_fake_input() {
-            return; // 透明模式：不伪造悬停回调
-        }
-        self.flash_hover_sent = Some(i);
-        let Some(f) = self.flash.get(i) else { return };
-        let Some(raw) = f.target else { return };
-        let t = traymsg::Target::from_raw(raw);
-        let Some(r) = self.widget_rects.get(self.widget_kinds.len() + i) else { return };
-        let cx = self.pos.0 + (r[0] + r[2] / 2.0) as i32;
-        let cy = self.pos.1 + (r[1] + r[3] / 2.0) as i32;
-        crate::tlog!("[pill] 悬停闪烁图标 {}（{}）", f.name, f.key);
-        traymsg::hover(&t, (cx, cy));
-        let cap = RECT {
-            left: self.pos.0,
-            top: self.pos.1,
-            right: self.pos.0 + self.pill.0,
-            bottom: self.pos.1 + self.pill.1,
-        };
-        crate::flyout::watch(t.pid, t.hwnd, cap, (cx, cy), &f.name, true);
-    }
-
-    /// 闪烁图标悬停离开：补发 leave（Dock 同款）
-    fn flash_hover_leave(&mut self) {
-        if !settings::tray_fake_input() {
-            self.flash_hover_sent = None;
-            return;
-        }
-        let Some(i) = self.flash_hover_sent.take() else { return };
-        if let Some(f) = self.flash.get(i) {
-            if let Some(raw) = f.target {
-                let t = traymsg::Target::from_raw(raw);
-                traymsg::leave(&t, (0, 0));
-            }
-        }
     }
 
     // ---------- widget 点击 / 面板 ----------
