@@ -31,21 +31,33 @@ pub fn local() -> String {
     format!("{}.{}", head_str(), VER_BUILD)
 }
 
-/// 把 210 这类数拆成 (head, build)？—— 不，这里解析远端版本文件：
-/// 在文本里找第一个 `x.y.z.d` 形式的行，返回 (前三段合数, 构建号)。
+/// 在文本里找版本号：先按行找整行 `x.y.z.d`；找不到再把整段文本按
+/// 「数字和小数点以外」的字符切开逐令牌找（容错 HTML 错误页里夹带的版本串等）。
 pub fn parse_remote(text: &str) -> Result<(u32, u32), String> {
-    for line in text.lines() {
-        let t = line.trim();
+    let try_tok = |t: &str| -> Option<(u32, u32)> {
         let parts: Vec<&str> = t.split('.').collect();
-        if parts.len() == 4 {
-            if let (Ok(a), Ok(b), Ok(c), Ok(d)) = (
-                parts[0].parse::<u32>(),
-                parts[1].parse::<u32>(),
-                parts[2].parse::<u32>(),
-                parts[3].parse::<u32>(),
-            ) {
-                return Ok((a * 100 + b * 10 + c, d));
-            }
+        if parts.len() != 4 {
+            return None;
+        }
+        if let (Ok(a), Ok(b), Ok(c), Ok(d)) = (
+            parts[0].parse::<u32>(),
+            parts[1].parse::<u32>(),
+            parts[2].parse::<u32>(),
+            parts[3].parse::<u32>(),
+        ) {
+            Some((a * 100 + b * 10 + c, d))
+        } else {
+            None
+        }
+    };
+    for line in text.lines() {
+        if let Some(v) = try_tok(line.trim()) {
+            return Ok(v);
+        }
+    }
+    for tok in text.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        if let Some(v) = try_tok(tok) {
+            return Ok(v);
         }
     }
     Err("版本文件里没有 x.y.z.d 形式的版本号".into())
@@ -93,6 +105,10 @@ mod tests {
         assert_eq!(parse_remote("1.2.9.12123\r\n"), Ok((129, 12123)));
         assert_eq!(parse_remote("# comment\n3.0.0.0\n"), Ok((300, 0)));
         assert!(parse_remote("hello").is_err());
+        // 容错：版本号混在 HTML/错误页文本里也能捞出来
+        assert_eq!(parse_remote("<html>404</html> version=3.2.1.9</body>"), Ok((321, 9)));
+        // 三段号不算版本
+        assert!(parse_remote("raw content v1.2.3 only").is_err());
     }
 
     #[test]

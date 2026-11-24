@@ -647,6 +647,8 @@ struct SettingsApp {
     snap_status: String,
     /// 「检查更新」状态（与后台线程共享；点左下角版本号触发）
     check: Arc<Mutex<CheckState>>,
+    /// 最近一次检查更新实际请求的 URL（失败时悬停可看，便于排查加速前缀/密码配置）
+    check_url_used: String,
 }
 
 #[derive(Default)]
@@ -863,12 +865,12 @@ impl SettingsApp {
                 if let Ok(mut s) = self.check.lock() {
                     *s = CheckState::Running;
                 }
+                self.check_url_used = crate::version::check_url(&settings::update_accel(), &settings::update_pw());
                 let shared = self.check.clone();
+                let shared_url = self.check_url_used.clone();
                 // 网络请求放后台线程，UI 只轮询结果（页面本身每 500ms 重绘一次）
                 std::thread::spawn(move || {
-                    let accel = settings::update_accel();
-                    let pw = settings::update_pw();
-                    let url = crate::version::check_url(&accel, &pw);
+                    let url = shared_url.clone();
                     let result = match crate::net::get(&url, 10000) {
                         Err(e) => CheckState::Fail(e),
                         Ok(body) => match crate::version::parse_remote(&body) {
@@ -920,7 +922,8 @@ impl SettingsApp {
                     egui::RichText::new(format!("检查失败：{msg}"))
                         .size(11.0)
                         .color(argb(cfg::cur().text_dim)),
-                );
+                )
+                .on_hover_text(format!("请求的地址：{}", self.check_url_used));
             }
         }
     }

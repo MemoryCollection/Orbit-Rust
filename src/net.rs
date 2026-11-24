@@ -3,11 +3,42 @@
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
-    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
-    INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
+    WinHttpSetTimeouts, INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
+
+/// `WINHTTP_HEADER_NAME_BY_INDEX` / `WINHTTP_NO_HEADER_INDEX`（SDK 宏 = (句柄)-1，
+/// windows crate 没导出，这里按值补上）
+const BY_INDEX: PCWSTR = PCWSTR(usize::MAX as *const u16);
+const NO_HEADER_INDEX: *mut u32 = usize::MAX as *mut u32;
+
+/// 循环读光响应体（UTF-8 lossy）；空响应报错
+unsafe fn read_body(req: *mut core::ffi::c_void) -> Result<String, String> {
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        let mut avail = 0u32;
+        if WinHttpQueryDataAvailable(req, &mut avail).is_err() || avail == 0 {
+            break;
+        }
+        let mut buf = vec![0u8; avail as usize];
+        let mut read = 0u32;
+        if WinHttpReadData(req, buf.as_mut_ptr().cast(), avail, &mut read).is_err() || read == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..read as usize]);
+        if body.len() > MAX_BODY {
+            break;
+        }
+    }
+    if body.is_empty() {
+        Err("空响应".into())
+    } else {
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+}
 
 /// GET 一个 https URL，返回响应体文本（UTF-8 lossy）。任何失败都返回 Err(原因)。
 pub fn get(url: &str, timeout_ms: i32) -> Result<String, String> {
@@ -59,28 +90,23 @@ pub fn get(url: &str, timeout_ms: i32) -> Result<String, String> {
             Ok(_) => match WinHttpReceiveResponse(req, std::ptr::null_mut()) {
                 Err(e) => Err(format!("ReceiveResponse: {e}")),
                 Ok(_) => {
-                    let mut body: Vec<u8> = Vec::new();
-                    loop {
-                        let mut avail = 0u32;
-                        if WinHttpQueryDataAvailable(req, &mut avail).is_err() || avail == 0 {
-                            break;
-                        }
-                        let mut buf = vec![0u8; avail as usize];
-                        let mut read = 0u32;
-                        if WinHttpReadData(req, buf.as_mut_ptr().cast(), avail, &mut read).is_err()
-                            || read == 0
-                        {
-                            break;
-                        }
-                        body.extend_from_slice(&buf[..read as usize]);
-                        if body.len() > MAX_BODY {
-                            break;
-                        }
-                    }
-                    if body.is_empty() {
-                        Err("空响应".into())
+                    // 先看状态码：非 2xx 的响应体多半是错误页（代理劫持 / 404 等），
+                    // 不检查的话调用方会把 HTML 当文本解析，报出莫名其妙的错
+                    let mut status = 0u32;
+                    let mut st_size = std::mem::size_of::<u32>() as u32;
+                    let st_ok = WinHttpQueryHeaders(
+                        req,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        BY_INDEX,
+                        Some(&mut status as *mut u32 as *mut core::ffi::c_void),
+                        &mut st_size,
+                        NO_HEADER_INDEX,
+                    )
+                    .is_ok();
+                    if st_ok && !(200..300).contains(&status) {
+                        Err(format!("HTTP {status}"))
                     } else {
-                        Ok(String::from_utf8_lossy(&body).into_owned())
+                        read_body(req)
                     }
                 }
             },
