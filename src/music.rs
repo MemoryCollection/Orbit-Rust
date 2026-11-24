@@ -275,12 +275,16 @@ fn query(mgr: &Manager) -> Raw {
     let Ok(session) = mgr.GetCurrentSession() else {
         return Raw::none();
     };
-    let playing = session
+    let status = session
         .GetPlaybackInfo()
         .ok()
-        .and_then(|i| i.PlaybackStatus().ok())
-        .map(|s| s == Status::Playing)
-        .unwrap_or(false);
+        .and_then(|i| i.PlaybackStatus().ok());
+    // 播放器正常退出时会把会话标成 Closed，但会话对象可能还留在管理器里，
+    // 歌名也还能取到——不当回事的话音乐条就会一直挂着上一次的曲目。
+    if status == Some(Status::Closed) {
+        return Raw::none();
+    }
+    let playing = status.map(|s| s == Status::Playing).unwrap_or(false);
 
     let (pos_ms, since_update_ms) = match session.GetTimelineProperties() {
         Ok(t) => {

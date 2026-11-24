@@ -89,6 +89,8 @@ pub struct App {
     angle_at: std::time::Instant,
     /// 上一次的曲目（歌名 + 歌手），换曲时把角度归零
     last_track: (String, String),
+    /// 音乐条从"暂停/停止"开始的挂机时刻：超过 MUSIC_IDLE_HIDE_SECS 整条自动收起
+    music_idle: Option<std::time::Instant>,
     /// 40ms 的旋转定时器是否开着
     anim_on: bool,
     /// 上次见过的设置版本号（设置页面改值后靠它触发重绘）
@@ -400,6 +402,7 @@ impl App {
             angle: 0.0,
             angle_at: std::time::Instant::now(),
             last_track: (String::new(), String::new()),
+            music_idle: None,
             anim_on: false,
             seen_settings: 0,
         }
@@ -778,7 +781,8 @@ impl App {
     }
 
     /// 驱动胶囊旁的音乐条（封面 + 歌词）：换歌/取词/播放进度变化时才动窗口。
-    /// 没有歌曲播放时整条隐藏——原来的音乐 widget 就是这么并进来的。
+    /// 没有歌曲播放时整条隐藏——原来的音乐 widget 就是这么并进来的；
+    /// 暂停/停止挂机超过 MUSIC_IDLE_HIDE_SECS 也收条（播放器退出后会话可能残留）。
     fn tick_bar(&mut self) {
         if !cfg::SHOW_MUSIC {
             musicbar::hide();
@@ -792,12 +796,27 @@ impl App {
             self.cover = None;
             self.angle = 0.0;
             self.last_track = (String::new(), String::new());
+            self.music_idle = None;
             self.set_anim(false);
             return;
         }
 
-        // 换曲：角度归零（封面版本号由 Music 递增，解码在下面按版本做一次）
         let playing = self.music.playing();
+        // 暂停/停止挂机超时就自动收条：播放器退出后 SMTC 会话可能残留
+        // （歌名还在、状态停在暂停），不能让音乐条一直挂着上一次的曲目；
+        // 恢复播放后 T_LYRIC 定时器会带着新状态把它再显示出来
+        if cfg::MUSIC_IDLE_HIDE_SECS > 0 && !playing {
+            let idle = self.music_idle.get_or_insert_with(std::time::Instant::now);
+            if idle.elapsed() >= std::time::Duration::from_secs(cfg::MUSIC_IDLE_HIDE_SECS) {
+                musicbar::hide();
+                self.set_anim(false);
+                return;
+            }
+        } else {
+            self.music_idle = None;
+        }
+
+        // 换曲：角度归零（封面版本号由 Music 递增，解码在下面按版本做一次）
         let track_changed = match self.music.now.as_ref() {
             Some(n) => n.title != self.last_track.0 || n.artist != self.last_track.1,
             None => false,

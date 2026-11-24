@@ -303,6 +303,9 @@ pub const MUSIC_BTN_RATIO: f32 = 0.62;
 pub const COVER_DEG_PER_SEC: f32 = 45.0;
 /// 没有专辑封面时的占位音符
 pub const MUSIC_PLACEHOLDER: &str = "♪";
+/// 音乐条自动隐藏：暂停/停止连续超过这个秒数就把整条收起（0 = 不自动隐藏）。
+/// 播放器退出后 SMTC 会话有时不会立刻消失（残留歌名 + 暂停态），靠这个兜底收条。
+pub const MUSIC_IDLE_HIDE_SECS: u64 = 10;
 
 // ---------- 剪贴板面板 ----------
 
