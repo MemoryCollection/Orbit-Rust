@@ -2,11 +2,11 @@
 //! 所有值都写回 `settings.rs`（= `<exe>/data/settings.txt`），改完立刻生效，
 //! 胶囊 / 模块条 / Dock 靠 `settings::version()` 感知变化后重绘。
 //!
-//! 布局：左 = 分组导航（常规 / 顶部胶囊 / 通知 / 功能模块 / Dock / 开始菜单 / 微信），
+//! 布局：左 = 分组导航（常规 / 顶部胶囊 / 通知 / 天气 / 邮箱 / 剪贴板 / Dock / 开始菜单 / 微信），
 //! 右 = 所选分组的详细设置（组内滚动）。窗口尺寸固定，打开时主屏居中。
+//! - 天气 / 邮箱 / 剪贴板各占一个分组：模块的「显示开关 + 位置」与模块自身的设置都收在同一组内
 //! - 邮箱：多账号管理，内置常用服务器预设（QQ/163/Gmail/Outlook），
 //!   「测试连通」通过后打 ✓ 标记并持久化
-//! - 模块芯片：拖动排序、点击循环 胶囊 → 左条 → 右条 → 隐藏
 //! - 托盘图标：统一列表（一行完成 显示/隐藏 + 图标指定 + ▲▼ 排序），「返回桌面」固定第一行
 //! - 开始菜单：Win 键接管、每行列数、快捷方式增删排序（拖动行首圆点或 ↑↓，「快速添加」一键加任务管理器）
 //!
@@ -33,7 +33,7 @@ use eframe::egui;
 use crate::clock;
 use crate::config as cfg;
 use crate::egui_soft;
-use crate::settings::{self, DockAnchor, LyricPos, ModuleMode, PillAnchor, WeatherSource};
+use crate::settings::{self, DockAnchor, LyricPos, PillAnchor, WeatherSource};
 
 const TITLE: &str = "Orbit 设置";
 /// 窗口总宽（固定尺寸，内容超出走组内滚动）
@@ -555,18 +555,22 @@ enum Group {
     General,
     Pill,
     Notify,
-    Modules,
+    Weather,
+    Mail,
+    Clipboard,
     Dock,
     Start,
     Wechat,
 }
 
 impl Group {
-    const ALL: [Group; 7] = [
+    const ALL: [Group; 9] = [
         Group::General,
         Group::Pill,
         Group::Notify,
-        Group::Modules,
+        Group::Weather,
+        Group::Mail,
+        Group::Clipboard,
         Group::Dock,
         Group::Start,
         Group::Wechat,
@@ -576,7 +580,9 @@ impl Group {
             Group::General => "常规",
             Group::Pill => "顶部胶囊",
             Group::Notify => "通知",
-            Group::Modules => "功能模块",
+            Group::Weather => "天气",
+            Group::Mail => "邮箱",
+            Group::Clipboard => "剪贴板",
             Group::Dock => "Dock",
             Group::Start => "开始菜单",
             Group::Wechat => "微信",
@@ -819,7 +825,9 @@ impl SettingsApp {
             Group::General => self.detail_general(ui, ver_changed),
             Group::Pill => self.detail_pill(ui, ver_changed),
             Group::Notify => self.detail_notify(ui, ver_changed),
-            Group::Modules => self.detail_modules(ui, ver_changed),
+            Group::Weather => self.detail_weather(ui, ver_changed),
+            Group::Mail => self.detail_mail(ui, ver_changed),
+            Group::Clipboard => self.detail_clipboard(ui, ver_changed),
             Group::Dock => self.detail_dock(ui),
             Group::Start => self.detail_start(ui),
             Group::Wechat => self.detail_wechat(ui, ver_changed),
@@ -2033,21 +2041,31 @@ impl SettingsApp {
                 .size(11.5)
                 .weak(),
         );
+    }
 
-        ui.add_space(10.0);
-        section(ui, "模块排序");
-        self.chips(ui);
+    /// 天气：桌面天气卡片（右上角常驻）。开关 + 字号/配色/数据源/Key 都在本分组。
+    fn detail_weather(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+        // 开关 + 位置：天气是独立桌面卡片，只留 显示/隐藏 开关（无 胶囊/左条/右条）
+        section(ui, "显示");
+        let off = settings::module_mode("weather") == settings::ModuleMode::Off;
+        if let Some(i) = seg(ui, &["显示", "隐藏"], if off { 1 } else { 0 }) {
+            settings::set_module_mode(
+                "weather",
+                if i == 1 { settings::ModuleMode::Off } else { settings::ModuleMode::Pill },
+            );
+            crate::tlog!(
+                "[settings] 天气卡片 → {}",
+                if i == 1 { "隐藏" } else { "显示" }
+            );
+        }
         ui.label(
-            egui::RichText::new("下拉选择位置：胶囊 / 左条 / 右条 / 隐藏；▲▼ 调整顺序")
+            egui::RichText::new("天气卡片常驻桌面右上角（跟随壁纸明暗自动配色）")
                 .size(11.5)
                 .weak(),
         );
-    }
 
-    /// 功能模块：天气卡片 / 剪切板 / 邮件——Orbit 的独立附加功能模块，
-    /// 各自有独立面板或卡片，不再归在「顶部胶囊」下。
-    fn detail_modules(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
-        section(ui, "天气");
+        ui.add_space(10.0);
+        section(ui, "天气设置");
         egui::Grid::new("g_weather")
             .num_columns(2)
             .spacing([10.0, 8.0])
@@ -2102,32 +2120,56 @@ impl SettingsApp {
                 .size(11.5)
                 .weak(),
         );
+    }
+
+    /// 邮箱：显示位置 + 多账号管理（添加 / 编辑 / 移除 / 测试连通 / 连通标记持久化）
+    fn detail_mail(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+        // 开关 + 位置：邮箱可显示在 胶囊 / 左条 / 右条，或隐藏
+        section(ui, "显示位置");
+        let mode = settings::module_mode("mail");
+        let idx = match mode {
+            settings::ModuleMode::Pill => 0,
+            settings::ModuleMode::BarLeft => 1,
+            settings::ModuleMode::BarRight => 2,
+            settings::ModuleMode::Off => 3,
+        };
+        if let Some(i) = seg(ui, &["胶囊", "左条", "右条", "隐藏"], idx) {
+            let m = match i {
+                1 => settings::ModuleMode::BarLeft,
+                2 => settings::ModuleMode::BarRight,
+                3 => settings::ModuleMode::Off,
+                _ => settings::ModuleMode::Pill,
+            };
+            settings::set_module_mode("mail", m);
+        }
 
         ui.add_space(10.0);
-        section(ui, "剪切板");
-        egui::Grid::new("g_clip")
-            .num_columns(2)
-            .spacing([10.0, 8.0])
-            .show(ui, |ui| {
-                ui.label(row_label("显示"));
-                let mode = settings::module_mode("clipboard");
-                let idx = match mode {
-                    settings::ModuleMode::Pill => 0,
-                    settings::ModuleMode::BarLeft => 1,
-                    settings::ModuleMode::BarRight => 2,
-                    settings::ModuleMode::Off => 3,
-                };
-                if let Some(i) = seg(ui, &["胶囊", "左条", "右条", "隐藏"], idx) {
-                    let m = match i {
-                        1 => settings::ModuleMode::BarLeft,
-                        2 => settings::ModuleMode::BarRight,
-                        3 => settings::ModuleMode::Off,
-                        _ => settings::ModuleMode::Pill,
-                    };
-                    settings::set_module_mode("clipboard", m);
-                }
-                ui.end_row();
-            });
+        self.mail_accounts_ui(ui, ver_changed);
+    }
+
+    /// 剪贴板：显示位置 + 显示内容 / 常驻文字
+    fn detail_clipboard(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
+        // 开关 + 位置：剪贴板可显示在 胶囊 / 左条 / 右条，或隐藏
+        section(ui, "显示位置");
+        let mode = settings::module_mode("clipboard");
+        let idx = match mode {
+            settings::ModuleMode::Pill => 0,
+            settings::ModuleMode::BarLeft => 1,
+            settings::ModuleMode::BarRight => 2,
+            settings::ModuleMode::Off => 3,
+        };
+        if let Some(i) = seg(ui, &["胶囊", "左条", "右条", "隐藏"], idx) {
+            let m = match i {
+                1 => settings::ModuleMode::BarLeft,
+                2 => settings::ModuleMode::BarRight,
+                3 => settings::ModuleMode::Off,
+                _ => settings::ModuleMode::Pill,
+            };
+            settings::set_module_mode("clipboard", m);
+        }
+
+        ui.add_space(10.0);
+        section(ui, "剪贴板设置");
         ui.horizontal(|ui| {
             ui.label(row_label("常驻文字"));
             let r = ui.add_sized(
@@ -2143,14 +2185,11 @@ impl SettingsApp {
                 self.edits.clipboard_pinned = settings::clipboard_pinned_text();
             }
         });
-
-        ui.add_space(10.0);
-        self.mail_accounts_ui(ui, ver_changed);
     }
 
     /// 邮件：多账号管理（添加 / 编辑 / 移除 / 测试连通 / 连通标记持久化）
     fn mail_accounts_ui(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
-        section(ui, "邮件");
+        section(ui, "邮箱账号");
         ui.label(
             egui::RichText::new("可保存多个邮箱账号同时监听；连通测试通过后会打上 ✓ 标记并记住，不用每次重测")
                 .size(11.5)
@@ -2853,105 +2892,6 @@ impl SettingsApp {
         ui.separator();
         ui.add_space(10.0);
     }
-
-    /// 模块位置/隐藏：每模块一行，位置下拉 + 上下移按钮（替代原来的「点击芯片循环 + 拖动换位」）。
-    fn chips(&mut self, ui: &mut egui::Ui) {
-        // 位置选项：胶囊 / 左条 / 右条 / 隐藏，与 ModuleMode 一一对应
-        const POSITIONS: [(&str, ModuleMode); 4] = [
-            ("胶囊", ModuleMode::Pill),
-            ("左条", ModuleMode::BarLeft),
-            ("右条", ModuleMode::BarRight),
-            ("隐藏", ModuleMode::Off),
-        ];
-
-        let order = settings::module_order();
-        let n = order.len();
-        for (idx, name) in order.iter().enumerate() {
-            let m = settings::module_mode(name);
-            // 下拉当前选中项的显示名
-            let cur_label = POSITIONS
-                .iter()
-                .find(|(_, mm)| *mm == m)
-                .map(|(l, _)| *l)
-                .unwrap_or("胶囊");
-
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                // 模块名（固定宽度对齐），邮件胶囊模式补一句说明
-                let mut label = module_label(name).to_string();
-                if name == "mail" && m == ModuleMode::Pill {
-                    label.push_str("（有新邮件时）");
-                }
-                ui.add_sized(
-                    [64.0, 22.0],
-                    egui::Label::new(egui::RichText::new(label).size(12.5)),
-                );
-
-                if name == "weather" {
-                    // 天气已移出胶囊，改为桌面右上角常驻卡片：没有 胶囊/左条/右条
-                    // 可选，只留一个 显示/隐藏 开关
-                    let off = m == ModuleMode::Off;
-                    if let Some(i) = seg(ui, &["显示", "隐藏"], if off { 1 } else { 0 }) {
-                        settings::set_module_mode(
-                            name,
-                            if i == 1 { ModuleMode::Off } else { ModuleMode::Pill },
-                        );
-                        crate::tlog!(
-                            "[settings] 天气卡片 → {}",
-                            if i == 1 { "隐藏" } else { "显示" }
-                        );
-                    }
-                    ui.label(
-                        egui::RichText::new("常驻桌面右上角").size(11.5).weak(),
-                    );
-                    return; // 天气不参与胶囊排序，不需要 上下移
-                }
-
-                // 位置下拉
-                egui::ComboBox::from_id_salt(format!("mod_pos_{name}"))
-                    .width(92.0)
-                    .selected_text(cur_label)
-                    .show_ui(ui, |ui| {
-                        for (lbl, mm) in POSITIONS {
-                            if ui
-                                .selectable_label(m == mm, egui::RichText::new(lbl).size(12.5))
-                                .clicked()
-                            {
-                                settings::set_module_mode(name, mm);
-                                crate::tlog!("[settings] 模块 {name} → {mm:?}");
-                            }
-                        }
-                    });
-
-                // 上下移（第一项不能上移，最后一项不能下移）
-                ui.add_enabled_ui(idx > 0, |ui| {
-                    if ui.add(egui::Button::new("▲").small()).clicked() {
-                        let mut o = settings::module_order();
-                        o.swap(idx, idx - 1);
-                        settings::set_module_order(o);
-                        crate::tlog!("[settings] 模块顺序 → {:?}", settings::module_order());
-                    }
-                });
-                ui.add_enabled_ui(idx + 1 < n, |ui| {
-                    if ui.add(egui::Button::new("▼").small()).clicked() {
-                        let mut o = settings::module_order();
-                        o.swap(idx, idx + 1);
-                        settings::set_module_order(o);
-                        crate::tlog!("[settings] 模块顺序 → {:?}", settings::module_order());
-                    }
-                });
-            });
-        }
-
-        // 时间 · 日期固定在最前，不参与排序
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.add_sized([64.0, 22.0], egui::Label::new(egui::RichText::new("时间 · 日期").size(12.5)));
-            ui.label(
-                egui::RichText::new("固定显示在胶囊最前").size(11.5).weak(),
-            );
-        });
-    }
 }
 
 // ---------- 小部件 ----------
@@ -3173,14 +3113,6 @@ fn stepper(ui: &mut egui::Ui, value: &str, can_dec: bool, can_inc: bool) -> Opti
         }
     });
     out
-}
-
-fn module_label(name: &str) -> &'static str {
-    match name {
-        "weather" => "天气",
-        "mail" => "邮箱",
-        _ => "剪贴板",
-    }
 }
 
 // ---------- 托盘列表 ----------

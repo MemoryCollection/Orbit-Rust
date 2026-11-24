@@ -456,7 +456,7 @@ pub const MODULES: [&str; 3] = ["weather", "mail", "clipboard"];
 fn mode_static(name: &str) -> (u32, u32) {
     // (加载后的值, 缺省值)
     match name {
-        "weather" => (WEATHER_MODE.load(Ordering::Relaxed), ModuleMode::BarLeft.code()),
+        "weather" => (WEATHER_MODE.load(Ordering::Relaxed), ModuleMode::Off.code()),
         "mail" => (MAIL_MODE.load(Ordering::Relaxed), ModuleMode::BarRight.code()),
         "clipboard" => (CLIPBOARD_MODE.load(Ordering::Relaxed), ModuleMode::BarRight.code()),
         _ => (UNLOADED, ModuleMode::Pill.code()),
@@ -477,6 +477,9 @@ pub fn module_order() -> Vec<String> {
     MODULE_ORDER.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
+/// 写回模块排列（去重、保序、补漏）。模块拆成独立分组后不再有 ▲▼ 排序入口，
+/// 保留给未来可能的排序 UI；`module_order()` 的读取仍被胶囊内排序使用。
+#[allow(dead_code)]
 pub fn set_module_order(order: Vec<String>) {
     let mut cleaned: Vec<String> = Vec::new();
     for name in order {
@@ -2442,7 +2445,7 @@ clock_format=%H:%M %m月%d日 %a
 # 顶部胶囊模块排列（拖动排序写回；时间日期固定在最前，不参与排序）
 module_order=weather,mail,clipboard
 # 模块摆哪：pill（留在胶囊里）/ left（胶囊左侧一条）/ right（右侧一条）/ off（隐藏）
-weather_mode=left
+weather_mode=off
 mail_mode=right
 clipboard_mode=right
 # 界面透明度（0.2 ~ 1.0）：胶囊（含分离模块条 / 音乐条）/ Dock / 展开面板 /
@@ -2570,7 +2573,7 @@ fn append_missing() {
     for (key, line) in [
         ("clock_format", "# 顶部胶囊时钟格式串（strftime 风格，占位符见 docs）\nclock_format=%H:%M %m月%d日 %a\n"),
         ("module_order", "# 顶部胶囊模块排列（拖动排序写回）\nmodule_order=weather,mail,clipboard\n"),
-        ("weather_mode", "# 模块摆哪：pill / left / right / off\nweather_mode=left\nmail_mode=right\nclipboard_mode=right\n"),
+        ("weather_mode", "# 模块摆哪：pill / left / right / off\nweather_mode=off\nmail_mode=right\nclipboard_mode=right\n"),
         (
             "alpha",
             "# 界面透明度（0.2 ~ 1.0）：胶囊 / 模块条 / 音乐条 / Dock / 面板 / 开始菜单 / 横幅共用\n\
