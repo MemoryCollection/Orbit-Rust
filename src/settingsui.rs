@@ -564,16 +564,18 @@ enum Group {
 }
 
 impl Group {
+    /// 左侧导航顺序（用户指定）：常规 → 通知 → 微信 → 天气 → 邮箱 →
+    /// 顶部胶囊 → Dock → 剪贴板 → 开始菜单
     const ALL: [Group; 9] = [
         Group::General,
-        Group::Pill,
         Group::Notify,
+        Group::Wechat,
         Group::Weather,
         Group::Mail,
-        Group::Clipboard,
+        Group::Pill,
         Group::Dock,
+        Group::Clipboard,
         Group::Start,
-        Group::Wechat,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -596,6 +598,17 @@ enum TestState {
     #[default]
     Idle,
     Running,
+    Ok(String),
+    Fail(String),
+}
+
+/// 「检查更新」的状态（后台线程写，UI 线程读）
+#[derive(Clone, Default)]
+enum CheckState {
+    #[default]
+    Idle,
+    Running,
+    /// 已是最新 / 发现新版本（带远端版本号）
     Ok(String),
     Fail(String),
 }
@@ -632,6 +645,8 @@ struct SettingsApp {
     pin_admin: bool,
     /// 微信快照操作的反馈信息（保存/恢复/快捷方式/删除的结果）
     snap_status: String,
+    /// 「检查更新」状态（与后台线程共享；点左下角版本号触发）
+    check: Arc<Mutex<CheckState>>,
 }
 
 #[derive(Default)]
@@ -655,6 +670,9 @@ struct Edits {
     port: String,
     user: String,
     pass: String,
+    /// 检查更新：GitHub 加速前缀 / 访问密码
+    update_accel: String,
+    update_pw: String,
 }
 
 impl eframe::App for SettingsApp {
@@ -740,6 +758,12 @@ impl eframe::App for SettingsApp {
                                     self.group = g;
                                 }
                             }
+                            // 底部剩余空间：版本号钉死在左下角，点击检查更新
+                            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                                ui.set_width(NAV_W);
+                                ui.add_space(10.0);
+                                self.version_ui(ui);
+                            });
                         });
                         // 导航列右侧的竖线（原来是 horizontal 里的 separator）
                         let r = ui.max_rect();
@@ -816,9 +840,90 @@ impl SettingsApp {
             .unwrap_or_else(|| cfg::MAIL_PORT.to_string());
         self.edits.user = u.unwrap_or_default();
         self.edits.pass = w.unwrap_or_default();
+        self.edits.update_accel = settings::update_accel();
+        self.edits.update_pw = settings::update_pw();
     }
 
     // ---------- 右侧详情（按分组） ----------
+
+    /// 左下角版本号：显示 v2.1.0.0，点击后台拉 GitHub 上的 version.txt 比对。
+    /// 加速前缀 / 访问密码在「常规」页设置，留空则直连 GitHub。
+    fn version_ui(&mut self, ui: &mut egui::Ui) {
+        let st = self.check.lock().map(|s| s.clone()).unwrap_or_default();
+        let txt = egui::RichText::new(format!("v{}", crate::version::local()))
+            .size(11.5)
+            .color(argb(cfg::cur().text_dim));
+        let resp = ui
+            .add(egui::Label::new(txt).sense(egui::Sense::click()))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("点击检查更新（GitHub 仓库 version.txt）");
+        if resp.clicked() {
+            let already_running = matches!(st, CheckState::Running);
+            if !already_running {
+                if let Ok(mut s) = self.check.lock() {
+                    *s = CheckState::Running;
+                }
+                let shared = self.check.clone();
+                // 网络请求放后台线程，UI 只轮询结果（页面本身每 500ms 重绘一次）
+                std::thread::spawn(move || {
+                    let accel = settings::update_accel();
+                    let pw = settings::update_pw();
+                    let url = crate::version::check_url(&accel, &pw);
+                    let result = match crate::net::get(&url, 10000) {
+                        Err(e) => CheckState::Fail(e),
+                        Ok(body) => match crate::version::parse_remote(&body) {
+                            Err(e) => CheckState::Fail(e),
+                            Ok(rv) => {
+                                if crate::version::remote_is_newer(rv) {
+                                    CheckState::Ok(format!(
+                                        "发现新版本 {}.{}.{}.{}",
+                                        rv.0 / 100,
+                                        rv.0 / 10 % 10,
+                                        rv.0 % 10,
+                                        rv.1
+                                    ))
+                                } else {
+                                    CheckState::Ok("已是最新版本".into())
+                                }
+                            }
+                        },
+                    };
+                    if let Ok(mut s) = shared.lock() {
+                        *s = result;
+                    }
+                });
+            }
+        }
+        // 状态一行小字：跑着时提示，结束后短暂显示结果
+        match &st {
+            CheckState::Idle => {}
+            CheckState::Running => {
+                ui.label(
+                    egui::RichText::new("检查更新中…").size(11.0).color(argb(cfg::cur().text_dim)),
+                );
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+            }
+            CheckState::Ok(msg) => {
+                let newer = msg.starts_with("发现");
+                ui.label(
+                    egui::RichText::new(msg.as_str())
+                        .size(11.0)
+                        .color(if newer {
+                            ok_green()
+                        } else {
+                            argb(cfg::cur().text_dim)
+                        }),
+                );
+            }
+            CheckState::Fail(msg) => {
+                ui.label(
+                    egui::RichText::new(format!("检查失败：{msg}"))
+                        .size(11.0)
+                        .color(argb(cfg::cur().text_dim)),
+                );
+            }
+        }
+    }
 
     fn detail(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
         match self.group {
@@ -835,7 +940,7 @@ impl SettingsApp {
     }
 
     /// 常规设置：字体 / 外观（主题 + 透明度·大小·形状·位置）/ 系统（开机启动、退出守护）
-    fn detail_general(&mut self, ui: &mut egui::Ui, _ver_changed: bool) {
+    fn detail_general(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
         // 字体放最上面：一换字体整页字全变，第一眼就能看出效果
         section(ui, "界面字体");
         if let Some(pick) = seg(
@@ -1080,6 +1185,44 @@ impl SettingsApp {
         });
         ui.label(
             egui::RichText::new("守护随 orbit 启动；开关在下次启动 orbit 时生效。正常退出（Ctrl+Alt+O）不触发复活；异常 / panic 退出时守护会自动复活 orbit（连续最多 3 次，复活成功或正常退出后计数清零）")
+                .size(11.5)
+                .weak(),
+        );
+
+        ui.add_space(10.0);
+        section(ui, "检查更新");
+        // GitHub 加速前缀：拼在完整链接前面（加速站/原始 GitHub 完整链接）
+        ui.horizontal(|ui| {
+            ui.label(row_label("加速连接"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.update_accel)
+                    .hint_text("留空直连 GitHub；填加速站地址，拼在完整链接前面"),
+            );
+            if r.lost_focus() && self.edits.update_accel != settings::update_accel() {
+                settings::set_update_accel(&self.edits.update_accel);
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.update_accel = settings::update_accel();
+            }
+        });
+        // 加速站访问密码：拼在链接最后（...?pw=密码）
+        ui.horizontal(|ui| {
+            ui.label(row_label("访问密码"));
+            let r = ui.add_sized(
+                [CTRL_W, 24.0],
+                egui::TextEdit::singleline(&mut self.edits.update_pw)
+                    .hint_text("留空不带；填了就拼在链接最后（?pw=…）"),
+            );
+            if r.lost_focus() && self.edits.update_pw != settings::update_pw() {
+                settings::set_update_pw(&self.edits.update_pw);
+            }
+            if ver_changed && !r.has_focus() {
+                self.edits.update_pw = settings::update_pw();
+            }
+        });
+        ui.label(
+            egui::RichText::new("点左下角版本号即可检查更新：最终请求 = 加速前缀 + GitHub 版本文件地址 + ?pw=密码，前缀与密码留空则直连")
                 .size(11.5)
                 .weak(),
         );

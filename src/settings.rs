@@ -151,6 +151,10 @@ static WEATHER_SOURCE: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 天气卡片配色方案：0 = 自动跟壁纸（默认）/ 1 = 深色背景（浅色字）/ 2 = 浅色背景（深色字）
 static WEATHER_SCHEME: AtomicU32 = AtomicU32::new(UNLOADED);
 static AMAP_KEY: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+/// 更新加速前缀（空 = 直连 GitHub）
+static UPDATE_ACCEL: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+/// 加速站访问密码（拼在链接末尾 ?pw=...；空 = 不带）
+static UPDATE_PW: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 /// 邮箱账号（空字符串 = 回落 mail.txt / 编译期默认）
 static IMAP_HOST: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 static IMAP_PORT: AtomicU32 = AtomicU32::new(UNLOADED);
@@ -896,6 +900,40 @@ pub fn set_amap_key(k: &str) {
     }
     if let Ok(mut v) = AMAP_KEY.lock() {
         *v = k;
+    }
+    save();
+    bump();
+}
+
+/// 检查更新用的 GitHub 加速前缀（空 = 直连）
+pub fn update_accel() -> String {
+    UPDATE_ACCEL.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+pub fn set_update_accel(v: &str) {
+    let v = v.trim().to_string();
+    if v == update_accel() {
+        return;
+    }
+    if let Ok(mut s) = UPDATE_ACCEL.lock() {
+        *s = v;
+    }
+    save();
+    bump();
+}
+
+/// 加速站访问密码（空 = 不带 ?pw=）
+pub fn update_pw() -> String {
+    UPDATE_PW.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+pub fn set_update_pw(v: &str) {
+    let v = v.trim().to_string();
+    if v == update_pw() {
+        return;
+    }
+    if let Ok(mut s) = UPDATE_PW.lock() {
+        *s = v;
     }
     save();
     bump();
@@ -2106,6 +2144,8 @@ fn save() {
         ("dock_anchor", dock_anchor().as_str().to_string()),
         ("weather_source", weather_source().as_str().to_string()),
         ("amap_key", key),
+        ("update_accel", update_accel()),
+        ("update_pw", update_pw()),
         ("imap_host", ih),
         ("imap_port", if ip == UNLOADED { String::new() } else { ip.to_string() }),
         ("imap_user", iu),
@@ -2504,6 +2544,11 @@ tray_order=
 # 开始菜单（Win 键弹出）快捷方式：`名称|程序路径`，分号分隔；删掉本行恢复默认「命令提示符(管理员)」
 # 路径前缀 @admin: 表示以管理员权限启动（ShellExecute runas）
 start_pins=命令提示符(管理员)|@admin:C:\\Windows\\System32\\cmd.exe
+# ===== 检查更新（设置页左下角点版本号）=====
+# GitHub 加速前缀（留空 = 直连 GitHub），拼在完整链接前面
+update_accel=
+# 加速站访问密码（拼在链接最后 ?pw=...；两边都留空 = 直连且不带密码）
+update_pw=
 # 开机启动：写注册表 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run（1 = 开，默认）
 autostart=1
 # 退出守护：orbit 被强杀（任务栏没恢复）时由守护进程重启 explorer 恢复任务栏（1 = 开，默认）
@@ -2651,6 +2696,11 @@ fn append_missing() {
         ),
         ("clipboard_pinned", "# 剪切板面板常驻置顶文字\nclipboard_pinned=\n"),
         (
+            "update_accel",
+            "# 检查更新的 GitHub 加速前缀（留空 = 直连），拼在完整链接前面\n\
+             update_accel=\n# 加速站访问密码（拼在链接最后 ?pw=...；留空不带）\nupdate_pw=\n",
+        ),
+        (
             "start_hook",
             "# 开始菜单：Win 键接管（1 = 接管，默认）/ 每行个数（1 ~ 8）\n\
              start_hook=1\nstart_cols=4\n",
@@ -2741,6 +2791,9 @@ fn load() {
     let mut shook = true;
     let mut takeover = false;
     let mut scols = 4usize;
+    // 检查更新：加速前缀 / 访问密码（None = 文件里没这个键，保留内存值）
+    let mut uaccel: Option<String> = None;
+    let mut upw: Option<String> = None;
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -3004,6 +3057,8 @@ fn load() {
                     .collect();
             }
             "clipboard_pinned" => clip_pin = v.to_string(),
+            "update_accel" => uaccel = Some(v.to_string()),
+            "update_pw" => upw = Some(v.to_string()),
             "start_hook" => {
                 if let Some(b) = parse_bool(v) { shook = b; }
             }
@@ -3107,6 +3162,16 @@ fn load() {
     if let Some(p) = ipass {
         if let Ok(mut v) = IMAP_PASS.lock() {
             *v = p;
+        }
+    }
+    if let Some(v) = uaccel {
+        if let Ok(mut s) = UPDATE_ACCEL.lock() {
+            *s = v;
+        }
+    }
+    if let Some(v) = upw {
+        if let Ok(mut s) = UPDATE_PW.lock() {
+            *s = v;
         }
     }
     SHOW_TRAY.store(bool_code(tray), Ordering::Relaxed);

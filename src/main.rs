@@ -51,6 +51,7 @@ mod wechatsnap;
 mod weather;
 mod weathercard;
 mod widgetbar;
+mod version;
 
 mod window;
 
