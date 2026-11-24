@@ -22,7 +22,8 @@ pub struct DockPainted {
     pub desktop_rect: Option<[f32; 4]>,
 }
 
-/// 右侧"返回桌面"按钮占掉的总宽度（逻辑点，含与图标区的间距）。
+/// 右端"返回桌面"细长条占掉的总宽度（逻辑点，含与图标区的间距）。
+/// 只在右端占位：条平时透明不画，左端不再镜像一块空白，免得两边一起空一大截。
 fn desktop_side(show_desktop: bool) -> f32 {
     if show_desktop {
         cfg::DOCK_DESKTOP_W + cfg::DOCK_DESKTOP_GAP
@@ -52,18 +53,15 @@ pub fn wave_mag(cursor_axis: Option<f32>, axis: f32) -> f32 {
 
 /// 第 i 个应用图标的主轴中心（底板坐标，k=1 逻辑点）。
 /// 与 paint 的排布严格一致：paint 用同一个函数取 axis，不会两处漂移。
-pub fn icon_axis(i: usize, show_desktop: bool) -> f32 {
-    cfg::DOCK_PAD_X
-        + desktop_side(show_desktop)
-        + i as f32 * (cfg::DOCK_SLOT + cfg::DOCK_GAP)
-        + cfg::DOCK_SLOT * 0.5
+/// 图标组从左端内边距起排（右端细长条不再在左端镜像占位）。
+pub fn icon_axis(i: usize) -> f32 {
+    cfg::DOCK_PAD_X + i as f32 * (cfg::DOCK_SLOT + cfg::DOCK_GAP) + cfg::DOCK_SLOT * 0.5
 }
 
 /// 第 j 个托盘图标的主轴中心。任务组与托盘组之间隔一个普通间距
 /// （分隔线画在间隙里，paint 里 -gap/+gap 一去一回正好是 n*(slot+gap)）。
-pub fn tray_axis(j: usize, n_apps: usize, show_desktop: bool) -> f32 {
+pub fn tray_axis(j: usize, n_apps: usize) -> f32 {
     let base = cfg::DOCK_PAD_X
-        + desktop_side(show_desktop)
         + if n_apps > 0 { n_apps as f32 * (cfg::DOCK_SLOT + cfg::DOCK_GAP) } else { 0.0 };
     base + j as f32 * (cfg::DOCK_TRAY_SLOT + cfg::DOCK_TRAY_GAP) + cfg::DOCK_TRAY_SLOT * 0.5
 }
@@ -144,7 +142,8 @@ pub fn dock_size(
     let slot = cfg::DOCK_SLOT;
     let gap = cfg::DOCK_GAP;
     let side = desktop_side(show_desktop);
-    let mut len = pad * 2.0 + side * 2.0 + n as f32 * slot + n.saturating_sub(1) as f32 * gap;
+    // 右端细长条只在尾部占位（左端不镜像），整条收紧
+    let mut len = pad * 2.0 + side + n as f32 * slot + n.saturating_sub(1) as f32 * gap;
     if show_tray && n_tray > 0 {
         // 任务组与托盘组之间也只隔一个普通间距（分隔线画在间隙里，不额外占宽）
         if n > 0 {
@@ -259,8 +258,8 @@ impl DockView {
                     grad_quad(&p, a, b, 1.0, argb(cfg::cur().dock_glow), argb(cfg::cur().dock_glow));
                 }
 
-                // 沿主轴排布；首端留细长条等长占位
-                let mut pos = pad + desktop_side(show_desktop);
+                // 沿主轴排布：图标组从左端内边距起排，右端细长条只在尾部占位
+                let mut pos = pad;
                 for (i, buf) in icons.iter().enumerate() {
                     let rc = (cross - slot) / 2.0;
                     let (rx, ry) = if vertical { (rc, pos) } else { (pos, rc) };
@@ -268,7 +267,7 @@ impl DockView {
                     rects_pt.push([rx, ry, slot, slot]);
                     // 波浪放大：中心沿主轴按槽位算（几何只此一处，见 icon_axis），
                     // 放大倍数随光标距离衰减。
-                    let axis = icon_axis(i, show_desktop);
+                    let axis = icon_axis(i);
                     let mag = wave_mag(cursor_axis, axis);
                     let side = isz * mag;
                     let rise = (cross * 0.5) * (mag - 1.0) / cfg::DOCK_WAVE_AMP;
@@ -338,7 +337,7 @@ impl DockView {
                         let (rx, ry) = if vertical { (rc, pos) } else { (pos, rc) };
                         tray_rects_pt.push([rx, ry, tslot, tslot]);
                         // 托盘图标与任务图标同一套波浪放大（大小已统一）
-                        let t_axis = tray_axis(i, icons.len(), show_desktop);
+                        let t_axis = tray_axis(i, icons.len());
                         let t_mag = wave_mag(cursor_axis, t_axis);
                         let t_side = tisz * t_mag;
                         let t_rise = (cross * 0.5) * (t_mag - 1.0) / cfg::DOCK_WAVE_AMP;

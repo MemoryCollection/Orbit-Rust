@@ -1400,7 +1400,6 @@ impl Dock {
             }
             return;
         }
-        let show_desktop = settings::show_desktop_btn();
         let (text, rect, axis) = if let Some(i) = self.hovered_tray {
             let rect = self.tray_rects.get(i).copied();
             let item = self
@@ -1413,14 +1412,14 @@ impl Dock {
                 Some(r) => (
                     item,
                     r,
-                    crate::dockview::tray_axis(i, self.items.len(), show_desktop),
+                    crate::dockview::tray_axis(i, self.items.len()),
                 ),
                 None => return self.hide_tip(),
             }
         } else if let Some(i) = self.hovered {
             match (self.rects.get(i).copied(), self.items.get(i)) {
                 (Some(r), Some(it)) => {
-                    (it.tip.clone(), r, crate::dockview::icon_axis(i, show_desktop))
+                    (it.tip.clone(), r, crate::dockview::icon_axis(i))
                 }
                 _ => return self.hide_tip(),
             }
@@ -1542,16 +1541,15 @@ impl Dock {
             settings::DockAnchor::Right => (-1.0, 0.0),
         };
         let se = (self.scale * settings::icon_scale().clamp(0.5, 2.0)).max(0.5);
-        let show_desktop = settings::show_desktop_btn();
         let mut app = Vec::with_capacity(self.rects.len());
         for (i, r) in self.rects.iter().enumerate() {
-            let (rise, side) = self.pop_wave(crate::dockview::icon_axis(i, show_desktop));
+            let (rise, side) = self.pop_wave(crate::dockview::icon_axis(i));
             app.push(popped_rect(r, gx, gy, rise, side, se));
         }
         let mut tray = Vec::with_capacity(self.tray_rects.len());
         for (j, r) in self.tray_rects.iter().enumerate() {
             let (rise, side) =
-                self.pop_wave(crate::dockview::tray_axis(j, self.items.len(), show_desktop));
+                self.pop_wave(crate::dockview::tray_axis(j, self.items.len()));
             tray.push(popped_rect(r, gx, gy, rise, side, se));
         }
         (app, tray)

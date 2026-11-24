@@ -222,9 +222,9 @@ pub const WINLIST_GRACE_MS: u128 = 450;
 pub const SHOW_DESKTOP_BTN: bool = true;
 /// 细竖条宽度（垂直于 Dock 主轴）
 pub const DOCK_DESKTOP_W: f32 = 7.0;
-/// 细竖条与图标区之间的间距。左侧按同样的宽度留一块空白占位，
-/// 图标组才仍然是屏幕居中（右侧多宽、左侧就空多宽）
-pub const DOCK_DESKTOP_GAP: f32 = 10.0;
+/// 细竖条与图标区之间的间距。条平时透明不画，占位要收紧：
+/// 只在右端占位，左端不再镜像空白（否则两侧一起空出一大截）
+pub const DOCK_DESKTOP_GAP: f32 = 6.0;
 /// 细竖条长度占 Dock 厚度的比例（留足上下呼吸，不顶满）
 pub const DOCK_DESKTOP_H: f32 = 0.62;
 

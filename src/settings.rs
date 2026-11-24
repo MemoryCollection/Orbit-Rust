@@ -148,6 +148,8 @@ static DOCK_ANCHOR: AtomicU32 = AtomicU32::new(UNLOADED);
 static CORNER: AtomicU32 = AtomicU32::new(UNLOADED);
 /// 天气数据源编码 / 高德 key
 static WEATHER_SOURCE: AtomicU32 = AtomicU32::new(UNLOADED);
+/// 天气卡片配色方案：0 = 自动跟壁纸（默认）/ 1 = 深色背景（浅色字）/ 2 = 浅色背景（深色字）
+static WEATHER_SCHEME: AtomicU32 = AtomicU32::new(UNLOADED);
 static AMAP_KEY: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 /// 邮箱账号（空字符串 = 回落 mail.txt / 编译期默认）
 static IMAP_HOST: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
@@ -1017,6 +1019,14 @@ pub fn weather_text_scale() -> f32 {
     match SCALE.load(Ordering::Relaxed) {
         UNLOADED => cfg::WEATHER_TEXT_SCALE,
         bits => f32::from_bits(bits),
+    }
+}
+
+/// 天气卡片配色方案（0 自动跟壁纸 / 1 深色背景·浅色字 / 2 浅色背景·深色字）
+pub fn weather_scheme() -> u32 {
+    match WEATHER_SCHEME.load(Ordering::Relaxed) {
+        UNLOADED => 0,
+        v => v.min(2),
     }
 }
 
@@ -1992,6 +2002,17 @@ pub fn set_weather_text_scale(v: f32) {
     bump();
 }
 
+/// 天气卡片配色方案（设置页三档 seg 用）
+pub fn set_weather_scheme(v: u32) {
+    let v = v.min(2);
+    if v == weather_scheme() {
+        return;
+    }
+    WEATHER_SCHEME.store(v, Ordering::Relaxed);
+    save();
+    bump();
+}
+
 pub fn set_lyric_size(v: f32) {
     let v = v.clamp(LYRIC_MIN, LYRIC_MAX);
     if (v - lyric_size()).abs() < 1e-4 {
@@ -2087,6 +2108,7 @@ fn save() {
         ("imap_user", iu),
         ("imap_pass", iw),
         ("weather_text_scale", trim_num(weather_text_scale())),
+        ("weather_scheme", weather_scheme().to_string()),
         ("lyric_position", lyric_pos_str(lyric_position()).to_string()),
         ("lyric_size", trim_num(lyric_size())),
         ("lyric_lead", trim_num(lyric_lead())),
@@ -2452,6 +2474,8 @@ imap_user=
 imap_pass=
 # 天气面板字号倍率：1.0 为基准
 weather_text_scale=1.25
+# 天气卡片配色：0 自动跟壁纸（默认）/ 1 深色背景（浅色字）/ 2 浅色背景（深色字）
+weather_scheme=0
 # 音乐条位置：right（胶囊右侧，默认）/ left（左侧）/ bottom（下方）
 lyric_position=right
 # 歌词字号
@@ -2575,6 +2599,7 @@ fn append_missing() {
         ("lyric_position", "# 音乐条位置：right（胶囊右侧，默认）/ left（左侧）/ bottom（下方）\nlyric_position=right\n"),
         ("lyric_size", "# 歌词字号\nlyric_size=20\n"),
         ("weather_text_scale", "# 天气面板字号倍率：1.0 为基准\nweather_text_scale=1.25\n"),
+        ("weather_scheme", "# 天气卡片配色：0 自动跟壁纸（默认）/ 1 深色背景（浅色字）/ 2 浅色背景（深色字）\nweather_scheme=0\n"),
         (
             "show_tray",
             "# 底部 Dock：显示托盘图标 / 右端“返回桌面”细长条（1 = 显示，0 = 隐藏）\nshow_tray=1\nshow_desktop_btn=1\n",
@@ -2645,6 +2670,7 @@ fn load() {
         return;
     }
     let mut scale = cfg::WEATHER_TEXT_SCALE;
+    let mut wscheme = 0u32;
     let mut size = cfg::LYRIC_FONT_SIZE;
     let mut llead: Option<f32> = None;
     let mut pos = LyricPos::Right;
@@ -2840,6 +2866,11 @@ fn load() {
                     scale = n.clamp(SCALE_MIN, SCALE_MAX);
                 }
             }
+            "weather_scheme" => {
+                if let Some(n) = parse_num(v) {
+                    wscheme = (n.max(0.0) as u32).min(2);
+                }
+            }
             "lyric_size" => {
                 if let Some(n) = parse_num(v) {
                     size = n.clamp(LYRIC_MIN, LYRIC_MAX);
@@ -3027,6 +3058,7 @@ fn load() {
     }
 
     SCALE.store(scale.to_bits(), Ordering::Relaxed);
+    WEATHER_SCHEME.store(wscheme, Ordering::Relaxed);
     LYRIC_SIZE.store(size.to_bits(), Ordering::Relaxed);
     if let Some(v) = llead {
         LYRIC_LEAD.store(v.to_bits(), Ordering::Relaxed);

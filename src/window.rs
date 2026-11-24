@@ -356,6 +356,9 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     app.reload_panel();
                 }
                 app.render();
+                // 天气卡片也立即重绘：卡片挂在桌面壁纸层（WorkerW 子窗口），
+                // 设置页按类名 FindWindow 找不到它，只能由主进程收到消息后转发
+                crate::weathercard::refresh();
                 LRESULT(0)
             }
             // 设置页子进程请求「手动拿一次微信 UIA」（跨进程）

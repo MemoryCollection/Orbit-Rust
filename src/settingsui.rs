@@ -918,6 +918,43 @@ impl SettingsApp {
                 });
                 ui.end_row();
 
+                // 圆角：胶囊 / 音乐条 / 模块条 / Dock 共用（默认 14px = 圆角矩形）。
+                // 原在「顶部胶囊」页，挪到透明度下面统一管外观；落盘后主动通知
+                // 主进程的胶囊 + Dock 立即重绘，不等 500ms 轮询
+                ui.label(row_label("圆角"));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.spacing_mut().slider_width = CTRL_W - 148.0;
+                    let mut cr = settings::corner_radius();
+                    let r = ui.add(
+                        egui::Slider::new(&mut cr, settings::CORNER_MIN..=settings::CORNER_MAX)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    if r.changed() {
+                        settings::preview_corner_radius(cr);
+                    }
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        settings::persist_corner_radius();
+                        post_to_parent(crate::appmsg::WM_SETTINGS_APPLIED);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}px", settings::corner_radius()))
+                            .size(12.5)
+                            .monospace(),
+                    );
+                    let at_default = (settings::corner_radius() - 14.0).abs() < 0.5;
+                    if ui
+                        .add_enabled(!at_default, egui::Button::new("重置").small())
+                        .on_hover_text("回到圆角矩形（14px）")
+                        .clicked()
+                    {
+                        settings::set_corner_radius(14.0);
+                        post_to_parent(crate::appmsg::WM_SETTINGS_APPLIED);
+                    }
+                });
+                ui.end_row();
+
                 ui.label(row_label("胶囊大小"));
                 scale_row(
                     ui,
@@ -1935,7 +1972,7 @@ impl SettingsApp {
     fn detail_pill(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
         section(ui, "顶部胶囊");
         ui.label(
-            egui::RichText::new("透明度、大小、形状和 Dock 位置都在「常规设置 → 外观」里调，这里只管圆角与胶囊内容")
+            egui::RichText::new("透明度、大小、形状、圆角和 Dock 位置都在「常规设置 → 外观」里调，这里只管胶囊内容")
                 .size(11.5)
                 .weak(),
         );
@@ -1944,39 +1981,6 @@ impl SettingsApp {
             .num_columns(2)
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
-                // 圆角：胶囊 / 音乐条 / 模块条 / Dock 共用（默认 14px = 圆角矩形）
-                ui.label(row_label("圆角"));
-                let mut cr = settings::corner_radius();
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.spacing_mut().slider_width = CTRL_W - 148.0;
-                    let r = ui.add(
-                        egui::Slider::new(&mut cr, settings::CORNER_MIN..=settings::CORNER_MAX)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    );
-                    if r.changed() {
-                        settings::preview_corner_radius(cr);
-                    }
-                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                        settings::persist_corner_radius();
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{:.0}px", settings::corner_radius()))
-                            .size(12.5)
-                            .monospace(),
-                    );
-                    let at_default = (settings::corner_radius() - 14.0).abs() < 0.5;
-                    if ui
-                        .add_enabled(!at_default, egui::Button::new("重置").small())
-                        .on_hover_text("回到圆角矩形（14px）")
-                        .clicked()
-                    {
-                        settings::set_corner_radius(14.0);
-                    }
-                });
-                ui.end_row();
-
                 ui.label(row_label("时钟格式"));
                 ui.vertical(|ui| {
                     let r = ui.add_sized(
@@ -2086,6 +2090,18 @@ impl SettingsApp {
                 }
                 ui.end_row();
 
+                // 天气卡片配色两套：深色背景一套（浅色字）、浅色背景一套（深色字）；
+                // 默认「自动跟壁纸」保持原来的自动明暗切换。切换后立即通知卡片重绘
+                ui.label(row_label("天气配色"));
+                let sch = settings::weather_scheme();
+                if let Some(i) = seg(ui, &["自动跟壁纸", "深色背景", "浅色背景"], sch.min(2) as usize)
+                {
+                    settings::set_weather_scheme(i as u32);
+                    // 卡片窗口在主进程：立即按新配色重绘，不等 500ms 轮询
+                    post_to_parent(crate::appmsg::WM_SETTINGS_APPLIED);
+                }
+                ui.end_row();
+
                 ui.label(row_label("数据源"));
                 let ws = match settings::weather_source() {
                     WeatherSource::Amap => 0,
@@ -2112,6 +2128,11 @@ impl SettingsApp {
                 }
                 ui.end_row();
             });
+        ui.label(
+            egui::RichText::new("天气配色：「深色背景」用浅色字、「浅色背景」用深色字，各一套配色；「自动跟壁纸」按卡片周围壁纸明暗自动切换")
+                .size(11.5)
+                .weak(),
+        );
 
         ui.add_space(10.0);
         section(ui, "剪切板");

@@ -8,8 +8,9 @@
 //!   它就是桌面的一部分，Win+D / 「返回桌面」再也收不走；卡片在壁纸之上、
 //!   桌面图标之下。`HTTRANSPARENT` 让鼠标穿透，不挡桌面点击。
 //! - 透明背景靠分层窗口逐像素 alpha（不画底板），只画字形。
-//! - 配色自适应壁纸：沿卡片四周取屏幕像素算平均亮度，深壁纸用浅色字、浅壁纸用
-//!   深色字，并给文字加一层反差色的淡描影，混合色壁纸也能读。
+//! - 配色两套可选（设置页「天气配色」）：深色背景（浅色字）一套、浅色背景（深色字）
+//!   一套；默认「自动跟壁纸」——沿卡片四周取屏幕像素算平均亮度自动切换，并给文字
+//!   加一层反差色的淡描影，混合色壁纸也能读。
 //! - 主题 / 字体切换：监听 `WM_SETTINGS_APPLIED` 立即重绘；壁纸明暗每 2s 复检一次。
 //! - 显隐：由天气模块的「隐藏」档控制（`module_mode("weather") == Off`），关闭即隐藏。
 //! - 高度按内容量出（详情折行 / 字号倍率大时窗口自动撑高），宽度固定 CARD_W。
@@ -138,6 +139,9 @@ struct Card {
     embedded: bool,
     /// 「微信监视」区当前显示的行（变化才重绘）
     wechat: Vec<WeLine>,
+    /// 上次应用过的天气配色档：变了就重绘（设置页按类名找不到挂在桌面层的
+    /// 子窗口，通知可能收不到，靠 2s 复检兜底）
+    last_scheme: u32,
 }
 
 pub fn init(instance: HINSTANCE) {
@@ -157,6 +161,7 @@ pub fn init(instance: HINSTANCE) {
             probed: false,
             embedded: false,
             wechat: Vec::new(),
+            last_scheme: settings::weather_scheme(),
         }));
         match CreateWindowExW(
             // 注意：没有 WS_EX_TOPMOST —— 卡片只属于桌面层
@@ -302,6 +307,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
 impl Card {
     /// 按当前开关与数据决定显隐，并在显示时重排 + 重绘。
     fn apply(&mut self, h: HWND) {
+        // 这次重绘用的配色档记下来，recheck_bg 据此发现设置页又换了档
+        self.last_scheme = settings::weather_scheme();
         let has = VIEW.lock().map(|g| g.is_some()).unwrap_or(false);
         // 复用天气模块的「隐藏」档作为卡片开关；胶囊/左条/右条都表示右上角显示
         let off = settings::module_mode("weather") == ModuleMode::Off;
@@ -343,10 +350,24 @@ impl Card {
         self.push_bottom(h);
     }
 
-    /// 每 2s 复检壁纸明暗：幻灯片/换壁纸后文字色自动跟着切，只有变化时才重绘
+    /// 每 2s 复检壁纸明暗与配色档：幻灯片/换壁纸后文字色自动跟着切，
+    /// 设置页切「天气配色」后也在这里跟上（变化才重绘）。
+    /// 固定方案（深/浅背景）时不探测壁纸，配色恒定。
     fn recheck_bg(&mut self, h: HWND) {
         if unsafe { !IsWindowVisible(h).as_bool() } || self.size.0 <= 0 {
             return;
+        }
+        // 设置页在独立子进程写盘，主进程内存可能还是旧值：先按 mtime 重读
+        settings::reload_if_changed();
+        let sc = settings::weather_scheme();
+        if sc != self.last_scheme {
+            // 配色档变了（通知没到也能在 2s 内跟上）
+            self.last_scheme = sc;
+            self.apply(h);
+            return;
+        }
+        if sc != 0 {
+            return; // 固定方案：不看壁纸
         }
         let before = (self.dark_bg, self.probed);
         self.probe_bg();
@@ -357,8 +378,9 @@ impl Card {
 
     /// 每 3s 刷新「微信监视」区：热键注册 / UIA 拿取 / 实时监视状态。
     /// 内容变了才重排重绘（行数变化会撑高/收矮窗口）。
+    /// 「微信消息卡片」= UIA 总开关：设置页里关着就不显示监控区。
     fn recheck_wechat(&mut self, h: HWND) {
-        let lines = wechat_lines();
+        let lines = if settings::wechat_cards() { wechat_lines() } else { Vec::new() };
         if lines == self.wechat {
             return;
         }
@@ -481,6 +503,16 @@ impl Card {
         }
     }
 
+    /// 当前生效的配色档：设置里选了固定方案就按它来（1 深色背景 / 2 浅色背景），
+    /// 「自动跟壁纸」才用 probe_bg 探到的壁纸明暗。
+    fn eff_dark_bg(&self) -> bool {
+        match settings::weather_scheme() {
+            1 => true,
+            2 => false,
+            _ => self.dark_bg,
+        }
+    }
+
     fn render(&mut self, h: HWND) {
         let (w, hh) = self.size;
         let view = match VIEW.lock().ok().and_then(|g| g.clone()) {
@@ -492,7 +524,8 @@ impl Card {
         }
         let s = scale(h);
         let wechat = self.wechat.clone();
-        let rgba = paint(&mut self.view, w, hh, s, &view, self.dark_bg, &wechat);
+        let dark = self.eff_dark_bg();
+        let rgba = paint(&mut self.view, w, hh, s, &view, dark, &wechat);
         let bgra = render::premultiplied_rgba_to_bgra(&rgba);
         render::present(h, &bgra, w, hh);
     }
