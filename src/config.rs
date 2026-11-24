@@ -215,6 +215,8 @@ pub const WINLIST_FONT: f32 = 12.5;
 pub const WINLIST_GAP: i32 = 6;
 /// 鼠标离开弹窗多久后自动收起（毫秒）
 pub const WINLIST_GRACE_MS: u128 = 450;
+/// 每行右侧「关闭窗口」× 按钮的命中区宽度（逻辑点）
+pub const WINLIST_CLOSE_W: f32 = 24.0;
 
 // ---------- Dock：返回桌面（右端细竖条）----------
 

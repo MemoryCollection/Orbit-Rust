@@ -37,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LR_LOADFROMFILE, WNDCLASSW,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, GWLP_USERDATA,
     GW_OWNER, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, SWP_NOACTIVATE, SW_HIDE,
-    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -196,6 +196,10 @@ pub struct Dock {
     winlist_hover: Option<usize>,
     /// 每行命中矩形（物理像素 client 坐标）
     winlist_rects: Vec<[f32; 4]>,
+    /// 每行「关闭窗口」× 按钮命中矩形（物理像素 client 坐标）
+    winlist_close: Vec<[f32; 4]>,
+    /// 鼠标悬停的关闭按钮
+    winlist_close_hover: Option<usize>,
     /// 弹窗尺寸
     winlist_size: (i32, i32),
     /// 鼠标离开弹窗的那一刻（超过 `WINLIST_GRACE_MS` 就收起）
@@ -573,6 +577,8 @@ impl Dock {
             winlist_rows: Vec::new(),
             winlist_hover: None,
             winlist_rects: Vec::new(),
+            winlist_close: Vec::new(),
+            winlist_close_hover: None,
             winlist_size: (0, 0),
             winlist_left: None,
             mouse: None,
@@ -1668,6 +1674,7 @@ impl Dock {
         }
         self.winlist_rows = rows;
         self.winlist_hover = None;
+        self.winlist_close_hover = None;
         self.winlist_left = None;
         self.winlist_size = (w, h);
         self.paint_winlist();
@@ -1686,13 +1693,19 @@ impl Dock {
         }
         let titles: Vec<String> = self.winlist_rows.iter().map(|r| r.1.clone()).collect();
         let (w, h) = self.winlist_size;
-        let (rgba, rects) = self
-            .view
-            .paint_winlist(&titles, self.winlist_hover, self.scale, w, h);
+        let (rgba, rects, closes) = self.view.paint_winlist(
+            &titles,
+            self.winlist_hover,
+            self.winlist_close_hover,
+            self.scale,
+            w,
+            h,
+        );
         if rgba.is_empty() {
             return;
         }
         self.winlist_rects = rects;
+        self.winlist_close = closes;
         let bgra = render::premultiplied_rgba_to_bgra(&rgba);
         render::present(self.winlist, &bgra, w, h);
     }
@@ -1736,7 +1749,9 @@ impl Dock {
         }
         self.winlist_rows.clear();
         self.winlist_rects.clear();
+        self.winlist_close.clear();
         self.winlist_hover = None;
+        self.winlist_close_hover = None;
         self.winlist_left = None;
     }
 
@@ -1771,8 +1786,9 @@ impl Dock {
         }
         match self.winlist_left {
             None => {
-                // 指针一离开就先把高亮行清掉，别让最后一行亮着等 450ms
-                if self.winlist_hover.take().is_some() {
+                // 指针一离开就先把高亮行/高亮×清掉，别让最后一行亮着等 450ms
+                let had = self.winlist_hover.take().is_some() || self.winlist_close_hover.take().is_some();
+                if had {
                     self.paint_winlist();
                 }
                 self.winlist_left = Some(Instant::now());
@@ -1797,8 +1813,26 @@ impl Dock {
         self.hide_winlist();
     }
 
+    /// 弹窗里点了第 i 行的「关闭窗口」×：给目标窗口投 WM_CLOSE（走正常关闭流程，
+    /// 有未保存内容的程序仍会自己弹保存确认），然后收起弹窗；
+    /// 关掉最后一个窗口后 Dock 下轮扫描（T_RESCAN）自然摘掉图标
+    fn winlist_close_pick(&mut self, i: usize) {
+        if let Some((h, title)) = self.winlist_rows.get(i).map(|r| (r.0, r.1.clone())) {
+            unsafe {
+                let _ = PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            crate::vlog!("[dock] 窗口列表关闭 → {title}");
+        }
+        self.hide_winlist();
+    }
+
     fn winlist_hit(&self, x: f32, y: f32) -> Option<usize> {
         self.winlist_rects.iter().position(|r|
+            x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3])
+    }
+
+    fn winlist_close_hit(&self, x: f32, y: f32) -> Option<usize> {
+        self.winlist_close.iter().position(|r|
             x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3])
     }
 }
@@ -1852,15 +1886,22 @@ pub unsafe extern "system" fn winlist_proc(hwnd: HWND, msg: u32, w: WPARAM, l: L
         match msg {
             WM_MOUSEMOVE => {
                 let h = dock.winlist_hit(lx(), ly());
+                let ch = dock.winlist_close_hit(lx(), ly());
                 dock.winlist_left = None;
-                if h != dock.winlist_hover {
-                    dock.winlist_hover = h;
+                // 行高亮与×高亮互斥：指到×上时行不再整行点亮
+                let row_h = if ch.is_some() { None } else { h };
+                if row_h != dock.winlist_hover || ch != dock.winlist_close_hover {
+                    dock.winlist_hover = row_h;
+                    dock.winlist_close_hover = ch;
                     dock.paint_winlist();
                 }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
-                if let Some(i) = dock.winlist_hit(lx(), ly()) {
+                // × 优先于整行：按钮区里点下就是关窗，不触发切窗
+                if let Some(i) = dock.winlist_close_hit(lx(), ly()) {
+                    dock.winlist_close_pick(i);
+                } else if let Some(i) = dock.winlist_hit(lx(), ly()) {
                     dock.winlist_pick(i);
                 }
                 LRESULT(0)

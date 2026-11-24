@@ -499,7 +499,8 @@ impl DockView {
 
     // ---------- 同程序多开：窗口选择弹窗 ----------
 
-    /// 弹窗尺寸（逻辑点 → 物理像素）。宽度按最长标题撑开，夹在 MIN/MAX 之间。
+    /// 弹窗尺寸（逻辑点 → 物理像素）。宽度按最长标题撑开，夹在 MIN/MAX 之间；
+    /// 右侧固定留出 18pt 前台小点位 + 24pt 关闭按钮位。
     pub fn winlist_size(&mut self, titles: &[String], scale: f32) -> (i32, i32) {
         if titles.is_empty() {
             return (0, 0);
@@ -514,22 +515,24 @@ impl DockView {
             cfg::WINLIST_MIN_W - cfg::WINLIST_PAD * 2.0 - 18.0,
             cfg::WINLIST_MAX_W - cfg::WINLIST_PAD * 2.0 - 18.0,
         );
-        let fw = text_w + cfg::WINLIST_PAD * 2.0 + 18.0;
+        let fw = text_w + cfg::WINLIST_PAD * 2.0 + 18.0 + cfg::WINLIST_CLOSE_W;
         let fh = titles.len() as f32 * cfg::WINLIST_ROW_H + cfg::WINLIST_PAD * 2.0;
         ((fw * scale).ceil() as i32, (fh * scale).ceil() as i32)
     }
 
-    /// 画窗口选择弹窗：一行一个窗口标题，悬停行高亮。返回 (预乘 RGBA, 每行命中矩形[px])
+    /// 画窗口选择弹窗：一行一个窗口标题（名字后带「关闭窗口」×），悬停行/×高亮。
+    /// 返回 (预乘 RGBA, 每行命中矩形[px], 每个×命中矩形[px])，坐标均为物理像素。
     pub fn paint_winlist(
         &mut self,
         titles: &[String],
         hovered: Option<usize>,
+        close_hovered: Option<usize>,
         scale: f32,
         w: i32,
         h: i32,
-    ) -> (Vec<u8>, Vec<[f32; 4]>) {
+    ) -> (Vec<u8>, Vec<[f32; 4]>, Vec<[f32; 4]>) {
         if titles.is_empty() || w <= 0 || h <= 0 {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
         let scale = scale.max(0.5);
         self.soft.set_scale(scale);
@@ -538,8 +541,8 @@ impl DockView {
         let pad = cfg::WINLIST_PAD;
         let row_h = cfg::WINLIST_ROW_H;
         let font = egui::FontId::proportional(cfg::WINLIST_FONT);
-        // 文本可用宽度（右侧留 18 给"前台"小点，别顶着边）
-        let text_w = fw - pad * 2.0 - 18.0;
+        // 文本可用宽度（右侧留 18 给"前台"小点、WINLIST_CLOSE_W 给关闭×，别顶着边）
+        let text_w = fw - pad * 2.0 - 18.0 - cfg::WINLIST_CLOSE_W;
         // 逐条截断（度量走 SoftBackend，pass 之前也能用）
         let mut labels: Vec<String> = Vec::with_capacity(titles.len());
         for t in titles {
@@ -559,6 +562,7 @@ impl DockView {
         }
 
         let mut rows_pt: Vec<[f32; 4]> = Vec::with_capacity(labels.len());
+        let mut close_pt: Vec<[f32; 4]> = Vec::with_capacity(labels.len());
         let ctx = self.soft.ctx().clone();
         let input = self.soft.input(fw, fh);
         let mut out = ctx.run_ui(
@@ -586,15 +590,46 @@ impl DockView {
                         font.clone(),
                         argb(cfg::cur().text_body),
                     );
+                    // 行尾「关闭窗口」×：画两条对角线（不依赖字体里的 ✕ 字形），
+                    // 悬停×时垫红底、线变红，暗示这是关窗不是切窗
+                    let d = 4.5f32; // × 半边长
+                    let cx = row.right() - cfg::WINLIST_CLOSE_W * 0.5;
+                    let cy = row.center().y;
+                    let btn = egui::Rect::from_center_size(
+                        egui::pos2(cx, cy),
+                        egui::vec2(cfg::WINLIST_CLOSE_W, row_h - 4.0),
+                    );
+                    close_pt.push([btn.min.x, btn.min.y, btn.width(), btn.height()]);
+                    let is_close_hover = Some(i) == close_hovered;
+                    if is_close_hover {
+                        p.rect_filled(
+                            btn,
+                            egui::CornerRadius::same(7),
+                            egui::Color32::from_rgba_unmultiplied(0xE0, 0x6C, 0x6C, 0x38),
+                        );
+                    }
+                    let col = if is_close_hover {
+                        egui::Color32::from_rgb(0xE0, 0x6C, 0x6C)
+                    } else {
+                        argb(cfg::cur().text_dim)
+                    };
+                    let sw = egui::Stroke::new(1.4, col);
+                    p.line_segment(
+                        [egui::pos2(cx - d, cy - d), egui::pos2(cx + d, cy + d)],
+                        sw,
+                    );
+                    p.line_segment(
+                        [egui::pos2(cx - d, cy + d), egui::pos2(cx + d, cy - d)],
+                        sw,
+                    );
                 }
             },
         );
         self.soft.update_textures(&mut out.textures_delta);
         let rgba = self.soft.rasterize(out.shapes, out.pixels_per_point, w, h);
-        let rows = rows_pt
-            .iter()
-            .map(|r| [r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale])
-            .collect();
-        (rgba, rows)
+        let mul = |r: &[[f32; 4]]| -> Vec<[f32; 4]> {
+            r.iter().map(|r| [r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale]).collect()
+        };
+        (rgba, mul(&rows_pt), mul(&close_pt))
     }
 }
