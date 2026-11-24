@@ -2,7 +2,7 @@
 //! 所有值都写回 `settings.rs`（= `<exe>/data/settings.txt`），改完立刻生效，
 //! 胶囊 / 模块条 / Dock 靠 `settings::version()` 感知变化后重绘。
 //!
-//! 布局：左 = 分组导航（常规设置 / 顶部胶囊 / Dock / 开始菜单），
+//! 布局：左 = 分组导航（常规 / 顶部胶囊 / 通知 / 功能模块 / Dock / 开始菜单 / 微信），
 //! 右 = 所选分组的详细设置（组内滚动）。窗口尺寸固定，打开时主屏居中。
 //! - 邮箱：多账号管理，内置常用服务器预设（QQ/163/Gmail/Outlook），
 //!   「测试连通」通过后打 ✓ 标记并持久化
@@ -554,17 +554,29 @@ enum Group {
     #[default]
     General,
     Pill,
+    Notify,
+    Modules,
     Dock,
     Start,
     Wechat,
 }
 
 impl Group {
-    const ALL: [Group; 5] = [Group::General, Group::Pill, Group::Dock, Group::Start, Group::Wechat];
+    const ALL: [Group; 7] = [
+        Group::General,
+        Group::Pill,
+        Group::Notify,
+        Group::Modules,
+        Group::Dock,
+        Group::Start,
+        Group::Wechat,
+    ];
     fn label(self) -> &'static str {
         match self {
-            Group::General => "常规设置",
+            Group::General => "常规",
             Group::Pill => "顶部胶囊",
+            Group::Notify => "通知",
+            Group::Modules => "功能模块",
             Group::Dock => "Dock",
             Group::Start => "开始菜单",
             Group::Wechat => "微信",
@@ -806,14 +818,15 @@ impl SettingsApp {
         match self.group {
             Group::General => self.detail_general(ui, ver_changed),
             Group::Pill => self.detail_pill(ui, ver_changed),
+            Group::Notify => self.detail_notify(ui, ver_changed),
+            Group::Modules => self.detail_modules(ui, ver_changed),
             Group::Dock => self.detail_dock(ui),
             Group::Start => self.detail_start(ui),
             Group::Wechat => self.detail_wechat(ui, ver_changed),
         }
     }
 
-    /// 常规设置：字体 / 外观（主题 + 胶囊透明度·大小）/ 系统（开机启动、退出守护）
-    /// / 通知接管与方式 / 横幅时长 / 提示音
+    /// 常规设置：字体 / 外观（主题 + 透明度·大小·形状·位置）/ 系统（开机启动、退出守护）
     fn detail_general(&mut self, ui: &mut egui::Ui, _ver_changed: bool) {
         // 字体放最上面：一换字体整页字全变，第一眼就能看出效果
         section(ui, "界面字体");
@@ -1062,9 +1075,10 @@ impl SettingsApp {
                 .size(11.5)
                 .weak(),
         );
+    }
 
-        ui.add_space(10.0);
-        ui.add_space(10.0);
+    /// 通知：各类消息的通知方式 / 接管系统通知 / 横幅显示时长 / 横幅大小 / 提示音
+    fn detail_notify(&mut self, ui: &mut egui::Ui, _ver_changed: bool) {
         section(ui, "通知方式");
         ui.label(
             egui::RichText::new("每类消息各自选择弹在哪里：Orbit 横幅（右下角卡片）/ Windows 系统通知 / 不通知")
@@ -1076,6 +1090,7 @@ impl SettingsApp {
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
                 for (name, ch) in [
+                    ("微信", settings::notify_wechat()),
                     ("邮件", settings::notify_mail()),
                     ("托盘闪烁", settings::notify_tray()),
                     ("剪切板", settings::notify_clipboard()),
@@ -1093,6 +1108,7 @@ impl SettingsApp {
                             _ => settings::NotifyChannel::Orbit,
                         };
                         match name {
+                            "微信" => settings::set_notify_wechat(c),
                             "邮件" => settings::set_notify_mail(c),
                             "托盘闪烁" => settings::set_notify_tray(c),
                             _ => settings::set_notify_clipboard(c),
@@ -1140,6 +1156,7 @@ impl SettingsApp {
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
                 for (name, key) in [
+                    ("微信", 0u8),
                     ("邮件", 1u8),
                     ("托盘闪烁", 2u8),
                     ("剪切板", 3u8),
@@ -1468,8 +1485,8 @@ impl SettingsApp {
         });
     }
 
-    /// 微信分组：消息监控 / 通知与横幅 / 程序路径与数据目录 / 登录凭证快照。
-    /// （2026-11-23 起所有微信相关设置集中到本页，常规设置里不再出现微信项）
+    /// 微信分组：消息监控 / 程序路径与数据目录 / 登录凭证快照。
+    /// （微信的通知方式与横幅时长已并入「通知」分组）
     fn detail_wechat(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
         section(ui, "消息监控");
         ui.horizontal(|ui| {
@@ -1736,57 +1753,6 @@ impl SettingsApp {
 
         ui.add_space(10.0);
         ui.add_space(10.0);
-        section(ui, "通知与横幅");
-        ui.label(
-            egui::RichText::new("微信消息弹在哪里、横幅显示多久（提示音模式在「常规设置 → 提示音」）")
-                .size(11.5)
-                .weak(),
-        );
-        ui.horizontal(|ui| {
-            ui.label(row_label("通知方式"));
-            let ch = settings::notify_wechat();
-            let idx = match ch {
-                settings::NotifyChannel::Orbit => 0,
-                settings::NotifyChannel::Windows => 1,
-                settings::NotifyChannel::Off => 2,
-            };
-            if let Some(i) = seg(ui, &["Orbit 横幅", "Windows 通知", "不通知"], idx) {
-                let c = match i {
-                    1 => settings::NotifyChannel::Windows,
-                    2 => settings::NotifyChannel::Off,
-                    _ => settings::NotifyChannel::Orbit,
-                };
-                settings::set_notify_wechat(c);
-            }
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(row_label("横幅时长"));
-            let cur = settings::banner_secs_wechat();
-            let buf = &mut self.edits.banner_secs_wechat;
-            let r = ui.add_sized([CTRL_W, 24.0], egui::TextEdit::singleline(buf).hint_text("6"));
-            // 逐键提交：设置窗失活会直接收起，文本框来不及触发 lost_focus
-            let parsed = buf.trim().parse::<u32>().ok();
-            if r.changed() {
-                if let Some(v) = parsed {
-                    settings::set_banner_secs_wechat(v);
-                }
-            }
-            if r.lost_focus() {
-                let v = parsed.unwrap_or(6);
-                settings::set_banner_secs_wechat(v);
-                *buf = cur.to_string();
-            }
-            if ver_changed && !r.has_focus() {
-                *buf = cur.to_string();
-            }
-            ui.label(
-                egui::RichText::new("秒；0 = 不自动关闭，点一下才收起").size(11.5).weak(),
-            );
-        });
-
-        ui.add_space(10.0);
-        ui.add_space(10.0);
         section(ui, "微信程序");
         ui.horizontal(|ui| {
             ui.label(row_label("程序路径"));
@@ -1972,7 +1938,7 @@ impl SettingsApp {
     fn detail_pill(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
         section(ui, "顶部胶囊");
         ui.label(
-            egui::RichText::new("透明度、大小、形状、圆角和 Dock 位置都在「常规设置 → 外观」里调，这里只管胶囊内容")
+            egui::RichText::new("透明度、大小、形状、圆角和 Dock 位置都在「常规 → 外观」里调，这里只管胶囊内容")
                 .size(11.5)
                 .weak(),
         );
@@ -2076,8 +2042,11 @@ impl SettingsApp {
                 .size(11.5)
                 .weak(),
         );
+    }
 
-        ui.add_space(10.0);
+    /// 功能模块：天气卡片 / 剪切板 / 邮件——Orbit 的独立附加功能模块，
+    /// 各自有独立面板或卡片，不再归在「顶部胶囊」下。
+    fn detail_modules(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
         section(ui, "天气");
         egui::Grid::new("g_weather")
             .num_columns(2)
