@@ -150,7 +150,7 @@ pub fn show(v: &View) {
         }
         let soft = slot.as_mut().unwrap();
         soft.set_scale(scale);
-        let text = crate::musicbarview::ellipsize(soft, v.text, max_w_l - fixed, v.font);
+        let text = crate::egui_soft::ellipsize(soft, v.text, max_w_l - fixed, v.font);
         let w_l = fixed + crate::musicbarview::text_w(soft, &text, v.font);
         // w_l 是逻辑点，窗口尺寸要物理像素（乘以 DPI × 胶囊缩放）
         let w = (w_l * scale).ceil() as i32;

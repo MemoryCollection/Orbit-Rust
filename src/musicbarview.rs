@@ -24,25 +24,6 @@ pub fn text_w(soft: &SoftBackend, text: &str, font: f32) -> f32 {
     soft.text_width(text, egui::FontId::proportional(font))
 }
 
-/// 按最大逻辑宽度截断并加省略号（egui 字体度量）。
-pub fn ellipsize(soft: &SoftBackend, text: &str, max_w: f32, font: f32) -> String {
-    if text_w(soft, text, font) <= max_w {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for ch in text.chars() {
-        let mut trial = out.clone();
-        trial.push(ch);
-        trial.push('…');
-        if text_w(soft, &trial, font) > max_w {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
-}
-
 /// 画整条音乐条。w/h 是物理像素尺寸，scale 是 pixels_per_point。
 /// cover 是 decode_cover 解码后的正方形 straight RGBA，rotate_cover 在这里调用。
 /// 形状固定为四角圆角胶囊（不跟随顶部胶囊的吸顶/吸底"耳朵"）。

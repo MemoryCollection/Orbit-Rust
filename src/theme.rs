@@ -395,6 +395,38 @@ mod tests {
         over(t.panel_bg, if t.dark { [0.0; 3] } else { [1.0; 3] })
     }
 
+    fn with_alpha(c: u32, a: f32) -> u32 {
+        let a = (a.clamp(0.0, 1.0) * 255.0).round() as u32;
+        (a << 24) | (c & 0x00FF_FFFF)
+    }
+
+    /// 硬编码颜色主题化后的派生色可辨性（浅色主题的回归防线）。
+    ///
+    /// 这几处原先写死深色/白色，浅色主题下几乎看不见。现在都从主题派生，
+    /// 这里把派生公式对应的"合成色 vs 面板底"对比度固化成断言——阈值略低于
+    /// 当前六套主题的最小实测值（tab_hot 1.145 / ph 1.303 / ring 1.587 /
+    /// glyph 11.41），调主题色调过头会直接报出来。
+    #[test]
+    fn derived_hover_and_button_colors_are_discernible() {
+        for t in ALL {
+            let panel = panel_of(t);
+            // 面板标签页悬停底：主题字色 8%（panelview::paint_list）
+            let tab_hot = contrast(over(with_alpha(t.text, 0.08), panel), panel);
+            assert!(tab_hot >= 1.08, "{} 标签页悬停底几乎不可辨（{tab_hot:.3}:1）", t.key);
+            // 音乐条无封面占位圆：字色 15%（musicbarview）
+            let ph = contrast(over(with_alpha(t.text, 0.15), panel), panel);
+            assert!(ph >= 1.20, "{} 音乐条占位圆几乎不可辨（{ph:.3}:1）", t.key);
+            // 音乐条封面描边：字色 25%（musicbarview）
+            let ring = contrast(over(with_alpha(t.text, 0.25), panel), panel);
+            assert!(ring >= 1.40, "{} 封面描边几乎不可辨（{ring:.3}:1）", t.key);
+            // 音乐条中心按钮：盘 = 面板底色 65% 自叠，主文字字形 ≥ 4.5:1 的
+            // 文字可读底线要远远够着（musicbarview 播放/暂停图标用 text 画）
+            let disk = over(with_alpha(t.panel_bg, 0.65), panel);
+            let glyph = contrast(over(t.text, disk), disk);
+            assert!(glyph >= 6.0, "{} 播放按钮字形对比度不足（{glyph:.2}:1）", t.key);
+        }
+    }
+
     #[test]
     fn text_contrast_is_readable_in_every_theme() {
         for t in ALL {

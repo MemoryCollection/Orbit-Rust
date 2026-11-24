@@ -31,7 +31,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, glass_board, SoftBackend};
+use crate::egui_soft::{argb, ellipsize, glass_board, SoftBackend};
 use crate::render;
 use crate::settings;
 use crate::wechatmsg::Reader;
@@ -777,25 +777,6 @@ impl Banner {
         let bgra = render::premultiplied_rgba_to_bgra(&rgba);
         render::present(h, &bgra, w, hh);
     }
-}
-
-fn ellipsize(soft: &SoftBackend, text: &str, max_w: f32, size: f32) -> String {
-    let font = egui::FontId::proportional(size);
-    if soft.text_width(text, font.clone()) <= max_w {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for ch in text.chars() {
-        let mut trial = out.clone();
-        trial.push(ch);
-        trial.push('…');
-        if soft.text_width(&trial, font.clone()) > max_w {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
 }
 
 fn txt(p: &egui::Painter, x: f32, y: f32, s: &str, size: f32, color: u32) {

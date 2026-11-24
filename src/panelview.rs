@@ -6,7 +6,7 @@
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, widget_icon, with_alpha, KIND_USB, SoftBackend};
+use crate::egui_soft::{argb, ellipsize, widget_icon, with_alpha, KIND_USB, SoftBackend};
 use crate::render::{PanelRow, UsbView, WeatherView, LEFT_DET_DY, LEFT_DET_STEP, LEFT_REP_GAP, PIN_BASE, TAB_BASE, USB_EJECT_BASE};
 
 pub struct PanelPainted {
@@ -24,24 +24,6 @@ fn tw(soft: &SoftBackend, text: &str, size: f32) -> f32 {
 
 fn th(soft: &SoftBackend, text: &str, size: f32) -> f32 {
     soft.text_height(text, egui::FontId::proportional(size))
-}
-
-fn ellipsize(soft: &SoftBackend, text: &str, max_w: f32, size: f32) -> String {
-    if tw(soft, text, size) <= max_w {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for ch in text.chars() {
-        let mut trial = out.clone();
-        trial.push(ch);
-        trial.push('…');
-        if tw(soft, &trial, size) > max_w {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
 }
 
 fn txt(p: &egui::Painter, x: f32, y: f32, s: &str, size: f32, color: u32) {

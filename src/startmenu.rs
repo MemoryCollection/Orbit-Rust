@@ -38,7 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, glass_board, with_alpha, SoftBackend};
+use crate::egui_soft::{argb, ellipsize, glass_board, with_alpha, SoftBackend};
 use crate::guard::PowerAction;
 use crate::render;
 
@@ -691,25 +691,6 @@ fn draw_gear_icon(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
         let d = egui::vec2(a.cos(), a.sin());
         p.line_segment([c + d * 6.2, c + d * 8.8], egui::Stroke::new(1.6, color));
     }
-}
-
-fn ellipsize(soft: &SoftBackend, text: &str, max_w: f32, size: f32) -> String {
-    let font = egui::FontId::proportional(size);
-    if soft.text_width(text, font.clone()) <= max_w {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for ch in text.chars() {
-        let mut trial = out.clone();
-        trial.push(ch);
-        trial.push('…');
-        if soft.text_width(&trial, font.clone()) > max_w {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
 }
 
 #[allow(clippy::too_many_arguments)]

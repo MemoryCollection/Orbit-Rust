@@ -508,6 +508,30 @@ pub fn with_alpha(c: u32, a: f32) -> u32 {
     (a << 24) | (c & 0x00FF_FFFF)
 }
 
+/// 按最大逻辑宽度截断文本并加省略号（egui 字体度量）。
+///
+/// 超宽时逐字符尝试：`已收部分 + 当前字符 + '…'` 一旦超宽就停——保证结果
+/// （含省略号）一定不超 max_w。原先面板/横幅/天气/开始菜单/音乐条/微信卡片
+/// 六个视图各抄了一份同样的实现，收敛到这里共用。
+pub fn ellipsize(soft: &SoftBackend, text: &str, max_w: f32, size: f32) -> String {
+    let font = egui::FontId::proportional(size);
+    if soft.text_width(text, font.clone()) <= max_w {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let mut trial = out.clone();
+        trial.push(ch);
+        trial.push('…');
+        if soft.text_width(&trial, font.clone()) > max_w {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
 /// 沿边缘的**内发光**：由外向内画几圈 alpha 递减的描边，模拟霓虹灯管的光晕。
 ///
 /// 为什么向内：分层窗口的尺寸恰好等于形状尺寸，向外画会被窗口边裁掉；

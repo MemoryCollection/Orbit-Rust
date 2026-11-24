@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, bold_font, SoftBackend};
+use crate::egui_soft::{argb, bold_font, ellipsize, SoftBackend};
 use crate::render;
 use crate::settings::{self, ModuleMode};
 use crate::weather;
@@ -646,25 +646,6 @@ fn txt(
         );
     }
     p.text(egui::pos2(x, y), egui::Align2::LEFT_TOP, s, font, argb(color));
-}
-
-fn ellipsize(soft: &SoftBackend, text: &str, max_w: f32, size: f32) -> String {
-    let font = egui::FontId::proportional(size);
-    if soft.text_width(text, font.clone()) <= max_w {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for ch in text.chars() {
-        let mut trial = out.clone();
-        trial.push(ch);
-        trial.push('…');
-        if soft.text_width(&trial, font.clone()) > max_w {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
 }
 
 /// 详情段按可用宽度折行（段间用 "   ·   " 连接），单段超宽时省略号兜底。
