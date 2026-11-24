@@ -109,10 +109,10 @@ pub fn paint_list(
                     let active = k == tab_active;
                     if active {
                         p.rect_filled(egui::Rect::from_min_size(egui::pos2(x, ty), egui::vec2(twid, tab_h)),
-                            egui::CornerRadius::same(7), argb(cfg::cur().hover));
+                            egui::CornerRadius::same(HOT_R), argb(cfg::cur().hover));
                     } else if hovered == Some(TAB_BASE + k as u32) {
                         p.rect_filled(egui::Rect::from_min_size(egui::pos2(x, ty), egui::vec2(twid, tab_h)),
-                            egui::CornerRadius::same(7), argb(with_alpha(cfg::cur().text, 0.08)));
+                            egui::CornerRadius::same(HOT_R), argb(with_alpha(cfg::cur().text, 0.08)));
                     }
                     let lx = x + (twid - label_w) / 2.0;
                     let ly = ty + (tab_h - th(s, label, cfg::PANEL_SUB_SIZE)) / 2.0;
@@ -136,7 +136,7 @@ pub fn paint_list(
                 if hovered == Some(id) {
                     p.rect_filled(
                         egui::Rect::from_min_size(egui::pos2(pad * 0.5, y + 1.0), egui::vec2(fw - pad, row_h - 2.0)),
-                        egui::CornerRadius::same(8), argb(cfg::cur().hover));
+                        egui::CornerRadius::same(HOT_R), argb(cfg::cur().hover));
                 }
 
                 let mut x = pad;
@@ -186,6 +186,12 @@ pub fn paint_list(
 /// DET/STEP/REP_GAP 的单一来源在 render.rs（定高公式 left_group_height 共用）。
 const LEFT_SUB_DY: f32 = 58.0;
 
+/// 面板内可点元素（列表行 / 标签页 / USB 按钮 / 天气刷新）悬停底的统一圆角。
+/// 原先行 8 / 标签页与 USB 按钮 7 / 天气刷新 6 混用：同一窗口内的层级感
+/// 应该靠色深区分而不是圆角差异，收敛成一个值（与 Dock 提示条、开始菜单
+/// 列表行的 8 对齐；更大圆角只留给尺寸明显更大的开始菜单磁贴格）。
+const HOT_R: u8 = 8;
+
 pub fn paint_weather(
     soft: &mut SoftBackend,
     w: i32, h: i32, scale: f32,
@@ -228,7 +234,7 @@ pub fn paint_weather(
                 p.rect_filled(
                     egui::Rect::from_min_size(egui::pos2(refresh_rect[0] - 6.0, refresh_rect[1]),
                         egui::vec2(refresh_rect[2] + 12.0, refresh_rect[3])),
-                    egui::CornerRadius::same(6), argb(cfg::cur().hover));
+                    egui::CornerRadius::same(HOT_R), argb(cfg::cur().hover));
             }
             let rw = tw(s, "刷新", cfg::WEATHER_DETAIL_SIZE * k);
             let rh = th(s, "刷新", cfg::WEATHER_DETAIL_SIZE * k);
@@ -382,7 +388,7 @@ pub fn paint_usb(
                     p.rect_filled(
                         egui::Rect::from_min_size(egui::pos2(pad * 0.5, y + 1.0),
                             egui::vec2(fw - pad, row_h - 2.0)),
-                        egui::CornerRadius::same(8), argb(cfg::cur().hover));
+                        egui::CornerRadius::same(HOT_R), argb(cfg::cur().hover));
                 }
 
                 // 矢量 U 盘图标
@@ -406,9 +412,9 @@ pub fn paint_usb(
                 let open_rect = egui::Rect::from_min_size(egui::pos2(open_x, by), egui::vec2(open_w, btn_h));
                 let open_hot = hovered == Some(id) || hovered == Some(USB_EJECT_BASE + id);
                 if open_hot {
-                    p.rect_filled(open_rect, egui::CornerRadius::same(7), argb(cfg::cur().hover));
+                    p.rect_filled(open_rect, egui::CornerRadius::same(HOT_R), argb(cfg::cur().hover));
                 }
-                p.rect_stroke(open_rect, egui::CornerRadius::same(7),
+                p.rect_stroke(open_rect, egui::CornerRadius::same(HOT_R),
                     egui::Stroke::new(1.0, argb(cfg::cur().icon_dim)), egui::StrokeKind::Inside);
                 let ow = tw(s, "打开", USB_BTN_SIZE);
                 let oh = th(s, "打开", USB_BTN_SIZE);
@@ -419,9 +425,9 @@ pub fn paint_usb(
                 let ej_rect = egui::Rect::from_min_size(egui::pos2(ej_x, by), egui::vec2(ej_w, btn_h));
                 let ej_hot = hovered == Some(USB_EJECT_BASE + id);
                 if ej_hot {
-                    p.rect_filled(ej_rect, egui::CornerRadius::same(7), argb(cfg::cur().hover));
+                    p.rect_filled(ej_rect, egui::CornerRadius::same(HOT_R), argb(cfg::cur().hover));
                 }
-                p.rect_stroke(ej_rect, egui::CornerRadius::same(7),
+                p.rect_stroke(ej_rect, egui::CornerRadius::same(HOT_R),
                     egui::Stroke::new(1.0, argb(cfg::cur().accent)), egui::StrokeKind::Inside);
                 let ew = tw(s, "弹出", USB_BTN_SIZE);
                 let eh = th(s, "弹出", USB_BTN_SIZE);
