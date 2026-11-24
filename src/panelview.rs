@@ -6,7 +6,7 @@
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, widget_icon, KIND_USB, SoftBackend};
+use crate::egui_soft::{argb, widget_icon, with_alpha, KIND_USB, SoftBackend};
 use crate::render::{PanelRow, UsbView, WeatherView, LEFT_DET_DY, LEFT_DET_STEP, LEFT_REP_GAP, PIN_BASE, TAB_BASE, USB_EJECT_BASE};
 
 pub struct PanelPainted {
@@ -130,7 +130,7 @@ pub fn paint_list(
                             egui::CornerRadius::same(7), argb(cfg::cur().hover));
                     } else if hovered == Some(TAB_BASE + k as u32) {
                         p.rect_filled(egui::Rect::from_min_size(egui::pos2(x, ty), egui::vec2(twid, tab_h)),
-                            egui::CornerRadius::same(7), argb(0x14FF_FFFF));
+                            egui::CornerRadius::same(7), argb(with_alpha(cfg::cur().text, 0.08)));
                     }
                     let lx = x + (twid - label_w) / 2.0;
                     let ly = ty + (tab_h - th(s, label, cfg::PANEL_SUB_SIZE)) / 2.0;

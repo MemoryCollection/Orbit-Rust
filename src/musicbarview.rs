@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use crate::config as cfg;
-use crate::egui_soft::{argb, glass_board, SoftBackend};
+use crate::egui_soft::{argb, glass_board, with_alpha, SoftBackend};
 
 /// 封面在条内的逻辑位置与边长：(x, y, 边长)（逻辑点，相对窗口左上角）。
 /// 与 render::cover_box 的数值口径一致（乘 scale 即物理像素）。
@@ -93,23 +93,25 @@ pub fn paint(
                 }
             }
             if !drew_cover {
-                // 占位圆 + 音符
-                p.circle_filled(center, d / 2.0, argb(0x26_FF_FF_FF));
+                // 占位圆 + 音符（圆底跟随主题字色低透明派生，深浅主题都可辨）
+                p.circle_filled(center, d / 2.0, argb(with_alpha(cfg::cur().text, 0.15)));
                 let icon = cfg::MUSIC_PLACEHOLDER;
                 let fid = egui::FontId::proportional(cfg::LYRIC_ICON_SIZE * 1.7);
                 p.text(center, egui::Align2::CENTER_CENTER, icon, fid, argb(cfg::cur().accent));
             }
-            // 封面细白描边
+            // 封面细描边（跟随主题字色低透明派生）
             p.circle_stroke(
                 center,
                 (d - 1.0) / 2.0,
-                egui::Stroke::new(1.0, argb(0x40_FF_FF_FF)),
+                egui::Stroke::new(1.0, argb(with_alpha(cfg::cur().text, 0.25))),
             );
 
-            // 中心按钮：半透明圆盘 + 播放/暂停
+            // 中心按钮：半透明圆盘 + 播放/暂停。
+            // 盘色由主题面板底色派生（面板底色与文字的反差已有对比度单测兜底），
+            // 浅色主题不再出现"深色盘 + 深色字"的不可读组合；hover 时盘更实。
             let bd = d * cfg::MUSIC_BTN_RATIO;
-            let btn_argb = if hovered { 0xE6_14_14_14 } else { 0xA6_10_10_10 };
-            p.circle_filled(center, bd / 2.0, argb(btn_argb));
+            let btn_alpha = if hovered { 0.90 } else { 0.65 };
+            p.circle_filled(center, bd / 2.0, argb(with_alpha(cfg::cur().panel_bg, btn_alpha)));
             if playing {
                 // 暂停：两根竖条
                 let bw = (bd * 0.15).max(2.0);
