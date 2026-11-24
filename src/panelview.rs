@@ -7,7 +7,7 @@ use eframe::egui;
 
 use crate::config as cfg;
 use crate::egui_soft::{argb, widget_icon, KIND_USB, SoftBackend};
-use crate::render::{PanelRow, UsbView, WeatherView, PIN_BASE, TAB_BASE, USB_EJECT_BASE};
+use crate::render::{PanelRow, UsbView, WeatherView, LEFT_DET_DY, LEFT_DET_STEP, LEFT_REP_GAP, PIN_BASE, TAB_BASE, USB_EJECT_BASE};
 
 pub struct PanelPainted {
     /// 预乘 RGBA（w*h*4）
@@ -200,11 +200,9 @@ pub fn paint_list(
 
 // ---- 天气面板 ----
 
-/// 天气卡片左栏各元素相对块顶部的偏移（逻辑单位，与 render.rs 同数值）
+/// 天气卡片左栏各元素相对块顶部的偏移（逻辑单位，会再乘字号倍率）。
+/// DET/STEP/REP_GAP 的单一来源在 render.rs（定高公式 left_group_height 共用）。
 const LEFT_SUB_DY: f32 = 58.0;
-const LEFT_DET_DY: f32 = 84.0;
-const LEFT_DET_STEP: f32 = 18.0;
-const LEFT_REP_GAP: f32 = 6.0;
 
 pub fn paint_weather(
     soft: &mut SoftBackend,

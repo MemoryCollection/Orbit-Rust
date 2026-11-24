@@ -395,10 +395,11 @@ fn left_group_height(detail_lines: usize, k: f32) -> f32 {
     (LEFT_DET_DY + n * LEFT_DET_STEP + LEFT_REP_GAP + 13.0) * k
 }
 
-// 左栏各元素相对块顶部的偏移（逻辑单位，会再乘字号倍率）
-const LEFT_DET_DY: f32 = 84.0;
-const LEFT_DET_STEP: f32 = 18.0;
-const LEFT_REP_GAP: f32 = 6.0;
+// 左栏各元素相对块顶部的偏移（逻辑单位，会再乘字号倍率）。
+// 绘制（panelview::paint_weather）与定高（left_group_height）共用同一套数值。
+pub(crate) const LEFT_DET_DY: f32 = 84.0;
+pub(crate) const LEFT_DET_STEP: f32 = 18.0;
+pub(crate) const LEFT_REP_GAP: f32 = 6.0;
 
 /// 卡片尺寸：基准尺寸随字号倍率长大；左栏更高时再按需撑高，绝不裁字。
 pub fn weather_panel_size(scale: f32, v: &WeatherView) -> (i32, i32) {
