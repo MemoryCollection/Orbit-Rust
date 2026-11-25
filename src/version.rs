@@ -12,8 +12,8 @@
 //! 支持加速前缀（拼在完整 URL 前面）和访问密码（拼 `?pw=...` 在最后），
 //! 两者都留空则直连 GitHub。
 
-/// 前三段合起来的数（当前正式版本：210 → 显示 2.1.0）
-pub const VER_HEAD: u32 = 210;
+/// 前三段合起来的数（当前正式版本：211 → 显示 2.1.1）
+pub const VER_HEAD: u32 = 211;
 /// 第四段构建号（正式版 = 0；打测试包时 +1）
 pub const VER_BUILD: u32 = 0;
 
@@ -26,7 +26,7 @@ fn head_str() -> String {
     format!("{}.{}.{}", VER_HEAD / 100, VER_HEAD / 10 % 10, VER_HEAD % 10)
 }
 
-/// 本地版本串，如 "2.1.0.0"
+/// 本地版本串，如 "2.1.1.0"
 pub fn local() -> String {
     format!("{}.{}", head_str(), VER_BUILD)
 }
@@ -69,8 +69,23 @@ pub fn remote_is_newer(remote: (u32, u32)) -> bool {
     rh > VER_HEAD || (rh == VER_HEAD && rb > VER_BUILD)
 }
 
+/// 百分号编码：只保留 RFC 3986 的 unreserved 字符，其余按 UTF-8 字节转成 %XX。
+/// 密码里带 `&` / `#` / `+` 等字符时，直接拼进 query 会被截断或转义错。
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
 /// 组合校验 URL：`{加速前缀}{GitHub 地址}?pw={密码}`，前缀/密码都可空，
-/// 都为空时返回直连 GitHub 的 raw 地址。
+/// 都为空时返回直连 GitHub 的 raw 地址。密码按 URL 规则编码。
 pub fn check_url(accel: &str, pw: &str) -> String {
     let mut url = String::new();
     let a = accel.trim();
@@ -84,7 +99,7 @@ pub fn check_url(accel: &str, pw: &str) -> String {
     let p = pw.trim();
     if !p.is_empty() {
         url.push_str("?pw=");
-        url.push_str(p);
+        url.push_str(&pct_encode(p));
     }
     url
 }
@@ -95,8 +110,8 @@ mod tests {
 
     #[test]
     fn local_version_is_head_dot_build() {
-        // 当前定为 210 / build 0 → 2.1.0.0
-        assert_eq!(local(), "2.1.0.0");
+        // 当前定为 211 / build 0 → 2.1.1.0
+        assert_eq!(local(), "2.1.1.0");
     }
 
     #[test]
@@ -113,11 +128,12 @@ mod tests {
 
     #[test]
     fn remote_newer_logic() {
-        // 本地 210.0
-        assert!(remote_is_newer((211, 0)));
-        assert!(remote_is_newer((210, 1)));
-        assert!(!remote_is_newer((210, 0)));
-        assert!(!remote_is_newer((209, 99999)));
+        // 断言相对当前版本，升版时无需改测试
+        let h = VER_HEAD;
+        assert!(remote_is_newer((h + 1, 0)));
+        assert!(remote_is_newer((h, VER_BUILD + 1)));
+        assert!(!remote_is_newer((h, VER_BUILD)));
+        assert!(!remote_is_newer((h - 1, 99999)));
     }
 
     #[test]
@@ -133,5 +149,10 @@ mod tests {
             "https://proxy.example.com/".to_string() + VERSION_URL
         );
         assert_eq!(check_url("", "secret"), VERSION_URL.to_string() + "?pw=secret");
+        // 特殊字符按 URL 规则编码，避免 query 被截断
+        assert_eq!(
+            check_url("", "a b&c+d"),
+            VERSION_URL.to_string() + "?pw=a%20b%26c%2Bd"
+        );
     }
 }

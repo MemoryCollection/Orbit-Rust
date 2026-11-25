@@ -8,6 +8,7 @@ mod appicon;
 mod appmsg;
 mod clock;
 mod config;
+mod crash;
 mod dock;
 mod dockview;
 mod egui_soft;
@@ -57,6 +58,8 @@ mod window;
 
 fn main() {
     trace::init();
+    // 尽早装原生异常捕获器：定位无 panic 日志的进程消失（AV/栈溢出/WinRT fail-fast）
+    crash::install();
     let args: Vec<String> = std::env::args().collect();
     // 退出守护子进程：等父进程退出，异常退出时恢复任务栏并重启 explorer（见 guard.rs）
     if let Some(a) = args.iter().find(|a| a.starts_with("--guardian=")) {

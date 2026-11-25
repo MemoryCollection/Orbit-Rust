@@ -10,10 +10,12 @@ use windows::Win32::Networking::WinHttp::{
 
 const MAX_BODY: usize = 2 * 1024 * 1024;
 
-/// `WINHTTP_HEADER_NAME_BY_INDEX` / `WINHTTP_NO_HEADER_INDEX`（SDK 宏 = (句柄)-1，
-/// windows crate 没导出，这里按值补上）
-const BY_INDEX: PCWSTR = PCWSTR(usize::MAX as *const u16);
-const NO_HEADER_INDEX: *mut u32 = usize::MAX as *mut u32;
+/// `WINHTTP_HEADER_NAME_BY_INDEX` / `WINHTTP_NO_HEADER_INDEX`。
+/// 新版 Windows SDK（10.0.26100）里这两个宏都是 `NULL`；旧 SDK 曾写成 `(PVOID)-1`，
+/// 但当前 winhttp.dll 会直接解引用传入的 name 指针，传 -1 会以
+/// `0xC0000005 fault=0xffffffffffffffff` 原生崩溃（不走 Rust panic hook）。
+/// windows crate 未导出这两个宏，这里按当前 SDK 的值补上。
+const BY_INDEX: PCWSTR = PCWSTR::null();
 
 /// 循环读光响应体（UTF-8 lossy）；空响应报错
 unsafe fn read_body(req: *mut core::ffi::c_void) -> Result<String, String> {
@@ -100,7 +102,7 @@ pub fn get(url: &str, timeout_ms: i32) -> Result<String, String> {
                         BY_INDEX,
                         Some(&mut status as *mut u32 as *mut core::ffi::c_void),
                         &mut st_size,
-                        NO_HEADER_INDEX,
+                        std::ptr::null_mut(),
                     )
                     .is_ok();
                     if st_ok && !(200..300).contains(&status) {
@@ -116,5 +118,16 @@ pub fn get(url: &str, timeout_ms: i32) -> Result<String, String> {
         let _ = WinHttpCloseHandle(connect);
         let _ = WinHttpCloseHandle(session);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore] // 走真实网络，cargo test 默认跳过；用 -- --ignored 手动跑
+    fn live_get_github_version() {
+        let r = super::get("https://www.baidu.com/", 8000);
+        println!("result: {r:?}");
+        assert!(r.is_ok());
     }
 }

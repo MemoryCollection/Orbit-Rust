@@ -122,7 +122,7 @@ fn worker() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
-    crate::tlog!("[notifycenter] 监听线程就绪（跟随设置项启停）");
+    crate::tlog!("[notifycenter] 监听线程就绪（跟随设置项启停，tid={}）", crate::crash::current_thread_id());
     let mut listener: Option<UserNotificationListener> = None;
     let mut seen: HashSet<u32> = HashSet::new();
     // 首轮只登记已有通知，不弹也不撤

@@ -1071,6 +1071,7 @@ impl Drop for Reader {
 }
 
 unsafe fn run(wake: HANDLE, stop: Arc<AtomicBool>) {
+    crate::tlog!("[wechatmsg] 读取线程启动 tid={}", crate::crash::current_thread_id());
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
     let auto: IUIAutomation = match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {

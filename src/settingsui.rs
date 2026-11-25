@@ -2,7 +2,7 @@
 //! 所有值都写回 `settings.rs`（= `<exe>/data/settings.txt`），改完立刻生效，
 //! 胶囊 / 模块条 / Dock 靠 `settings::version()` 感知变化后重绘。
 //!
-//! 布局：左 = 分组导航（常规 / 顶部胶囊 / 通知 / 天气 / 邮箱 / 剪贴板 / Dock / 开始菜单 / 微信），
+//! 布局：左 = 分组导航（常规 / 胶囊 / 通知 / 天气 / 邮箱 / 剪贴板 / Dock / 开始菜单 / 微信），
 //! 右 = 所选分组的详细设置（组内滚动）。窗口尺寸固定，打开时主屏居中。
 //! - 天气 / 邮箱 / 剪贴板各占一个分组：模块的「显示开关 + 位置」与模块自身的设置都收在同一组内
 //! - 邮箱：多账号管理，内置常用服务器预设（QQ/163/Gmail/Outlook），
@@ -565,7 +565,7 @@ enum Group {
 
 impl Group {
     /// 左侧导航顺序（用户指定）：常规 → 通知 → 微信 → 天气 → 邮箱 →
-    /// 顶部胶囊 → Dock → 剪贴板 → 开始菜单
+    /// 胶囊 → Dock → 剪贴板 → 开始菜单
     const ALL: [Group; 9] = [
         Group::General,
         Group::Notify,
@@ -580,7 +580,7 @@ impl Group {
     fn label(self) -> &'static str {
         match self {
             Group::General => "常规",
-            Group::Pill => "顶部胶囊",
+            Group::Pill => "胶囊",
             Group::Notify => "通知",
             Group::Weather => "天气",
             Group::Mail => "邮箱",
@@ -848,7 +848,7 @@ impl SettingsApp {
 
     // ---------- 右侧详情（按分组） ----------
 
-    /// 左下角版本号：显示 v2.1.0.0，点击后台拉 GitHub 上的 version.txt 比对。
+    /// 左下角版本号：显示 v2.1.1.0，点击后台拉 GitHub 上的 version.txt 比对。
     /// 加速前缀 / 访问密码在「常规」页设置，留空则直连 GitHub。
     fn version_ui(&mut self, ui: &mut egui::Ui) {
         let st = self.check.lock().map(|s| s.clone()).unwrap_or_default();
@@ -870,10 +870,8 @@ impl SettingsApp {
                 let shared_url = self.check_url_used.clone();
                 // 网络请求放后台线程，UI 只轮询结果（页面本身每 500ms 重绘一次）
                 std::thread::spawn(move || {
-                    let url = shared_url.clone();
-                    let result = match crate::net::get(&url, 10000) {
-                        Err(e) => CheckState::Fail(e),
-                        Ok(body) => match crate::version::parse_remote(&body) {
+                    let parse = |body: String| -> CheckState {
+                        match crate::version::parse_remote(&body) {
                             Err(e) => CheckState::Fail(e),
                             Ok(rv) => {
                                 if crate::version::remote_is_newer(rv) {
@@ -888,8 +886,32 @@ impl SettingsApp {
                                     CheckState::Ok("已是最新版本".into())
                                 }
                             }
-                        },
+                        }
                     };
+                    // 加速站令牌会过期/改版（典型表现 HTTP 403），这时自动回退 GitHub 直连
+                    let mut first_err = String::new();
+                    let mut result = None;
+                    let mut urls = vec![shared_url.clone()];
+                    if shared_url != crate::version::VERSION_URL {
+                        urls.push(crate::version::VERSION_URL.to_string());
+                    }
+                    for (i, u) in urls.into_iter().enumerate() {
+                        match crate::net::get(&u, 10000) {
+                            Ok(body) => {
+                                result = Some(parse(body));
+                                break;
+                            }
+                            Err(e) => {
+                                if i == 0 {
+                                    if shared_url != crate::version::VERSION_URL {
+                                        crate::tlog!("[settings] 版本检查：加速地址失败（{e}），改用 GitHub 直连");
+                                    }
+                                    first_err = e;
+                                }
+                            }
+                        }
+                    }
+                    let result = result.unwrap_or_else(|| CheckState::Fail(first_err));
                     if let Ok(mut s) = shared.lock() {
                         *s = result;
                     }
@@ -2090,7 +2112,7 @@ impl SettingsApp {
     }
 
     fn detail_pill(&mut self, ui: &mut egui::Ui, ver_changed: bool) {
-        section(ui, "顶部胶囊");
+        section(ui, "胶囊");
         ui.label(
             egui::RichText::new("透明度、大小、形状、圆角和 Dock 位置都在「常规 → 外观」里调，这里只管胶囊内容")
                 .size(11.5)

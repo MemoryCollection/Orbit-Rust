@@ -1,8 +1,9 @@
 //! 开始菜单（接管系统 Win 键）：按 Win 弹出，再按一次收起；点菜单外也收起。
 //!
 //! 布局（上下两栏）：
-//! - 上栏：应用快捷方式网格（一行 4 个，最多 8 个），列表在设置页「开始菜单/系统」
-//!   里增删，默认只有「命令提示符 (cmd)」。图标从 exe / .lnk 里取 64px 源图。
+//! - 上栏：应用快捷方式网格（一行 4 个，最多 8 个），列表在设置页「开始菜单」
+//!   里增删，也可以直接在菜单里按住图标拖到别的格子换位（松手写回设置）。
+//!   图标从 exe / .lnk 里取 64px 源图。
 //! - 下栏：三个按钮 —— 关机（弹 关机/重启/锁屏 小菜单）、设置（打开 Orbit 设置）、
 //!   系统（打开 Windows 系统设置 ms-settings:）。
 //!
@@ -48,6 +49,13 @@ const WM_START_OPEN: u32 = WM_APP + 0x61;
 const WM_START_CLOSE: u32 = WM_APP + 0x62;
 /// 切换菜单（键盘钩子吃掉裸 Win 抬起后投递）
 const WM_START_TOGGLE: u32 = WM_APP + 0x63;
+/// 图标拖动结束（低级鼠标钩子在任意位置收到左键抬起时投递，避免拖出窗口后收不到）
+const WM_START_DROP: u32 = WM_APP + 0x64;
+/// windows 导入里没带这几个常用消息/修饰位
+const WM_LBUTTONUP: u32 = 0x0202;
+const MK_LBUTTON: usize = 0x1;
+/// 拖动越过后置位：钩子据此在所有位置收尾
+static DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 static START_HWND: AtomicIsize = AtomicIsize::new(0);
 static OPEN: AtomicBool = AtomicBool::new(false);
@@ -109,6 +117,12 @@ struct Menu {
     hover_tile: Option<usize>,
     hover_btn: Option<usize>,
     hover_power: Option<usize>,
+    /// 图标拖动：按下时记下的格子与起点（逻辑点）；移动越过阈值才算拖动
+    press_tile: Option<usize>,
+    press_pos: (f32, f32),
+    dragging: bool,
+    /// 拖动时悬停的目标格子
+    drag_target: Option<usize>,
     /// 菜单逻辑高度
     menu_h: f32,
     /// 物理像素窗口尺寸
@@ -139,6 +153,10 @@ pub fn init(instance: HINSTANCE) {
             hover_tile: None,
             hover_btn: None,
             hover_power: None,
+            press_tile: None,
+            press_pos: (0.0, 0.0),
+            dragging: false,
+            drag_target: None,
             menu_h: 0.0,
             size: (0, 0),
             mouse_tracked: false,
@@ -229,10 +247,23 @@ unsafe extern "system" fn mouse_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
                 }
             }
         }
-        // WM_LBUTTONUP = 0x0202（本文件的 windows 导入里没带这个名字）
-        if msg == 0x0202 && SWALLOW_UP.swap(false, Ordering::Relaxed) {
+        if msg == WM_LBUTTONUP && SWALLOW_UP.swap(false, Ordering::Relaxed) {
             // 按下已被吞掉，抬起也吞掉，免得微信收到一个孤立的抬键
             return LRESULT(1);
+        }
+        // 拖动图标时，指针可能已经移出菜单窗口：钩子在所有位置收左键抬起，
+        // 换算成窗口内坐标投递给窗口线程收尾（窗口自己的 WM_LBUTTONUP 也会走同一入口，幂等）
+        if msg == WM_LBUTTONUP && DRAG_ACTIVE.load(Ordering::Relaxed) {
+            let ms = l.0 as *const MSLLHOOKSTRUCT;
+            if !ms.is_null() {
+                let pt = (*ms).pt;
+                let mut r = RECT::default();
+                if GetWindowRect(hwnd(), &mut r).is_ok() {
+                    let x = (pt.x - r.left).max(0) as u16 as isize;
+                    let y = (pt.y - r.top).max(0) as u16 as isize;
+                    let _ = PostMessageW(hwnd(), WM_START_DROP, WPARAM(0), LPARAM((y << 16) | x));
+                }
+            }
         }
         if OPEN.load(Ordering::Relaxed)
             && matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN)
@@ -343,6 +374,10 @@ fn close_window(h: HWND, m: &mut Menu) {
     m.hover_tile = None;
     m.hover_btn = None;
     m.hover_power = None;
+    m.press_tile = None;
+    m.dragging = false;
+    m.drag_target = None;
+    DRAG_ACTIVE.store(false, Ordering::Relaxed);
     m.mouse_tracked = false;
     unsafe {
         let _ = ShowWindow(h, SW_HIDE);
@@ -377,6 +412,12 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                 toggle();
                 LRESULT(0)
             }
+            WM_START_DROP => {
+                let (x, y) = decode_xy(l);
+                let k = m.scale(h);
+                m.finish_drag(h, x as f32 / k, y as f32 / k);
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 let (x, y) = decode_xy(l);
                 let k = m.scale(h);
@@ -389,6 +430,22 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                 m.hover_tile = hit(&m.tiles);
                 m.hover_btn = hit(&m.buttons);
                 m.hover_power = if m.power_open { hit(&m.power_rows) } else { None };
+                // 按住左键拖动图标：移动越过阈值后实时换位，松手才写回设置
+                if m.press_tile.is_some() && (w.0 & MK_LBUTTON) != 0 {
+                    let dx = lx - m.press_pos.0;
+                    let dy = ly - m.press_pos.1;
+                    if !m.dragging && dx * dx + dy * dy >= 36.0 {
+                        m.dragging = true;
+                        DRAG_ACTIVE.store(true, Ordering::Relaxed);
+                    }
+                    if m.dragging {
+                        m.drag_target = hit(&m.tiles);
+                        if let Some(dst) = m.drag_target {
+                            let src = m.press_tile.unwrap_or(dst);
+                            m.move_pin(src, dst);
+                        }
+                    }
+                }
                 if !m.mouse_tracked {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -455,14 +512,20 @@ unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESU
                     return LRESULT(0);
                 }
                 if let Some(i) = m.tiles.iter().position(|r| inside(r)) {
-                    if let Some((_, target)) = m.pins.get(i) {
-                        crate::tlog!("[start] 启动 {target}");
-                        launch(target);
-                    }
-                    close_window(h, m);
+                    // 先记下按下位置：抬起时若没越过拖动阈值，仍按原来的点击启动处理
+                    m.press_tile = Some(i);
+                    m.press_pos = (lx, ly);
+                    m.dragging = false;
+                    m.drag_target = None;
                     return LRESULT(0);
                 }
                 m.render(h);
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = decode_xy(l);
+                let k = m.scale(h);
+                m.finish_drag(h, x as f32 / k, y as f32 / k);
                 LRESULT(0)
             }
             WM_NCHITTEST => {
@@ -603,6 +666,54 @@ impl Menu {
         if self.power_open {
             self.layout_power();
         }
+    }
+
+    /// 拖动中把 src 格子的图标移到 dst（格子矩形是固定位置，pins 换序即完成换位）
+    fn move_pin(&mut self, src: usize, dst: usize) {
+        if src == dst || src >= self.pins.len() || dst >= self.pins.len() {
+            return;
+        }
+        let item = self.pins.remove(src);
+        self.pins.insert(dst, item);
+        self.press_tile = Some(dst);
+    }
+
+    /// 左键抬起统一收尾：拖过 → 写回设置；没拖过 → 点击启动。
+    /// 窗口自己的 WM_LBUTTONUP 与钩子投递的 WM_START_DROP 都会走这里，take() 保证幂等。
+    fn finish_drag(&mut self, h: HWND, lx: f32, ly: f32) {
+        let Some(idx) = self.press_tile.take() else {
+            return;
+        };
+        if self.dragging {
+            // 最后再对齐一次目标格子：避免最后一次 MOUSEMOVE 没送到就松手
+            if let Some(dst) = self.tiles.iter().position(|r| {
+                lx >= r[0] && lx < r[0] + r[2] && ly >= r[1] && ly < r[1] + r[3]
+            }) {
+                self.move_pin(idx, dst);
+            }
+            // 只改显示出来的前几项，设置里若还有额外条目保持原样
+            let mut full = crate::settings::start_pins();
+            for (slot, pin) in full.iter_mut().enumerate().take(self.pins.len()) {
+                *pin = self.pins[slot].clone();
+            }
+            crate::settings::set_start_pins(full);
+            crate::tlog!("[start] 快捷方式顺序已保存");
+        } else {
+            // 没拖动 = 普通点击：必须在按下的那个格子上松开才启动
+            let still = self.tiles.get(idx).map_or(false, |r| {
+                lx >= r[0] && lx < r[0] + r[2] && ly >= r[1] && ly < r[1] + r[3]
+            });
+            if still {
+                if let Some((_, target)) = self.pins.get(idx) {
+                    crate::tlog!("[start] 启动 {target}");
+                    launch(target);
+                }
+            }
+        }
+        self.dragging = false;
+        self.drag_target = None;
+        DRAG_ACTIVE.store(false, Ordering::Relaxed);
+        close_window(h, self);
     }
 
     /// 关机小菜单贴在下栏上方（窗口内），默认对齐关机按钮

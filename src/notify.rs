@@ -116,6 +116,7 @@ fn enqueue(tag: &str) {
 /// 载荷 repeat：有限值播放 N 遍；u32::MAX 循环播放直到 `UNTIL_STOP` 置位。
 fn worker(rx: Receiver<u32>) {
     unsafe {
+        crate::tlog!("[notify] 播放线程启动 tid={}", crate::crash::current_thread_id());
         let p = sound_path();
         if !p.exists() {
             if let Err(e) = std::fs::write(&p, SOUND_MP3) {
