@@ -100,6 +100,23 @@ fn main() {
         }
         return;
     }
+    // 微信账号批量启动（多开桌面快捷方式入口）：逐个恢复凭证 → 启动微信 → 点「进入微信」。
+    // 参数 = 逗号分隔的快照 ID，如 `--wechat-batch-launch id1,id2,id3`。
+    if let Some(pos) = args.iter().position(|a| a == "--wechat-batch-launch") {
+        settings::init();
+        let ids: Vec<String> = args
+            .get(pos + 1)
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default();
+        match wechatsnap::batch_launch(&ids) {
+            Ok(()) => tlog!("[wechat-batch-launch] 批量启动完成：{} 个账号", ids.len()),
+            Err(e) => {
+                tlog!("[wechat-batch-launch] 批量启动失败：{e}");
+                wechatsnap::error_popup(&format!("微信多开批量启动失败\n\n{e}"));
+            }
+        }
+        return;
+    }
     // 单实例互斥：已有 orbit 在跑就直接退出（守护子进程 / --restore-taskbar 不受影响）
     if guard::acquire_single_instance().is_err() {
         tlog!("orbit 已在运行，本次启动不重复拉起");

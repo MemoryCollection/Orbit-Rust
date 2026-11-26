@@ -1,6 +1,6 @@
 [package]
 name = "orbit"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2021"
 description = "Windows 11 桌面增强悬浮栏：胶囊 + Dock + 通知横幅 + 开始菜单接管"
 license = "MIT"
@@ -24,6 +24,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Environment",
+    "Win32_System_Console",
     "Win32_System_Threading",
     "Win32_System_Shutdown",
     "Win32_Security",

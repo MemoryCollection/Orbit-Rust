@@ -28,7 +28,17 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::System::Console::{AllocConsole, GetStdHandle, WriteConsoleW, STD_OUTPUT_HANDLE};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, CreateMutexW, GetCurrentThreadId, ReleaseMutex, WaitForSingleObject,
+};
 use windows::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath, ShellLink, IShellLinkW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect,
+    GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_RESTORE,
+};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 
 /// 构成「登录凭证」的四个文件（相对 `all_users/config/`）
 const CFG_FILES: [&str; 4] = ["global_config", "global_config.crc", "client_config", "client_config.crc"];
@@ -436,10 +446,314 @@ pub fn make_shortcut(id: &str) -> Result<PathBuf, String> {
     Ok(lnk)
 }
 
-fn shortcut_display_name(nickname: &str, id: &str) -> String {
+// ---------- 多账号批量启动（桌面快捷方式「逐个登录」） ----------
+
+/// 微信窗口类名。实测（2026-11-26，微信 4.x）：登录窗口和登录后的主窗口**同名**，
+/// 都是 `Qt51514QWindowIcon`；靠尺寸区分（登录窗约 368×484，主窗约 1241×869）。
+/// 保留旧版类名做兼容。
+const WX_WND_CLASSES: [&str; 3] = ["Qt51514QWindowIcon", "mmui::LoginWindow", "WeChatLoginWndForPC"];
+/// 登录窗口的宽度上限（物理像素）。主窗口远大于此值，据此区分"还在登录"和"已进主界面"。
+const LOGIN_WND_MAX_W: i32 = 700;
+
+/// 设置本进程为 DPI 感知：GetWindowRect 才会返回物理坐标（宽度阈值判断需要一致坐标系）。
+/// --wechat-batch-launch 分支在 app::run 之前返回，不会经过主程序的 DPI 初始化，必须在这里补上。
+fn ensure_dpi_aware() {
+    use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// 批量启动的跨进程互斥锁：命名 Mutex，保证同一时刻只有一个批次在跑。
+/// 凭证目录是全局的，多个批次并发会互相覆盖导致登录错乱（实测已复现）。
+/// 用 Drop 自动释放；进程崩溃时系统也会自动释放命名 Mutex。
+struct BatchGuard(HANDLE);
+
+impl BatchGuard {
+    /// 尝试独占。已有批次在跑时立即返回 Err（等待 0ms，不排队）。
+    fn try_acquire() -> Result<Self, String> {
+        let name = HSTRING::from(r"Local\Orbit_WeChatBatchLaunch");
+        unsafe {
+            let h = CreateMutexW(None, false, PCWSTR(name.as_ptr()))
+                .map_err(|e| format!("创建批量互斥锁失败：{e}"))?;
+            // 0 = 立即返回，不等待。已有人持有则为 WAIT_TIMEOUT。
+            let wait = WaitForSingleObject(h, 0);
+            if wait != WAIT_OBJECT_0 {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+                if wait == WAIT_TIMEOUT {
+                    return Err("已有微信批量登录正在进行，请等它完成（或关闭上一个）后再运行".into());
+                }
+                return Err(format!("获取批量互斥锁失败（wait={wait:?}）"));
+            }
+            Ok(Self(h))
+        }
+    }
+}
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+// ---------- 多开进度控制台 ----------
+// 发布版是 GUI 子系统（#![windows_subsystem = "windows"]），默认不弹控制台。
+// 多开是长时间等待人工登录的流程，给用户弹一个控制台看进度；关掉这个窗口 = 结束本次任务
+// （GUI 进程附加控制台后，点窗口 X 会触发默认 CTRL_CLOSE_EVENT → 进程终止）。
+
+/// 弹出进度控制台并打印标题。失败（例如已附加到别的控制台）不影响主流程。
+fn init_progress_console(total: usize) {
+    unsafe {
+        // 已附加控制台时 AllocConsole 会失败，忽略即可
+        let _ = AllocConsole();
+    }
+    console_line(&format!("==== 微信多开 · 共 {total} 个账号 ===="));
+    console_line("请按顺序手动点「进入微信」登录；关闭此窗口即结束本次多开。");
+    console_line("");
+}
+
+/// 输出一行进度到控制台（同时写 orbit.log，便于事后排查）。
+fn console_line(msg: &str) {
+    crate::tlog!("[batch] {msg}");
+    unsafe {
+        let Ok(h) = GetStdHandle(STD_OUTPUT_HANDLE) else { return };
+        let t = windows::Win32::System::SystemInformation::GetLocalTime();
+        let line = format!("[{:02}:{:02}:{:02}] {msg}\r\n", t.wHour, t.wMinute, t.wSecond);
+        let wide: Vec<u16> = line.encode_utf16().collect();
+        let _ = WriteConsoleW(h, &wide, None, None);
+    }
+}
+
+/// 逐个恢复凭证并启动微信：严格串行 —— 第 N 个**由用户手动登录进主界面后**，才处理第 N+1 个。
+///
+/// 流程（对每个快照 ID 依次执行，任何一步失败立即中止、不再替换后续凭证）：
+///   0. 跨进程互斥：只允许一个批次在跑，防止多次双击导致凭证目录被并发覆盖
+///   1. 热替换该快照凭证（此刻**只**为启动这一个对象）→ 启动 Weixin.exe
+///   2. 弹窗提示用户手动点「进入微信」登录（**不自动点击**）
+///   3. 轮询等待该 pid 的主界面出现（用户手动登录完成，最多 5 分钟）
+///   4. 主界面出现后再进入下一个快照 —— 保证"一个登好了才开下一个"
+///
+/// 关键点：凭证目录是全局的。只有等微信真正读取凭证并进入主界面后，替换下一个凭证
+/// 才不会干扰它；否则上一个实例可能还在读盘，凭证被挪走就登录失败（实测复现过）。
+pub fn batch_launch(ids: &[String]) -> Result<(), String> {
+    if ids.is_empty() {
+        return Err("没有勾选任何凭证".into());
+    }
+    // 跨进程互斥必须最先拿：拿到之前绝不碰凭证目录
+    let _guard = BatchGuard::try_acquire()?;
+    init_progress_console(ids.len());
+    ensure_dpi_aware();
+    let exe = wechat_exe().ok_or("找不到 Weixin.exe（可在设置里自定义微信程序路径）")?;
+
+    let snaps = list();
+    let label = |id: &str| -> String {
+        snaps.iter().find(|s| s.id == id)
+            .map(|s| s.nickname.clone()).unwrap_or_else(|| id.to_string())
+    };
+
+    for (i, id) in ids.iter().enumerate() {
+        let name = label(id);
+        console_line(&format!("[{}/{}] 「{}」— 正在替换凭证…", i + 1, ids.len(), name));
+
+        // 1. 替换凭证（全局），仅用于即将启动的这一个对象
+        restore(id).map_err(|e| format!("「{name}」恢复凭证失败：{e}"))?;
+
+        // 2. 启动微信，spawn 的 pid 就是窗口 pid（微信多开是独立主进程，用户实测确认）
+        let child = std::process::Command::new(&exe)
+            .spawn()
+            .map_err(|e| format!("「{name}」启动微信失败：{e}"))?;
+        let pid = child.id();
+        write_pid(id, pid);
+        crate::tlog!("[wechatsnap] 批量启动 [{}/{}] 快照 {id} 微信 pid={pid}", i + 1, ids.len());
+
+        // 3. 提示用户手动登录（不自动点击），等主界面出现才算完成。
+        //    失败立即中止，绝不替换下一个凭证。
+        console_line(&format!("[{}/{}] 「{}」已启动，请在微信窗口手动点「进入微信」登录…", i + 1, ids.len(), name));
+        wait_user_login(pid).map_err(|e| {
+            format!("「{name}」等待手动登录失败：{e}；已中止，后续账号凭证未替换")
+        })?;
+        console_line(&format!("[{}/{}] 「{}」✓ 已登录，进入主界面", i + 1, ids.len(), name));
+
+        // 4. 主界面出现后留缓冲，让凭证彻底落盘再开下一个
+        if i + 1 < ids.len() {
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+        }
+    }
+
+    console_line("==== 全部完成，可关闭此窗口 ====");
+    crate::tlog!("[wechatsnap] 批量启动完成，共 {} 个账号", ids.len());
+    Ok(())
+}
+
+/// 把窗口置到最前。
+///
+/// Windows 有「前台锁定」限制：非前台进程直接调 SetForegroundWindow 往往无效。
+/// 这里临时把本线程输入队列挂到当前前台线程上（AttachThreadInput），再置前，成功率最高。
+fn bring_to_front(hwnd: HWND) {
+    unsafe {
+        // 若最小化则还原，否则置前无效
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let fg = GetForegroundWindow();
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let my_tid = GetCurrentThreadId();
+        let attached = fg_tid != 0 && fg_tid != my_tid;
+        if attached {
+            let _ = AttachThreadInput(my_tid, fg_tid, true);
+        }
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(my_tid, fg_tid, false);
+        }
+    }
+}
+
+/// 等待单个账号**由用户手动**登录完成：不自动点「进入微信」，只轮询该 pid 的主界面是否出现。
+/// 登录小窗一出现就把它置到最前，方便用户直接看到并点击「进入微信」。
+/// 主界面出现 = 用户已完成登录（点按钮/扫码都算），调用方据此才替换下一个凭证、启动下一个微信。
+/// 因为要等人工操作，超时放宽到 5 分钟。
+fn wait_user_login(pid: u32) -> Result<(), String> {
+    let deadline = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() } + 300_000;
+    let mut front_tries = 0u32;
+    loop {
+        if !find_wx_window(pid, true).0.is_null() {
+            return Ok(());
+        }
+        // 登录小窗出现后，头几次轮询反复置前，确保它稳定停在用户面前
+        if front_tries < 8 {
+            let login = find_wx_window(pid, false);
+            if !login.0.is_null() {
+                bring_to_front(login);
+                if front_tries == 0 {
+                    console_line("  ↳ 已把微信登录窗口置前，请手动点「进入微信」");
+                }
+                front_tries += 1;
+            }
+        }
+        let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+        if now >= deadline {
+            return Err("等待手动登录超时（5 分钟，微信主界面一直未出现）".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// 枚举顶层窗口，找 pid 的微信窗口。`want_main=true` 找大主窗（宽 ≥ LOGIN_WND_MAX_W），
+/// 否则找登录小窗。类名命中 WX_WND_CLASSES；实测登录窗与主窗同名，靠宽度区分。
+fn find_wx_window(pid: u32, want_main: bool) -> HWND {
+    struct Ctx {
+        pid: u32,
+        want_main: bool,
+        hit: HWND,
+    }
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+        let ctx = &mut *(lparam.0 as *mut Ctx);
+        let mut wpid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut wpid));
+        if wpid != ctx.pid {
+            return windows::Win32::Foundation::TRUE;
+        }
+        let mut buf = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut buf);
+        if len == 0 {
+            return windows::Win32::Foundation::TRUE;
+        }
+        let class = String::from_utf16_lossy(&buf[..len as usize]);
+        if !WX_WND_CLASSES.iter().any(|c| *c == class) {
+            return windows::Win32::Foundation::TRUE;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_err() {
+            return windows::Win32::Foundation::TRUE;
+        }
+        let is_main = (r.right - r.left) >= LOGIN_WND_MAX_W;
+        if is_main == ctx.want_main {
+            ctx.hit = hwnd;
+            return windows::Win32::Foundation::FALSE;
+        }
+        windows::Win32::Foundation::TRUE
+    }
+    let mut ctx = Ctx { pid, want_main, hit: HWND::default() };
+    unsafe {
+        let _ = EnumWindows(Some(enum_cb), LPARAM(&mut ctx as *mut Ctx as isize));
+    }
+    ctx.hit
+}
+
+/// 给多个快照生成**一个**桌面快捷方式：目标 = `--wechat-batch-launch <id1>,<id2>,...`，
+/// 图标用第一个快照的头像。返回生成的 .lnk 路径。
+pub fn make_batch_shortcut(ids: &[String]) -> Result<PathBuf, String> {
+    if ids.is_empty() {
+        return Err("没有勾选任何凭证".into());
+    }
+    // 校验每个快照凭证完整
+    for id in ids {
+        let snap = accounts_root().join(id);
+        if !snap.join("global_config").is_file() {
+            return Err(format!("快照「{id}」凭证不完整"));
+        }
+    }
+    // 快捷方式名字：取勾选账号的昵称拼起来（最多取前 3 个 + 省略）
+    let snaps = list();
+    let mut names: Vec<String> = Vec::new();
+    for id in ids {
+        let nick = snaps
+            .iter()
+            .find(|s| &s.id == id)
+            .map(|s| s.nickname.clone())
+            .unwrap_or_else(|| id.clone());
+        names.push(nick);
+    }
+    let display = if names.len() > 3 {
+        format!("{}-等{}个", names[..3].join("-"), names.len())
+    } else {
+        names.join("-")
+    };
+    // 用第一个快照的图标（没有就补一次）
+    let icon = accounts_root().join(&ids[0]).join("icon.ico");
+    if !icon.is_file() && accounts_root().join(&ids[0]).join("avatar.jpg").is_file() {
+        let _ = jpg_to_ico(
+            &accounts_root().join(&ids[0]).join("avatar.jpg"),
+            &icon,
+        );
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("取程序路径失败：{e}"))?;
+    // 多开快捷方式名：直接对拼接昵称做非法字符清洗
+    let lnk = desktop_dir()?.join(format!("{}.lnk", sanitize_name(&format!("多开-{display}"))));
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let link: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|e| e.to_string())?;
+        let exe_h = HSTRING::from(exe.as_os_str());
+        let args = HSTRING::from(format!("--wechat-batch-launch {}", ids.join(",")));
+        let workdir = HSTRING::from(exe.parent().unwrap_or(Path::new(".")));
+        link.SetPath(PCWSTR(exe_h.as_ptr())).map_err(|e| e.to_string())?;
+        link.SetArguments(PCWSTR(args.as_ptr())).map_err(|e| e.to_string())?;
+        link.SetWorkingDirectory(PCWSTR(workdir.as_ptr())).map_err(|e| e.to_string())?;
+        if icon.is_file() {
+            let icon_h = HSTRING::from(icon.as_os_str());
+            link.SetIconLocation(PCWSTR(icon_h.as_ptr()), 0).map_err(|e| e.to_string())?;
+        }
+        let persist: IPersistFile = link.cast().map_err(|e| e.to_string())?;
+        let lnk_h = HSTRING::from(lnk.as_os_str());
+        persist.Save(PCWSTR(lnk_h.as_ptr()), false).map_err(|e| e.to_string())?;
+    }
+    crate::tlog!("[wechatsnap] 已创建多开桌面快捷方式 {}", lnk.display());
+    Ok(lnk)
+}
+
+/// 清洗快捷方式文件名里的非法字符（Windows 文件名保留字符）
+fn sanitize_name(name: &str) -> String {
     let bad = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
-    let name: String = nickname.chars().map(|c| if bad.contains(&c) { '_' } else { c }).collect();
-    let name = name.trim();
+    name.chars().map(|c| if bad.contains(&c) { '_' } else { c }).collect()
+}
+
+fn shortcut_display_name(nickname: &str, id: &str) -> String {
+    let name = sanitize_name(nickname).trim().to_string();
     if name.is_empty() {
         format!("微信-{id}")
     } else {

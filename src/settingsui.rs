@@ -645,6 +645,9 @@ struct SettingsApp {
     pin_admin: bool,
     /// 微信快照操作的反馈信息（保存/恢复/快捷方式/删除的结果）
     snap_status: String,
+    /// 勾选要生成「多开快捷方式」的快照 ID（多选框）。用 Vec 而非 HashSet：
+    /// 顺序 = 用户勾选的先后 = 批量登录顺序，HashSet 无序会导致顺序错乱。
+    snap_selected: Vec<String>,
     /// 「检查更新」状态（与后台线程共享；点左下角版本号触发）
     check: Arc<Mutex<CheckState>>,
     /// 最近一次检查更新实际请求的 URL（失败时悬停可看，便于排查加速前缀/密码配置）
@@ -2032,13 +2035,25 @@ impl SettingsApp {
             .weak(),
         );
 
-        // 快照列表：昵称（账号 ID）+ 启动 / 创建快捷方式 / 删除
+        // 快照列表：多选框 + 昵称（账号 ID）+ 启动 / 创建快捷方式 / 删除
         let snaps = crate::wechatsnap::list();
         if !snaps.is_empty() {
             ui.add_space(6.0);
             for s in &snaps {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
+                    // 多选框：勾选要生成「多开快捷方式」的账号
+                    let mut checked = self.snap_selected.contains(&s.id);
+                    if ui.checkbox(&mut checked, "").changed() {
+                        if checked {
+                            // 按勾选先后追加 —— 这个顺序就是批量登录顺序
+                            if !self.snap_selected.contains(&s.id) {
+                                self.snap_selected.push(s.id.clone());
+                            }
+                        } else {
+                            self.snap_selected.retain(|x| x != &s.id);
+                        }
+                    }
                     ui.label(egui::RichText::new(s.nickname.as_str()).size(12.5));
                     ui.label(egui::RichText::new(format!("（账号 {}）", s.id)).size(11.0).weak());
                     // 登录状态：account.txt 里记录的 pid 还活着且是 Weixin.exe → 已登录
@@ -2090,6 +2105,47 @@ impl SettingsApp {
                     }
                 });
             }
+            // 生成多开快捷方式：勾选多个凭证后，生成一个桌面快捷方式，点击逐个登录
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                // 直接用勾选顺序（Vec 的插入顺序），这才是用户期望的批量登录顺序。
+                // 之前按快照列表顺序重排，导致先勾的账号反而不先登录。
+                // 同时过滤掉已被删除的快照 ID。
+                let selected: Vec<String> = self
+                    .snap_selected
+                    .iter()
+                    .filter(|id| snaps.iter().any(|s| &s.id == *id))
+                    .cloned()
+                    .collect();
+                let n = selected.len();
+                if ui
+                    .add_enabled(
+                        n >= 1,
+                        egui::Button::new(
+                            egui::RichText::new(format!("生成多开快捷方式（{n}）")).size(12.0),
+                        )
+                        .min_size(egui::vec2(168.0, 24.0)),
+                    )
+                    .clicked()
+                {
+                    if n < 1 {
+                        self.snap_status = "请先勾选要登录的凭证".into();
+                    } else {
+                        self.snap_status = match crate::wechatsnap::make_batch_shortcut(&selected) {
+                            Ok(p) => format!("已创建多开快捷方式：{}", p.display()),
+                            Err(e) => format!("创建多开快捷方式失败：{e}"),
+                        };
+                    }
+                }
+                if !selected.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("已勾选 {n} 个：登录顺序 = 勾选顺序"))
+                            .size(11.5)
+                            .weak(),
+                    );
+                }
+            });
             ui.label(
                 egui::RichText::new(
                     "「启动」= 恢复该快照凭证（热替换，运行中的微信不受影响）→ 自动打开微信免扫码登录，并把本次拉起的微信 pid 记进 account.txt（据此显示登录状态，pid 退出即变回未登录）。多开：先开 A 号，再点 B 号快照的「启动」",

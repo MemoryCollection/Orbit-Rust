@@ -12,8 +12,8 @@
 //! 支持加速前缀（拼在完整 URL 前面）和访问密码（拼 `?pw=...` 在最后），
 //! 两者都留空则直连 GitHub。
 
-/// 前三段合起来的数（当前正式版本：211 → 显示 2.1.1）
-pub const VER_HEAD: u32 = 211;
+/// 前三段合起来的数（当前正式版本：212 → 显示 2.1.2）
+pub const VER_HEAD: u32 = 212;
 /// 第四段构建号（正式版 = 0；打测试包时 +1）
 pub const VER_BUILD: u32 = 0;
 
@@ -110,8 +110,8 @@ mod tests {
 
     #[test]
     fn local_version_is_head_dot_build() {
-        // 当前定为 211 / build 0 → 2.1.1.0
-        assert_eq!(local(), "2.1.1.0");
+        // 当前定为 212 / build 0 → 2.1.2.0
+        assert_eq!(local(), "2.1.2.0");
     }
 
     #[test]
